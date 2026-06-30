@@ -32,10 +32,11 @@ streaming-file-avro = ["streaming", "ggcommons/streaming-file-avro"]
 
 [dependencies]
 # The ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building this
-# repo standalone needs read access to that repo; locally and in CI the fetch goes through the git CLI
-# (see .cargo/config.toml) so it uses your SSH key / a CI deploy key. For local development against an
+# repo standalone needs read access to that repo. The fetch goes through the git CLI (see
+# .cargo/config.toml); locally it uses your gh/git credential helper, and in CI the reusable workflow
+# rewrites this https URL with the EDGECOMMONS_READ_TOKEN PAT. For local development against an
 # unpushed change, temporarily swap this for `path = "../ggcommons-monorepo/libs/rust"`.
-ggcommons = { git = "ssh://git@github.com/edgecommons/ggcommons.git", rev = "a5b5fd5e0afcae28baed4e232b2a0692d925eb1d", default-features = false }
+ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "a5b5fd5e0afcae28baed4e232b2a0692d925eb1d", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
