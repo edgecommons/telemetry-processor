@@ -30,7 +30,7 @@
   },
   "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
   "component": {
-    "global": { "defaults": { "key": "body.tag.id", "flushMs": 1000 } },
+    "global": { "defaults": { "key": "body.tag.id" } },
     "instances": [
       {
         "id": "downsample-local",

@@ -78,7 +78,6 @@ ComponentConfiguration:
         global:
           defaults:
             key: "body.tag.id"
-            flushMs: 1000
         # Each instances[] entry is one route.
         instances:
           # Route 1: downsample + window-aggregate GOOD process telemetry → durable Parquet archive.

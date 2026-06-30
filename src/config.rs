@@ -26,9 +26,6 @@ fn lenient_opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Er
 pub struct GlobalDefaults {
     /// Default aggregation/partition key path (e.g. `body.tag.id`).
     pub key: Option<String>,
-    /// Default route worker flush cadence (ms) — the aggregate window tick.
-    #[serde(deserialize_with = "lenient_opt_u64")]
-    pub flush_ms: Option<u64>,
     /// Default target when a route omits one.
     pub target: Option<String>,
 }
@@ -49,7 +46,8 @@ pub struct RouteConfig {
     /// Aggregation/partition key path; falls back to the global default, then `body.tag.id`.
     #[serde(default)]
     pub key: Option<String>,
-    /// Subscribe queue depth (drop-on-full at the broker edge).
+    /// Depth of this route's internal channel between the subscribe handler and the worker
+    /// (drop-on-full). Default 256.
     #[serde(default, deserialize_with = "lenient_opt_u64")]
     pub max_queue: Option<u64>,
 }
