@@ -1,0 +1,50 @@
+[package]
+name = "telemetry-processor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Reference Rust processing component for ggcommons/edgecommons: subscribe → filter/sample/aggregate/project/script → forward (local / northbound / durable stream → Kinesis/Kafka/file)."
+publish = false
+
+# The reference Rust processor component, built on the ggcommons Rust library. It is the
+# high-throughput northbound seam between southbound adapters (channel 1) and the cloud
+# (channels 2/3). See docs/TELEMETRY_PROCESSOR.md in the ggcommons monorepo.
+
+[[bin]]
+name = "telemetry-processor"
+path = "src/main.rs"
+
+[features]
+default = ["standalone"]
+# Runtime selection (mirrors the library): standalone = dual-broker MQTT (containers/laptops);
+# greengrass = IPC (device; Linux-only build).
+standalone = ["ggcommons/standalone"]
+greengrass = ["ggcommons/greengrass"]
+cloudwatch = ["ggcommons/cloudwatch"]
+# Durable streaming targets (the `stream:<name>` route target). `streaming` alone is buffer-only;
+# add a sink feature for real export. The file sink (Parquet/AVRO) lives in the ggstreamlog core.
+streaming = ["ggcommons/streaming"]
+streaming-kinesis = ["streaming", "ggcommons/streaming-kinesis"]
+streaming-kafka = ["streaming", "ggcommons/streaming-kafka"]
+streaming-file-parquet = ["streaming", "ggcommons/streaming-file-parquet"]
+streaming-file-avro = ["streaming", "ggcommons/streaming-file-avro"]
+
+[dependencies]
+# Local path dependency on the ggcommons Rust library (sibling monorepo checkout). For a published
+# build this becomes a git/registry dependency (see the ecosystem packaging model).
+ggcommons = { path = "../ggcommons-monorepo/libs/rust", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+anyhow = "1"
+async-trait = "0.1"
+smallvec = "1"
+# Embedded scripting for the `script` stage + the Rhai `filter` option (always compiled in).
+# `sync` makes Engine/AST/Dynamic Send+Sync (shared across route workers); `serde` converts the
+# message JSON to/from a Rhai value.
+rhai = { version = "1", features = ["sync", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

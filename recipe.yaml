@@ -1,0 +1,130 @@
+---
+RecipeFormatVersion: "2020-01-25"
+ComponentName: "com.mbreissi.greengrass.TelemetryProcessor"
+ComponentVersion: "1.0.0"
+ComponentDescription: "Reference Rust processing component: subscribes to local telemetry topics, runs a per-route filter/sample/aggregate/project/Rhai pipeline, and forwards to local / northbound MQTT / a durable stream (Kinesis / Kafka / rolling Parquet-AVRO files)."
+ComponentPublisher: "Marc Breissinger"
+# TokenExchangeService makes the Nucleus inject AWS_CONTAINER_CREDENTIALS_FULL_URI so the AWS SDK
+# default credential chain resolves the device role — needed for the Kinesis stream sink.
+ComponentDependencies:
+  aws.greengrass.TokenExchangeService:
+    VersionRequirement: ">=0.0.0"
+    DependencyType: HARD
+ComponentConfiguration:
+  DefaultConfiguration:
+    ComponentConfig:
+      logging:
+        level: "INFO"
+        rust_format: "{timestamp} [{level}] {target} - {message}"
+      heartbeat:
+        intervalSecs: 5
+        targets:
+          - type: "metric"
+        measures:
+          cpu: true
+          memory: true
+      metricEmission:
+        target: "log"
+        namespace: "ggcommons"
+        targetConfig:
+          logFileName: "/greengrass/v2/work/{ComponentFullName}/metric.log"
+      # Durable streams the routes forward to. The `archive` stream lands rolling Parquet files for
+      # later bulk upload; `hot` exports aggregates to Kinesis. Inert unless the matching sink
+      # feature is built in (streaming-file-parquet / streaming-kinesis).
+      streaming:
+        streams:
+          - name: "archive"
+            sink:
+              type: "file"
+              format: "parquet"
+              mode: "rows"
+              dir: "/greengrass/v2/work/{ComponentFullName}/archive"
+              partitionBy: "dt={yyyy-MM-dd}/hr={HH}"
+              maxFileBytes: 134217728
+              maxFiles: 64
+              rollEverySecs: 300
+              onFull: "dropOldest"
+              compression: "snappy"
+            buffer:
+              path: "/greengrass/v2/work/{ComponentFullName}/stream-archive"
+              segmentBytes: 16777216
+              maxDiskBytes: 1073741824
+              onFull: "dropOldest"
+            batch:
+              maxRecords: 5000
+              maxBytes: 8388608
+              maxLatencyMs: 5000
+            delivery:
+              pollIntervalMs: 1000
+          - name: "hot"
+            sink:
+              type: "kinesis"
+              streamName: "ggcommons-telemetry-hot"
+              region: "us-east-1"
+            buffer:
+              path: "/greengrass/v2/work/{ComponentFullName}/stream-hot"
+              segmentBytes: 4194304
+              maxDiskBytes: 268435456
+              onFull: "dropOldest"
+            delivery:
+              pollIntervalMs: 1000
+      tags:
+        appId: "Demo"
+        site: "Chantilly"
+        shop: "test_shop"
+        line: "test_line"
+      component:
+        # Cross-route defaults, overlaid by each route (global ⊕ instance).
+        global:
+          defaults:
+            key: "body.tag.id"
+            flushMs: 1000
+        # Each instances[] entry is one route.
+        instances:
+          # Route 1: downsample + window-aggregate GOOD process telemetry → durable Parquet archive.
+          - id: "archive-good"
+            subscribe:
+              - "southbound/{site}/+/+/+"
+            pipeline:
+              - filter: { quality: "GOOD" }
+              - aggregate: { window: "10s", by: "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] }
+            target: "stream:archive"
+            publish:
+              partitionKey: "body.tag.id"
+          # Route 2: forward alarm-flagged updates northbound to IoT Core (low rate, control plane).
+          - id: "alarms-northbound"
+            subscribe:
+              - "southbound/{site}/+/+/alarms/#"
+            pipeline:
+              - filter: { field: "body.samples[].quality", op: "ne", value: "GOOD" }
+            target: "northbound"
+            publish:
+              topic: "telemetry/{ThingName}/alarms"
+              qos: "atLeastOnce"
+    accessControl:
+      aws.greengrass.ipc.pubsub:
+        "com.mbreissi.greengrass.TelemetryProcessor:pubsub:1":
+          policyDescription: Allows publish/subscribe on all local topics.
+          operations:
+            - "aws.greengrass#PublishToTopic"
+            - "aws.greengrass#SubscribeToTopic"
+          resources:
+            - "*"
+      aws.greengrass.ipc.mqttproxy:
+        "com.mbreissi.greengrass.TelemetryProcessor:iotcore:1":
+          policyDescription: Allows publish/subscribe to IoT Core (northbound target).
+          operations:
+            - "aws.greengrass#PublishToIoTCore"
+            - "aws.greengrass#SubscribeToIoTCore"
+          resources:
+            - "*"
+Manifests:
+  - Platform:
+      os: linux
+    Artifacts:
+      - URI: "s3://BUCKET_NAME/COMPONENT_NAME/COMPONENT_VERSION/telemetry-processor"
+    Lifecycle:
+      Install:
+        Script: "chmod +x {artifacts:path}/telemetry-processor"
+      Run:
+        Script: "{artifacts:path}/telemetry-processor --platform GREENGRASS -c GG_CONFIG"

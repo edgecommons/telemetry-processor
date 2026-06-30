@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: telemetry-processor-config
+  labels:
+    app: telemetry-processor
+data:
+  # The library's CONFIGMAP config source reads this mounted directory (with ..data-swap hot reload).
+  config.json: |
+    {
+      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+      "metricEmission": { "target": "log", "namespace": "ggcommons" },
+      "messaging": { "local": { "host": "mqtt-broker", "port": 1883, "clientId": "telemetry-processor" } },
+      "streaming": {
+        "streams": [
+          {
+            "name": "archive",
+            "sink": {
+              "type": "file", "format": "parquet", "mode": "rows",
+              "dir": "/data/archive", "partitionBy": "dt={yyyy-MM-dd}/hr={HH}",
+              "maxFileBytes": 134217728, "maxFiles": 64, "rollEverySecs": 300,
+              "onFull": "dropOldest", "compression": "snappy"
+            },
+            "buffer": { "path": "/data/stream-archive", "segmentBytes": 16777216, "maxDiskBytes": 1073741824, "onFull": "dropOldest" },
+            "batch": { "maxRecords": 5000, "maxBytes": 8388608, "maxLatencyMs": 5000 },
+            "delivery": { "pollIntervalMs": 1000 }
+          }
+        ]
+      },
+      "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
+      "component": {
+        "global": { "defaults": { "key": "body.tag.id", "flushMs": 1000 } },
+        "instances": [
+          {
+            "id": "archive-good",
+            "subscribe": [ "southbound/factory-1/+/+/+" ],
+            "pipeline": [
+              { "filter": { "quality": "GOOD" } },
+              { "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] } }
+            ],
+            "target": "stream:archive",
+            "publish": { "partitionKey": "body.tag.id" }
+          }
+        ]
+      }
+    }

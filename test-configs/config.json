@@ -1,0 +1,57 @@
+{
+  "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+  "heartbeat": {
+    "intervalSecs": 10,
+    "measures": { "cpu": true, "memory": true },
+    "targets": [ { "type": "metric" } ]
+  },
+  "metricEmission": { "target": "log", "namespace": "ggcommons" },
+  "streaming": {
+    "streams": [
+      {
+        "name": "archive",
+        "sink": {
+          "type": "file",
+          "format": "parquet",
+          "mode": "rows",
+          "dir": "./out/archive",
+          "partitionBy": "dt={yyyy-MM-dd}/hr={HH}",
+          "maxFileBytes": 1048576,
+          "maxFiles": 16,
+          "rollEverySecs": 30,
+          "onFull": "dropOldest",
+          "compression": "snappy"
+        },
+        "buffer": { "path": "./out/stream-archive", "segmentBytes": 1048576, "maxDiskBytes": 67108864, "onFull": "dropOldest" },
+        "batch": { "maxRecords": 500, "maxBytes": 1048576, "maxLatencyMs": 2000 },
+        "delivery": { "pollIntervalMs": 500 }
+      }
+    ]
+  },
+  "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
+  "component": {
+    "global": { "defaults": { "key": "body.tag.id", "flushMs": 1000 } },
+    "instances": [
+      {
+        "id": "downsample-local",
+        "subscribe": [ "southbound/factory-1/+/+/+" ],
+        "pipeline": [
+          { "filter": { "quality": "GOOD" } },
+          { "sample": { "everyMs": 1000, "by": "body.tag.id" } }
+        ],
+        "target": "local",
+        "publish": { "topic": "processed/{ThingName}/downsampled" }
+      },
+      {
+        "id": "archive",
+        "subscribe": [ "southbound/factory-1/+/+/+" ],
+        "pipeline": [
+          { "filter": { "quality": "GOOD" } },
+          { "aggregate": { "window": "5s", "by": "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] } }
+        ],
+        "target": "stream:archive",
+        "publish": { "partitionKey": "body.tag.id" }
+      }
+    ]
+  }
+}

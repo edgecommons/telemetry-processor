@@ -1,0 +1,214 @@
+//! # Processor application — wiring routes to the runtime
+//!
+//! Reads the routes from `component.instances[]` (overlaid with `component.global.defaults`), and
+//! for each route: builds the pipeline, resolves topic templates, opens a bounded channel, and
+//! spawns the route worker. Subscriptions are then established **once per unique topic filter**,
+//! with the handler fanning each message out to every route that subscribed that filter (so
+//! multiple routes can share a topic — ggcommons keys subscriptions by filter). On shutdown it
+//! unsubscribes, closes the channels, and waits for the workers to drain (final aggregate flush).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use ggcommons::config::model::Config;
+use ggcommons::config::template::resolve;
+use ggcommons::messaging::MessagingService;
+use ggcommons::prelude::*;
+use rhai::Engine;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use crate::config::{GlobalDefaults, RouteConfig, Target};
+use crate::proc::route::{run_worker, Dispatcher};
+use crate::proc::{now_ms, Pipeline, ProcMsg};
+
+/// Default aggregation/partition key when neither the route nor the global defaults set one.
+const DEFAULT_KEY: &str = "body.tag.id";
+/// Default route channel capacity (also the broker-side subscribe queue depth).
+const DEFAULT_QUEUE: usize = 256;
+
+/// One wired route: its resolved subscribe filters and the channel into its worker.
+struct RouteWire {
+    filters: Vec<String>,
+    tx: mpsc::Sender<ProcMsg>,
+}
+
+/// The running processor: its subscriptions, channel senders, and worker tasks.
+pub struct ProcessorApp {
+    messaging: Arc<dyn MessagingService>,
+    subscriptions: Vec<String>,
+    senders: Vec<mpsc::Sender<ProcMsg>>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl ProcessorApp {
+    /// Wire and start every configured route.
+    pub async fn start(gg: &GgCommons) -> anyhow::Result<Self> {
+        let config = gg.config();
+        let messaging =
+            gg.messaging().map_err(|e| anyhow::anyhow!("messaging transport unavailable: {e}"))?;
+
+        // One Rhai engine shared by all `filter`/`script` stages (bounded to deter runaway scripts).
+        let mut engine = Engine::new();
+        engine.set_max_operations(1_000_000);
+        let engine = Arc::new(engine);
+
+        let defaults: GlobalDefaults = config
+            .global()
+            .get("defaults")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let default_key = defaults.key.clone().unwrap_or_else(|| DEFAULT_KEY.to_string());
+
+        let mut app = Self {
+            messaging: messaging.clone(),
+            subscriptions: Vec::new(),
+            senders: Vec::new(),
+            workers: Vec::new(),
+        };
+
+        // 1. Build each route's worker + channel, collecting its resolved filters.
+        let mut wires: Vec<RouteWire> = Vec::new();
+        let ids = config.instance_ids();
+        if ids.is_empty() {
+            tracing::warn!("no routes configured (component.instances[] is empty)");
+        }
+        for id in ids {
+            let Some(raw) = config.instance(&id) else { continue };
+            let route: RouteConfig = match serde_json::from_value(raw.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(route = %id, error = %e, "invalid route config; skipping");
+                    continue;
+                }
+            };
+            match app.build_route(gg, &config, &engine, route, &default_key, defaults.target.as_deref()) {
+                Ok(wire) => wires.push(wire),
+                Err(e) => tracing::error!(error = %e, "failed to build route; skipping"),
+            }
+        }
+        anyhow::ensure!(!app.workers.is_empty(), "no routes started; nothing to do");
+
+        // 2. Subscribe each UNIQUE filter once, fanning each message out to every route that wants
+        //    it (ggcommons keys subscriptions by filter, so a shared filter must be one subscription).
+        let mut by_filter: BTreeMap<String, Vec<mpsc::Sender<ProcMsg>>> = BTreeMap::new();
+        for wire in &wires {
+            for f in &wire.filters {
+                by_filter.entry(f.clone()).or_default().push(wire.tx.clone());
+            }
+        }
+        for (filter, senders) in by_filter {
+            self_subscribe(&app.messaging, &filter, senders).await?;
+            app.subscriptions.push(filter);
+        }
+
+        tracing::info!(routes = app.workers.len(), filters = app.subscriptions.len(), "telemetry-processor started");
+        Ok(app)
+    }
+
+    /// Build one route's worker + channel; return its resolved filters (no subscription yet).
+    fn build_route(
+        &mut self,
+        gg: &GgCommons,
+        config: &Config,
+        engine: &Arc<Engine>,
+        route: RouteConfig,
+        default_key: &str,
+        default_target: Option<&str>,
+    ) -> anyhow::Result<RouteWire> {
+        let _ = gg; // used only under the `streaming` feature (stream targets)
+        let route_key = route.key.clone().unwrap_or_else(|| default_key.to_string());
+        let target_str = route
+            .target
+            .clone()
+            .or_else(|| default_target.map(String::from))
+            .ok_or_else(|| anyhow::anyhow!("route '{}' has no target", route.id))?;
+        let target = Target::parse(&target_str)?;
+
+        anyhow::ensure!(!route.subscribe.is_empty(), "route '{}' has no subscribe topics", route.id);
+
+        let mut publish = route.publish.clone().unwrap_or_default();
+        if let Some(t) = &publish.topic {
+            publish.topic = Some(resolve(config, t));
+        }
+
+        #[cfg(feature = "streaming")]
+        let stream = match &target {
+            Target::Stream(name) => Some(
+                gg.streams()
+                    .stream(name)
+                    .map_err(|e| anyhow::anyhow!("stream '{name}' not configured: {e}"))?,
+            ),
+            _ => None,
+        };
+
+        let pipeline = Pipeline::build(&route.pipeline, &route_key, engine)?;
+        let dispatcher = Dispatcher::new(
+            self.messaging.clone(),
+            target,
+            &publish,
+            &route_key,
+            #[cfg(feature = "streaming")]
+            stream,
+        );
+
+        let cap = route.max_queue.map(|n| n as usize).unwrap_or(DEFAULT_QUEUE).max(1);
+        let (tx, rx) = mpsc::channel::<ProcMsg>(cap);
+        self.workers.push(tokio::spawn(run_worker(pipeline, rx, dispatcher)));
+        self.senders.push(tx.clone());
+
+        let filters: Vec<String> = route.subscribe.iter().map(|f| resolve(config, f)).collect();
+        for f in &filters {
+            tracing::info!(route = %route.id, filter = %f, "route wired");
+        }
+        Ok(RouteWire { filters, tx })
+    }
+
+    /// Run until a shutdown signal, then unsubscribe, close channels, and drain the workers.
+    pub async fn run(self, gg: &GgCommons) -> anyhow::Result<()> {
+        gg.shutdown_signal().await;
+        tracing::info!("shutdown signal received; stopping routes");
+
+        for filt in &self.subscriptions {
+            if let Err(e) = self.messaging.unsubscribe(filt).await {
+                tracing::warn!(error = %e, filter = %filt, "unsubscribe failed");
+            }
+        }
+        // Close the route channels so each worker drains, does a final flush, and exits.
+        drop(self.senders);
+        for w in self.workers {
+            let _ = w.await;
+        }
+        Ok(())
+    }
+}
+
+/// Subscribe one filter with a fan-out handler that forwards each message to every route channel
+/// that registered for it. Concurrency is 1 so the ordered consumers get messages in order.
+async fn self_subscribe(
+    messaging: &Arc<dyn MessagingService>,
+    filter: &str,
+    senders: Vec<mpsc::Sender<ProcMsg>>,
+) -> anyhow::Result<()> {
+    let filter_owned = filter.to_string();
+    messaging
+        .subscribe(
+            filter,
+            message_handler(move |topic, msg| {
+                let senders = senders.clone();
+                let filter_owned = filter_owned.clone();
+                async move {
+                    let pm = ProcMsg { topic, msg, recv_ms: now_ms() };
+                    for s in &senders {
+                        if s.try_send(pm.clone()).is_err() {
+                            tracing::debug!(filter = %filter_owned, "route queue full; dropping message");
+                        }
+                    }
+                }
+            }),
+            DEFAULT_QUEUE,
+            1,
+        )
+        .await?;
+    Ok(())
+}

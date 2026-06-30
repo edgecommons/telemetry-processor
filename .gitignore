@@ -1,0 +1,7 @@
+/target
+greengrass-build/
+.vault/
+*.parquet
+*.avro
+/data/
+/out/

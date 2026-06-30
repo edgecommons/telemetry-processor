@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-processor
+  labels:
+    app: telemetry-processor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telemetry-processor
+  template:
+    metadata:
+      labels:
+        app: telemetry-processor
+    spec:
+      containers:
+        - name: telemetry-processor
+          image: ghcr.io/edgecommons/telemetry-processor:latest
+          # --platform KUBERNETES is the image entrypoint; read config from the mounted ConfigMap.
+          args: ["-c", "CONFIGMAP", "/config"]
+          env:
+            # Downward-API identity: the library resolves the Thing name from POD_NAME when -t is absent.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: health
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: telemetry-processor-config
+        # Durable buffer + rolling Parquet files survive restarts; size to your archive retention.
+        - name: data
+          persistentVolumeClaim:
+            claimName: telemetry-processor-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: telemetry-processor-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
