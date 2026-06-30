@@ -9,7 +9,8 @@ on:
 jobs:
   ci:
     # Reusable component CI from the org defaults repo. `secrets: inherit` passes the org-level
-    # EDGECOMMONS_READ_TOKEN so cargo can fetch the private ggcommons git dependency.
+    # EDGECOMMONS_READ_TOKEN so cargo can fetch the private ggcommons git dependency. The repo must be
+    # added to that secret's repository allow-list (org Actions secrets, via the REST API).
     permissions:
       contents: read
     uses: edgecommons/.github/.github/workflows/component-ci.yml@main
