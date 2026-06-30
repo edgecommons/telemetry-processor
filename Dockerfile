@@ -1,28 +1,29 @@
-# Multi-stage build for the telemetry-processor component (HOST / KUBERNETES platforms).
+# syntax=docker/dockerfile:1
 #
-# NOTE: this component depends on the ggcommons Rust library via a path dependency during local
-# development, so the Docker build context must contain BOTH this repo and the ggcommons monorepo as
-# siblings. Build from the parent `source/` directory:
+# Build the telemetry-processor from source. Its `ggcommons` dependency is a git dependency on the
+# private edgecommons/ggcommons repo, so the build needs SSH access to GitHub. Build with BuildKit and
+# forward your SSH agent (or a CI deploy key):
 #
-#   docker build -f telemetry-processor/Dockerfile \
-#     -t telemetry-processor:dev \
-#     --build-arg FEATURES=standalone,streaming,streaming-file-parquet .
+#   DOCKER_BUILDKIT=1 docker build --ssh default \
+#     --build-arg FEATURES=standalone,streaming,streaming-file-parquet \
+#     -t telemetry-processor:dev .
 #
-# A published build instead uses the registry/git ggcommons dependency and a normal single-repo
-# context.
+# This builds from THIS repo only — no sibling checkout required (cargo fetches ggcommons over SSH).
 ARG RUST_VERSION=1.85
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG FEATURES=standalone,streaming,streaming-file-parquet
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client git \
+ && rm -rf /var/lib/apt/lists/*
+# Trust github.com for the SSH fetch (the .cargo/config.toml in the repo sets git-fetch-with-cli).
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 WORKDIR /src
-# Bring in the workspace (telemetry-processor + sibling ggcommons-monorepo for the path dep).
-COPY ggcommons-monorepo /src/ggcommons-monorepo
-COPY telemetry-processor /src/telemetry-processor
-WORKDIR /src/telemetry-processor
-RUN cargo build --release --no-default-features --features "${FEATURES}"
+COPY . .
+RUN --mount=type=ssh cargo build --release --no-default-features --features "${FEATURES}"
 
 FROM debian:bookworm-slim AS runtime
 RUN useradd -r -u 10001 appuser && mkdir -p /data && chown appuser /data
-COPY --from=build /src/telemetry-processor/target/release/telemetry-processor /usr/local/bin/telemetry-processor
+COPY --from=build /src/target/release/telemetry-processor /usr/local/bin/telemetry-processor
 USER appuser
 WORKDIR /data
 # The ConfigMap is mounted at /config; identity comes from the Downward API (POD_NAME) by default.

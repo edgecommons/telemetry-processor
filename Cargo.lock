@@ -1530,6 +1530,7 @@ dependencies = [
 [[package]]
 name = "ggcommons"
 version = "0.1.1"
+source = "git+ssh://git@github.com/edgecommons/ggcommons.git?rev=a5b5fd5e0afcae28baed4e232b2a0692d925eb1d#a5b5fd5e0afcae28baed4e232b2a0692d925eb1d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1556,6 +1557,7 @@ dependencies = [
 [[package]]
 name = "ggstreamlog"
 version = "0.1.0"
+source = "git+ssh://git@github.com/edgecommons/ggcommons.git?rev=a5b5fd5e0afcae28baed4e232b2a0692d925eb1d#a5b5fd5e0afcae28baed4e232b2a0692d925eb1d"
 dependencies = [
  "apache-avro",
  "arrow",
