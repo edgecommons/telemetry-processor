@@ -1,8 +1,8 @@
 # Tutorial — Your First Telemetry Processor
 
 In this tutorial you bring the `telemetry-processor` up on your laptop, feed it synthetic
-`SouthboundTagUpdate` telemetry over a local MQTT broker, and watch it do two things at once:
-**downsample** a tag stream onto a new topic, and **archive** windowed aggregates as real
+`SouthboundSignalUpdate` telemetry over a local MQTT broker, and watch it do two things at once:
+**downsample** a signal stream onto a new topic, and **archive** windowed aggregates as real
 **Parquet** files. No Greengrass, no cloud, no hardware — just Docker, a Rust build, and a few lines
 of Python.
 
@@ -52,9 +52,9 @@ and `-t my-thing` (the Thing name, which fills the `{ThingName}` template).
 subscribed to `southbound/factory-1/+/+/+`:
 
 - **`downsample-local`** — drops any update that isn't all-`GOOD` quality, then keeps **at most one
-  message per tag per second** (`sample everyMs:1000`), and republishes the survivors on
+  message per signal per second** (`sample everyMs:1000`), and republishes the survivors on
   `processed/my-thing/downsampled`. Target `local` (straight back onto the bus).
-- **`archive`** — also drops non-`GOOD`, then rolls each tag's values into **5-second tumbling
+- **`archive`** — also drops non-`GOOD`, then rolls each signal's values into **5-second tumbling
   windows** computing `avg/max/min/count/last`, and appends each window result to the durable
   `archive` stream. Target `stream:archive` — whose **file sink** writes rolling **Parquet** under
   `./out/archive/`.
@@ -72,7 +72,7 @@ c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 c.on_connect = lambda c,u,f,rc,p=None: c.subscribe("processed/#")
 def on_msg(c,u,m):
     b = json.loads(m.payload)["body"]; s = b["samples"][0]
-    print(f'{m.topic}  {b["tag"]["id"]:12} = {s["value"]:>8}  [{s["quality"]}]')
+    print(f'{m.topic}  {b["signal"]["id"]:12} = {s["value"]:>8}  [{s["quality"]}]')
 c.on_message = on_msg
 c.connect("localhost", 1883); c.loop_forever()
 PY
@@ -83,7 +83,7 @@ retained, so the subscriber must be up before you publish.
 
 ## 4. Feed it synthetic telemetry
 
-In a third terminal, publish a burst of `SouthboundTagUpdate` envelopes for two tags — about four
+In a third terminal, publish a burst of `SouthboundSignalUpdate` envelopes for two signals — about four
 per second for eight seconds — and slip in **one BAD-quality sample** so you can watch the filter
 drop it:
 
@@ -94,19 +94,19 @@ from datetime import datetime, timezone
 c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 c.connect("localhost", 1883); c.loop_start()
 
-def update(tag_id, tag_name, value, quality="GOOD"):
+def update(signal_id, signal_name, value, quality="GOOD"):
     now = datetime.now(timezone.utc).isoformat()
     env = {
-        "header": {"name": "SouthboundTagUpdate", "version": "1.0"},
+        "header": {"name": "SouthboundSignalUpdate", "version": "1.0"},
         "tags":   {"thing": "my-thing", "site": "factory-1"},
         "body": {
             "device":  {"adapter": "sim", "instance": "inst1"},
-            "tag":     {"id": tag_id, "name": tag_name},
+            "signal":     {"id": signal_id, "name": signal_name},
             "samples": [{"value": value, "quality": quality,
                          "sourceTs": now, "serverTs": now}],
         },
     }
-    c.publish(f"southbound/factory-1/Sim/inst1/{tag_name}", json.dumps(env))
+    c.publish(f"southbound/factory-1/Sim/inst1/{signal_name}", json.dumps(env))
 
 for i in range(32):
     update("ns=3;i=1001", "Temp",     round(20 + i * 0.1, 2))
@@ -120,7 +120,7 @@ print("published ~64 GOOD updates + 1 BAD")
 PY
 ```
 
-You published ~4 updates/sec per tag, but the subscriber from Step 3 prints only about **one per tag
+You published ~4 updates/sec per signal, but the subscriber from Step 3 prints only about **one per signal
 per second** — that's the `sample` stage downsampling. And the `-999.0 [BAD]` reading **never
 appears**: the `filter { quality: GOOD }` stage dropped it before sampling. You'll see something like
 (exact values and cadence depend on arrival timing):
@@ -154,12 +154,12 @@ directly — **one row per aggregated sample**, with typed columns:
 python - <<'PY'
 import pyarrow.parquet as pq, glob
 f = sorted(glob.glob("./out/archive/dt=*/hr=*/*.parquet"))[-1]
-print(pq.read_table(f).to_pandas()[["tagId", "valueDouble", "valueType", "quality", "site"]])
+print(pq.read_table(f).to_pandas()[["signalId", "valueDouble", "valueType", "quality", "site"]])
 PY
 ```
 
-You'll see `tagId` (e.g. `ns=3;i=1001`), the window **average** in `valueDouble` with
-`valueType="double"`, `quality="GOOD"`, and `site="factory-1"` — alongside `tagName`, `sourceTs`,
+You'll see `signalId` (e.g. `ns=3;i=1001`), the window **average** in `valueDouble` with
+`valueType="double"`, `quality="GOOD"`, and `site="factory-1"` — alongside `signalName`, `sourceTs`,
 `serverTs`, and the other envelope dimensions (`thing`, `shop`, `line`, `adapter`, `instance`). The
 value is written as a sparse typed column (`valueDouble`/`valueLong`/`valueBool`/`valueString`) chosen
 by `valueType`, which is what lets a lakehouse crawl and column-prune it cleanly.
@@ -168,7 +168,7 @@ by `valueType`, which is what lets a lakehouse crawl and column-prune it cleanly
 
 One processor, one telemetry source, two routes — each a `filter → … → target` pipeline:
 
-- **`filter` → `sample` → `local`** turned a high-rate firehose into a steady ~1 Hz/tag stream on the
+- **`filter` → `sample` → `local`** turned a high-rate firehose into a steady ~1 Hz/signal stream on the
   bus, dropping bad-quality readings along the way. That is the **low-latency, lossy** path.
 - **`filter` → `aggregate` → `stream:archive`** turned the *same* firehose into windowed rollups
   written as query-ready Parquet through a durable buffer. That is the **bulk, durable** path —

@@ -6,13 +6,19 @@ shapes make sense as a whole. If you only need a specific key or a step-by-step 
 
 ## What the component is for
 
-Southbound protocol adapters (OPC UA, Modbus, …) publish every tag update to the **local bus** as a
-`SouthboundTagUpdate` envelope on config-driven topics
-(`southbound/{site}/{ComponentName}/{InstanceId}/{tagId}` — see the
+Southbound protocol adapters (OPC UA, Modbus, …) publish every signal update to the **local bus** as a
+`SouthboundSignalUpdate` envelope on config-driven topics
+(`southbound/{site}/{ComponentName}/{InstanceId}/{signalId}` — see the
 [southbound contract](#what-it-consumes-and-emits)). That telemetry is high-rate and edge-local, and
 a raw firehose to the cloud is the wrong shape: integrators want to **filter** (drop BAD quality or
-uninteresting tags), **downsample** (1 kHz → 1 Hz), and **aggregate** (per-tag windowed min/max/avg)
-*before* the data leaves the device — and then route each result to the right place.
+uninteresting signals), **downsample** (1 kHz → 1 Hz), and **aggregate** (per-signal windowed
+min/max/avg) *before* the data leaves the device — and then route each result to the right place.
+
+> **A "signal" is one southbound data point** — an OPC UA node, a Modbus register, … — carried in
+> `body.signal` with its readings in `body.samples[]`. It is what the OPC UA / historian world calls a
+> "tag"; the ggcommons contract names it a **signal** so the word "tag" is free for the message-envelope
+> metadata (`tags`). The two are unrelated — see [the terminology
+> note](reference/messaging-interface.md#envelope-tags-vs-the-signal).
 
 The Telemetry Processor is that stage: the high-throughput northbound seam between the adapters and
 the cloud. It is the reference **Rust processing component**
@@ -60,22 +66,111 @@ the later stages' `process`.
 | Stage | What it does | Stateful? |
 |---|---|---|
 | `filter` | Keep or drop the whole message. Three forms, checked in order: a Rhai boolean `script`; a `quality` shorthand (keep only when **every** `samples[].quality` equals the value and at least one sample exists); or a built-in `field` + `op` + `value` predicate over a dotted path. `[]` in a path spreads an array → an **any-element** match. Ops: `eq` `ne` `gt` `lt` `ge` `le` `exists` `contains`. Built-ins compile to a fixed closure at startup — no per-message parsing. | no |
-| `sample` | Per-key downsampling: keep one message per `everyMs` time window, or one in every `everyN`. The key path is `by`, falling back to the route key (`body.tag.id`). | yes (per key) |
-| `aggregate` | Tumbling-window reduction. The window is time (`"10s"`, `"500ms"`) or a bare count (`"100"`); state is keyed by `by`/route key; reducers are `avg` `max` `min` `sum` `count` `first` `last`. Emits one `ProcessedTelemetry` message per `(key, window)` when the window closes. | yes (per key) |
-| `project` | Reshape the body: `keep` a whitelist of **top-level** body keys (the first segment of each dotted path — so `keep: ["tag.id"]` retains the whole `tag` object), and/or `set` literal fields onto the body. | no |
-| `script` | A Rhai program that returns a new body map, or `()` to drop the message. Its scope exposes `topic`, `body`, `tags`, `samples`, and the conveniences `value`/`quality` (the **first** sample's). | no |
+| `sample` | Per-key downsampling: keep one message per `everyMs` time window, or one in every `everyN`. The key path is `by`, falling back to the route key (`body.signal.id`). | yes (per key) |
+| `aggregate` | Tumbling-window reduction. The window is time (`"10s"`, `"500ms"`) or a bare count (`"100"`); state is keyed by `by`/route key; the folded value is `value` (default `body.samples[].value`); reducers are `avg` `max` `min` `sum` `count` `first` `last`. Emits one `ProcessedTelemetry` message per `(key, window)` when the window closes. | yes (per key) |
+| `project` | Reshape the body: `keep` a whitelist of **top-level** body keys (the first segment of each dotted path — so `keep: ["signal.id"]` retains the whole `signal` object), and/or `set` literal fields onto the body. | no |
+| `script` | A Rhai program (inline or from a `.rhai` file) that returns a new body map, or `()` to drop the message. Its scope exposes `topic`, `body`, `tags`, `samples`, and the conveniences `value`/`quality` (the **first** sample's). See [Scripting with Rhai](#scripting-with-rhai). | no |
 
 Rhai is **always compiled in** — there is no feature gate, and the runtime cost is negligible when no
 route uses a script. One engine is shared by every `filter`/`script` stage, bounded to a million
 operations per evaluation so a runaway script cannot wedge a worker. A Rhai error (compile-time is
 caught at startup; runtime errors) drops the message rather than crashing the route.
 
+## Scripting with Rhai
+
+The built-in stages cover the common shapes — quality gating, value thresholds, downsampling,
+windowed reduction, whitelisting. **Scripting is the escape hatch** for logic they don't express:
+a derived field, a conditional drop, a reshape into a bespoke body, a multi-condition predicate.
+[Rhai](https://rhai.rs) is a small, sandboxed expression language embedded in the processor; you
+reach for it only when a built-in won't do, because the built-ins are faster and need no parsing.
+
+Scripting appears in **two places**, both backed by the same engine and the same message view:
+
+- a **`filter` `script`** — a predicate that evaluates to a **boolean**; `true` keeps the message.
+- a **`script` stage** — a transform that evaluates to the **new body** (a map), or to `()` to
+  **drop** the message.
+
+### Where the source lives — inline or a file
+
+A script's source is given **inline** (`{"script": "<source>"}`) or read from an external **file**
+(`{"script": {"file": "rules/derive.rhai"}}`). A relative file path resolves against
+`component.global.defaults.scriptsDir` (default: the working directory); an absolute path is used
+as-is. Both forms are **compiled once at startup** — a missing file or a syntax error fails the
+component immediately, before any telemetry flows, rather than at the first message. Inline is for a
+one-liner; once a script grows past a line or two, move it to a file (it version-controls cleanly,
+needs no JSON string-escaping, and ships as a deployment artifact — see [the how-to](how-to-guides.md#use-an-external-script-file)).
+
+### The scope a script sees
+
+Before each evaluation the stage builds a fresh **scope** from the current message and binds these
+variables (the same set for a `filter` predicate and a `script` transform):
+
+| Binding | Type | What it is |
+|---|---|---|
+| `topic` | string | the source topic the message arrived on |
+| `body` | map | the full message body (`body.signal`, `body.samples`, `body.device`, …) |
+| `tags` | map | the message-**envelope** `tags` metadata (`tags.site`, `tags.thing`, …) — **not** the signal |
+| `samples` | array | `body.samples` (or `[]` if absent) — each element a map with `value`, `quality`, … |
+| `value` | any | a convenience: the **first** sample's `value` (number, string, or bool) |
+| `quality` | string | a convenience: the **first** sample's `quality` (`""` if absent) |
+
+`body` and `tags` are the two roots. `value`/`quality`/`samples` are conveniences derived from the
+southbound shape — on a non-southbound payload `samples` is `[]` and `value`/`quality` are
+empty/`""`, but `body` always holds whatever JSON arrived, so a script is **payload-agnostic**: read
+your own paths off `body`.
+
+### What a script returns
+
+The return value is the whole contract — there is no other output channel:
+
+- **`filter` `script`** → a **boolean**. `true` keeps the message, `false` drops it. A non-boolean
+  result or a runtime error is treated as `false` (drop) and logged at WARN — a filter fails *closed*.
+- **`script` stage** → the **new body**. A map (`#{ … }`) replaces `body`; the envelope (`header`,
+  `tags`) is preserved. **`()`** (Rhai unit) **drops** the message. A result that can't convert to
+  JSON, or a runtime error, also drops the message (logged at WARN).
+
+So a transform either reshapes (`return a map`) or drops (`return ()`); a predicate either keeps
+(`true`) or drops (`false`). Nothing partially mutates the message in place.
+
+### Scripts are stateless (one message in, one decision out)
+
+Each evaluation gets a **fresh scope** and sees **only the current message** — there is no variable
+that persists from one message to the next, no counter, no rolling window inside a script. This is
+deliberate: it keeps a script a pure function (easy to reason about, impossible to leak memory
+across messages, safe to share one engine across every route). **Cross-message state lives in the
+built-in stages**, which the worker owns and drives on a timer: use `sample` for rate state and
+`aggregate` for windowed counters/min/max/avg. (A future revision may add an opt-in per-key script
+state object; it is intentionally not in this version.)
+
+### Worked examples
+
+```jsonc
+// filter: keep only when every sample is GOOD and under 100
+{ "filter": { "script": "samples.all(|s| s.quality == \"GOOD\" && s.value < 100.0)" } }
+
+// transform: rescale the first value and stamp the source topic, keeping the signal identity
+{ "script": "#{ \"signal\": body.signal, \"scaled\": value * 0.1, \"src\": topic }" }
+
+// conditional drop: keep the body as-is below the limit, drop it above
+{ "script": "if value > 1000.0 { () } else { body }" }
+
+// payload-agnostic: a non-southbound body, read your own paths and fold in envelope metadata
+{ "script": "#{ \"site\": tags.site, \"tempF\": body.temperature * 1.8 + 32.0 }" }
+
+// from a file (multi-line logic): rules/derive.rhai resolved under scriptsDir
+{ "script": { "file": "rules/derive.rhai" } }
+```
+
+`#{ … }` is a Rhai object-map literal; `||` is a closure; arrays have `.all` / `.any` / `.map`; `()`
+is unit (drop). JSON numbers arrive as integers or floats and `quality` as a string. Keep a script
+short — it runs on **every** message on the route's hot path, under the shared 1,000,000-op budget.
+
 ## The two flows: from adapter to cloud
 
 ```mermaid
 flowchart LR
     ADP["southbound adapters<br/>OPC UA · Modbus · …"]
-    BUS["local bus<br/>southbound/{site}/…/{tagId}"]
+    BUS["local bus<br/>southbound/{site}/…/{signalId}"]
     PROC["<b>Telemetry Processor</b><br/>one route per instances[] entry"]
     DISP["target dispatch"]
     LOC["<b>local</b><br/>republish on the bus"]
@@ -129,7 +224,7 @@ flowchart TD
 **Sampling decides resolution (①).** The `sample` stage is per key: with `everyMs` it keeps the first
 message it sees for a key, then drops everything for that key until the interval has elapsed; with
 `everyN` it keeps one message in every N. It is the processor-side throttle for a chatty source — turn
-a 1 kHz tag into a 1 Hz one before anything downstream has to carry the volume.
+a 1 kHz signal into a 1 Hz one before anything downstream has to carry the volume.
 
 **Windowing decides granularity (②).** The `aggregate` stage buckets each key's samples into
 **tumbling** windows and folds their `value`s with the configured reducers. A **time** window is
@@ -160,22 +255,28 @@ are emitted before exit, so a graceful stop loses no in-flight aggregate.
 ## What it consumes and emits
 
 The processor **consumes** the cross-language southbound envelope, header `name =
-"SouthboundTagUpdate"` (§2 of the southbound contract). The envelope is `header` + `tags` (`thing`,
+"SouthboundSignalUpdate"` (§2 of the southbound contract). The envelope is `header` + `tags` (`thing`,
 `appId`, `site`, `shop`, `line`) + `body`, where the body is
-`{ device:{ adapter, instance, endpoint }, tag:{ id, name, address }, samples:[ { value, quality,
+`{ device:{ adapter, instance, endpoint }, signal:{ id, name, address }, samples:[ { value, quality,
 qualityRaw, sourceTs, serverTs } ] }`. `quality` is normalized to `GOOD`/`BAD`/`UNCERTAIN` with the
-native code preserved in `qualityRaw`; `tag.id` is the stable canonical key the cloud routes on. The
-stages read this shape directly — `filter` gates on `samples[].quality`, `aggregate` folds
-`samples[].value`, the route/partition key defaults to `body.tag.id`. A payload that is *not*
-southbound-shaped is not rejected: the aggregate stage folds the whole body as a single value.
+native code preserved in `qualityRaw`; `signal.id` is the stable canonical key the cloud routes on.
+The stages read this shape directly — `filter` gates on `samples[].quality`, `aggregate` folds
+`samples[].value`, the route/partition key defaults to `body.signal.id`.
+
+But the shape is a **default, not a requirement** — the processor is payload-agnostic. Any JSON body
+that matches a route's `subscribe` filter flows through, and every southbound assumption is
+overridable: a `filter` `field`/`script` reads your own paths, the route `key` and the aggregate
+`value` path point at any field, and the file sink's [rows projection](#targets-and-the-file-sink)
+can be declared column-by-column. A payload that is *not* southbound-shaped is never rejected — with
+the defaults, the aggregate stage folds the whole body as one value.
 
 `filter`, `sample`, `project`, and `script` preserve the envelope (filter passes it untouched; project
 and script rewrite the body). The `aggregate` stage is the one that **emits a new message shape**,
-`ProcessedTelemetry`: it reuses the first message of the window as the base (so `tags`, `thing`, and
-the source `tag` carry through) and rewrites the body to
+`ProcessedTelemetry`: it reuses the first message of the window as the base (so the envelope `tags` and
+the source `signal` carry through) and rewrites the body to
 
 ```json
-{ "tag": { ... },
+{ "signal": { ... },
   "samples": [ { "value": <primary>, "quality": "GOOD" } ],
   "agg": { "avg": ..., "max": ..., "count": ... },
   "window": { "startMs": ..., "endMs": ..., "count": ... } }
@@ -184,7 +285,7 @@ the source `tag` carry through) and rewrites the body to
 The `samples[0].value` carries the **primary** reducer — the *first-listed* `fn` — so a downstream
 file sink in rows mode always lands a value column; the full reducer set lives under `agg`, and
 `window` records the bucket. Because the output is still a southbound-compatible envelope, a consumer
-parses a rollup exactly like any other tag update.
+parses a rollup exactly like any other signal update.
 
 ## Targets and the file sink
 
@@ -195,7 +296,7 @@ API — the net-new code is only the dispatch glue.
 |---|---|---|
 | `local` | Republish the processed message on the local bus, on `publish.topic` (resolved at startup) or the source topic. | — |
 | `northbound` | Publish to AWS IoT Core / a northbound MQTT broker. | `publish.qos`: `atLeastOnce` (default) or `atMostOnce` |
-| `stream:<name>` | Append to the named durable `ggcommons` stream, which exports to its configured sink — Kinesis, Kafka, or **file**. | partition key from `publish.partitionKey`, default the route key (`body.tag.id`) |
+| `stream:<name>` | Append to the named durable `ggcommons` stream, which exports to its configured sink — Kinesis, Kafka, or **file**. | partition key from `publish.partitionKey`, default the route key (`body.signal.id`) |
 
 The stream's sink is configured in the `streaming` section, not on the route, so a route forwards to
 `stream:archive` and the `archive` stream decides where the bytes land. (Stream targets require the
@@ -203,11 +304,14 @@ component's `streaming` feature; built without it, a stream target drops with a 
 
 **The file sink** is a shared `ggstreamlog` capability, so a file destination is a normal stream sink
 that inherits the durable buffer and at-least-once export. It writes **rolling Parquet (default) or
-AVRO** files in one of two modes. **`rows`** mode decodes each `SouthboundTagUpdate` and flattens every
-sample into one normalized, typed row (the site/adapter/tag columns plus a sparse typed value column)
-— query-ready for a lakehouse; a non-southbound payload is *never dropped* but routed to a sibling
-`_unmapped` raw file. **`raw`** mode keeps one opaque row per message for archival or replay. Files
-roll on size (`maxFileBytes`) or time (`rollEverySecs`), and `maxFiles` caps the on-disk ring.
+AVRO** files in one of two modes. **`rows`** mode flattens telemetry into normalized, typed rows —
+query-ready for a lakehouse. Its **default projection** decodes each `SouthboundSignalUpdate` into one
+row per sample (the envelope `tags` as a single JSON column, the `signal`/`device` identity, and a
+sparse typed value column); a non-southbound payload is *never dropped* but routed to a sibling
+`_unmapped` raw file. A **declared projection** (a `rows` config block) instead lands your own columns
+from arbitrary paths — payload-agnostic, no southbound assumption. **`raw`** mode keeps one opaque row
+per message for archival or replay. Files roll on size (`maxFileBytes`) or time (`rollEverySecs`), and
+`maxFiles` caps the on-disk ring.
 
 Two properties matter when you tune it. First, **`maxFileBytes` is a soft cap**: it is evaluated at
 row-group granularity, so a finalized file can exceed it by up to one row group plus the Parquet
@@ -216,7 +320,7 @@ footer — set `batch.maxBytes` comfortably below `maxFileBytes` if you need tig
 the open file (no loss); after a hard crash, **AVRO recovers to its last sync block** while **Parquet
 discards the unclosed, footer-less file** (loss bounded by the open-file window — keep `rollEverySecs`
 small, or prefer AVRO, when that matters). Because re-delivery after a crash can duplicate records,
-**de-duplicate downstream on `(tagId, sourceTs)`**.
+**de-duplicate downstream on `(signalId, sourceTs)`**.
 
 ## A note on lifecycle and what isn't here
 

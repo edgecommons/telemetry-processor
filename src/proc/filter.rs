@@ -13,7 +13,7 @@ use smallvec::smallvec;
 
 use crate::config::FilterSpec;
 use crate::json_path::resolve_values;
-use crate::proc::script::RhaiEval;
+use crate::proc::script::{RhaiEval, ScriptLoader};
 use crate::proc::{Out, ProcMsg, Processor};
 
 enum Op {
@@ -41,9 +41,13 @@ pub struct FilterStage {
 }
 
 impl FilterStage {
-    pub fn build(spec: &FilterSpec, engine: &Arc<Engine>) -> anyhow::Result<Self> {
+    pub fn build(
+        spec: &FilterSpec,
+        engine: &Arc<Engine>,
+        loader: &ScriptLoader,
+    ) -> anyhow::Result<Self> {
         let pred = if let Some(src) = &spec.script {
-            Predicate::Rhai(RhaiEval::compile(engine, src)?)
+            Predicate::Rhai(RhaiEval::compile(engine, &loader.load(src)?)?)
         } else if let Some(q) = &spec.quality {
             Predicate::QualityAll(q.clone())
         } else if let Some(field) = &spec.field {
@@ -141,13 +145,14 @@ fn as_num(v: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ScriptSource;
     use crate::proc::now_ms;
     use ggcommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     fn msg(samples: Value) -> ProcMsg {
-        let m = MessageBuilder::new("SouthboundTagUpdate", "1.0")
-            .payload(json!({ "tag": { "id": "t1" }, "samples": samples }))
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .payload(json!({ "signal": { "id": "t1" }, "samples": samples }))
             .build();
         ProcMsg { topic: "southbound/x".into(), msg: m, recv_ms: now_ms() }
     }
@@ -159,7 +164,7 @@ mod tests {
     #[test]
     fn quality_all_keeps_only_all_good() {
         let spec = FilterSpec { quality: Some("GOOD".into()), ..Default::default() };
-        let mut s = FilterStage::build(&spec, &engine()).unwrap();
+        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default()).unwrap();
         let good = msg(json!([{ "value": 1, "quality": "GOOD" }, { "value": 2, "quality": "GOOD" }]));
         let mixed = msg(json!([{ "value": 1, "quality": "GOOD" }, { "value": 2, "quality": "BAD" }]));
         assert_eq!(s.process(good).len(), 1);
@@ -174,7 +179,7 @@ mod tests {
             value: Some(json!(50)),
             ..Default::default()
         };
-        let mut s = FilterStage::build(&spec, &engine()).unwrap();
+        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default()).unwrap();
         assert_eq!(s.process(msg(json!([{ "value": 99 }]))).len(), 1);
         assert_eq!(s.process(msg(json!([{ "value": 10 }]))).len(), 0);
     }
@@ -182,10 +187,10 @@ mod tests {
     #[test]
     fn rhai_filter_predicate() {
         let spec = FilterSpec {
-            script: Some("samples.all(|s| s.quality == \"GOOD\")".into()),
+            script: Some(ScriptSource::Inline("samples.all(|s| s.quality == \"GOOD\")".into())),
             ..Default::default()
         };
-        let mut s = FilterStage::build(&spec, &engine()).unwrap();
+        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default()).unwrap();
         assert_eq!(s.process(msg(json!([{ "value": 1, "quality": "GOOD" }]))).len(), 1);
         assert_eq!(s.process(msg(json!([{ "value": 1, "quality": "BAD" }]))).len(), 0);
     }
@@ -199,6 +204,7 @@ mod tests {
                 ..Default::default()
             },
             &engine(),
+            &ScriptLoader::default(),
         )
         .unwrap()
     }
@@ -212,16 +218,16 @@ mod tests {
         assert_eq!(mk("body.samples[].value", "le", Some(json!(10))).process(m()).len(), 0);
         assert_eq!(mk("body.samples[].quality", "ne", Some(json!("BAD"))).process(m()).len(), 1);
         assert_eq!(mk("body.samples[].quality", "eq", Some(json!("GOOD"))).process(m()).len(), 1);
-        assert_eq!(mk("body.tag.id", "exists", None).process(m()).len(), 1);
+        assert_eq!(mk("body.signal.id", "exists", None).process(m()).len(), 1);
         assert_eq!(mk("body.missing", "exists", None).process(m()).len(), 0);
-        assert_eq!(mk("body.tag.id", "contains", Some(json!("t"))).process(m()).len(), 1);
-        assert_eq!(mk("body.tag.id", "contains", Some(json!("zzz"))).process(m()).len(), 0);
+        assert_eq!(mk("body.signal.id", "contains", Some(json!("t"))).process(m()).len(), 1);
+        assert_eq!(mk("body.signal.id", "contains", Some(json!("zzz"))).process(m()).len(), 0);
     }
 
     #[test]
     fn build_and_op_parse_errors() {
         // No predicate form configured.
-        assert!(FilterStage::build(&FilterSpec::default(), &engine()).is_err());
+        assert!(FilterStage::build(&FilterSpec::default(), &engine(), &ScriptLoader::default()).is_err());
         // Unknown op.
         assert!(Op::parse("bogus").is_err());
         // Symbolic aliases parse.

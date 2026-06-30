@@ -24,10 +24,25 @@ fn lenient_opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Er
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GlobalDefaults {
-    /// Default aggregation/partition key path (e.g. `body.tag.id`).
+    /// Default aggregation/partition key path (e.g. `body.signal.id`).
     pub key: Option<String>,
     /// Default target when a route omits one.
     pub target: Option<String>,
+    /// Base directory for `{"file": "…"}` script references (template-substituted). Relative script
+    /// paths resolve against it; defaults to the process working directory.
+    pub scripts_dir: Option<String>,
+}
+
+/// A Rhai script: inline source, or a path to a `.rhai` file read at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ScriptSource {
+    /// Inline Rhai source.
+    Inline(String),
+    /// A path to a `.rhai` file (relative to `global.defaults.scriptsDir`, or absolute), read once
+    /// at startup. Use this for anything beyond a one-liner — see the deployment guides for shipping
+    /// scripts as Greengrass artifacts / a Kubernetes ConfigMap.
+    File { file: String },
 }
 
 /// One route (a `component.instances[]` entry).
@@ -43,7 +58,7 @@ pub struct RouteConfig {
     pub target: Option<String>,
     #[serde(default)]
     pub publish: Option<PublishConfig>,
-    /// Aggregation/partition key path; falls back to the global default, then `body.tag.id`.
+    /// Aggregation/partition key path; falls back to the global default, then `body.signal.id`.
     #[serde(default)]
     pub key: Option<String>,
     /// Depth of this route's internal channel between the subscribe handler and the worker
@@ -60,9 +75,9 @@ pub enum StageConfig {
     Sample(SampleSpec),
     Aggregate(AggregateSpec),
     Project(ProjectSpec),
-    /// A Rhai transform: `{"script": "<expr or statements>"}`. The script sees `topic` + the message
-    /// fields and returns a new body map, or `()` to drop the message.
-    Script(String),
+    /// A Rhai transform: `{"script": "<expr>"}` (inline) or `{"script": {"file": "rules/x.rhai"}}`.
+    /// The script sees `topic` + the message fields and returns a new body map, or `()` to drop.
+    Script(ScriptSource),
 }
 
 /// `filter` stage. Exactly one form applies, checked in order: `script` (Rhai predicate) →
@@ -70,8 +85,9 @@ pub enum StageConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FilterSpec {
-    /// A Rhai boolean expression over the message view; keep the message when it returns `true`.
-    pub script: Option<String>,
+    /// A Rhai boolean predicate over the message view — inline source or `{"file": "…"}`; keep the
+    /// message when it returns `true`.
+    pub script: Option<ScriptSource>,
     /// Shorthand: keep the message only when every `body.samples[].quality` equals this.
     pub quality: Option<String>,
     /// Built-in predicate: a dotted path (supports `[]` array spread).
@@ -105,13 +121,18 @@ pub struct AggregateSpec {
     /// Reducers: `avg`, `max`, `min`, `sum`, `count`, `first`, `last`.
     #[serde(rename = "fn")]
     pub fns: Vec<String>,
+    /// Path to the value(s) to aggregate (supports `[]` for arrays). Default:
+    /// `body.samples[].value`, falling back to the whole body for non-sample payloads. Set this for
+    /// non-`SouthboundSignalUpdate` payloads (e.g. `body.temperature`).
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 /// `project` stage: keep a whitelist of body paths and/or set literal fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectSpec {
-    /// Body paths to keep (relative to `body`), e.g. `["tag.id", "tag.name", "samples"]`.
+    /// Body paths to keep (relative to `body`), e.g. `["signal.id", "signal.name", "samples"]`.
     pub keep: Option<Vec<String>>,
     /// Literal fields to set on the body.
     pub set: Option<Map<String, Value>>,
@@ -193,8 +214,8 @@ mod tests {
             "pipeline": [
                 { "filter": { "quality": "GOOD" } },
                 { "sample": { "everyMs": 1000.0 } },
-                { "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg", "max"] } },
-                { "project": { "keep": ["tag.id", "samples"] } },
+                { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max"] } },
+                { "project": { "keep": ["signal.id", "samples"] } },
                 { "script": "body" }
             ],
             "target": "stream:archive"
@@ -205,6 +226,21 @@ mod tests {
         assert!(matches!(r.pipeline[0], StageConfig::Filter(_)));
         assert!(matches!(r.pipeline[4], StageConfig::Script(_)));
         assert_eq!(Target::parse(r.target.as_deref().unwrap()).unwrap(), Target::Stream("archive".into()));
+    }
+
+    #[test]
+    fn script_stage_parses_inline_and_file_forms() {
+        // Inline string → ScriptSource::Inline.
+        let inline: StageConfig = serde_json::from_value(json!({ "script": "body" })).unwrap();
+        assert!(matches!(inline, StageConfig::Script(ScriptSource::Inline(s)) if s == "body"));
+        // Object `{"file": "..."}` → ScriptSource::File.
+        let file: StageConfig =
+            serde_json::from_value(json!({ "script": { "file": "rules/x.rhai" } })).unwrap();
+        assert!(matches!(file, StageConfig::Script(ScriptSource::File { file }) if file == "rules/x.rhai"));
+        // A `filter` may also take a `{"file": "..."}` predicate.
+        let f: FilterSpec =
+            serde_json::from_value(json!({ "script": { "file": "rules/keep.rhai" } })).unwrap();
+        assert!(matches!(f.script, Some(ScriptSource::File { file }) if file == "rules/keep.rhai"));
     }
 
     #[test]

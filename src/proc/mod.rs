@@ -56,12 +56,15 @@ impl Pipeline {
         stages: &[StageConfig],
         route_key: &str,
         engine: &Arc<Engine>,
+        loader: &script::ScriptLoader,
     ) -> anyhow::Result<Self> {
         let mut built: Vec<Box<dyn Processor>> = Vec::with_capacity(stages.len());
         let mut tick_hints: Vec<u64> = Vec::new();
         for sc in stages {
             let stage: Box<dyn Processor> = match sc {
-                StageConfig::Filter(spec) => Box::new(filter::FilterStage::build(spec, engine)?),
+                StageConfig::Filter(spec) => {
+                    Box::new(filter::FilterStage::build(spec, engine, loader)?)
+                }
                 StageConfig::Sample(spec) => Box::new(sample::SampleStage::build(spec, route_key)?),
                 StageConfig::Aggregate(spec) => {
                     if let Window::Time { ms } = Window::parse(&spec.window)? {
@@ -70,7 +73,9 @@ impl Pipeline {
                     Box::new(aggregate::AggregateStage::build(spec, route_key)?)
                 }
                 StageConfig::Project(spec) => Box::new(project::ProjectStage::build(spec)),
-                StageConfig::Script(src) => Box::new(script::ScriptStage::build(src, engine)?),
+                StageConfig::Script(src) => {
+                    Box::new(script::ScriptStage::build(src, engine, loader)?)
+                }
             };
             built.push(stage);
         }
@@ -120,9 +125,9 @@ mod tests {
         Arc::new(Engine::new())
     }
 
-    fn one(tag: &str, val: f64, q: &str, recv: u64) -> Out {
-        let m = MessageBuilder::new("SouthboundTagUpdate", "1.0")
-            .payload(json!({ "tag": { "id": tag }, "samples": [{ "value": val, "quality": q }] }))
+    fn one(signal: &str, val: f64, q: &str, recv: u64) -> Out {
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .payload(json!({ "signal": { "id": signal }, "samples": [{ "value": val, "quality": q }] }))
             .build();
         let mut s: Out = SmallVec::new();
         s.push(ProcMsg { topic: "t".into(), msg: m, recv_ms: recv });
@@ -137,9 +142,10 @@ mod tests {
                 window: "2".into(),
                 by: None,
                 fns: vec!["count".into(), "avg".into()],
+                value: None,
             }),
         ];
-        let mut p = Pipeline::build(&stages, "body.tag.id", &engine()).unwrap();
+        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default()).unwrap();
         assert_eq!(p.min_tick_ms(), None, "a count window needs no flush timer");
 
         // BAD is filtered out; two GOODs fill the count=2 window and emit on the second.
@@ -159,9 +165,10 @@ mod tests {
                 window: "1s".into(),
                 by: None,
                 fns: vec!["count".into()],
+                value: None,
             }),
         ];
-        let mut p = Pipeline::build(&stages, "body.tag.id", &engine()).unwrap();
+        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default()).unwrap();
         assert_eq!(p.min_tick_ms(), Some(1000));
         p.run(one("a", 1.0, "GOOD", 100), None);
         let out = p.run(SmallVec::new(), Some(2000));

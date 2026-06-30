@@ -42,8 +42,9 @@ Cross-route defaults overlaid by each route (`global ⊕ instance`, instance win
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `key` | string | `body.tag.id` | Default aggregation / sample / stream-partition key path (a [dotted path](#key-paths)). |
+| `key` | string | `body.signal.id` | Default aggregation / sample / stream-partition key path (a [dotted path](#key-paths)). |
 | `target` | string | — | Default `target` for a route that omits one (`local` \| `northbound` \| `stream:<name>`). |
+| `scriptsDir` | string (template) | the process working dir | Base directory for `script` **file** references (`{"file": "rules/x.rhai"}`). A relative script path resolves against it; an absolute path is used as-is. Template-resolved at startup. See [Use an external script file](../how-to-guides.md#use-an-external-script-file). |
 
 ## `component.instances[]` (one route)
 
@@ -56,7 +57,7 @@ Each entry is one independent route: subscribe → pipeline → target.
 | `pipeline` | stage[] | `[]` | Ordered processing stages (below). Empty = pass-through. |
 | `target` | string | `global.defaults.target` | `local` \| `northbound` \| `stream:<name>`. Required if no global default. |
 | `publish` | object | — | Output topic / partition key / QoS (below). |
-| `key` | string | `global.defaults.key` ▸ `body.tag.id` | Route default key path for `sample`/`aggregate`/stream partitioning. |
+| `key` | string | `global.defaults.key` ▸ `body.signal.id` | Route default key path for `sample`/`aggregate`/stream partitioning. |
 | `maxQueue` | number | `256` | Per-route internal queue depth. **Drop-on-full**: when the route's worker can't keep up, new messages are dropped (logged at debug). |
 
 > Numeric fields accept an integer **or** an integer-valued float (Greengrass delivers config numbers
@@ -73,7 +74,8 @@ Each entry is one independent route: subscribe → pipeline → target.
 ## Pipeline stages
 
 A stage is an externally-tagged object — `{"filter": {…}}`, `{"sample": {…}}`, `{"aggregate": {…}}`,
-`{"project": {…}}`, or `{"script": "<rhai>"}`. Stages run in order; each transforms 0..N messages.
+`{"project": {…}}`, or `{"script": "<rhai>"}` / `{"script": {"file": "<path>"}}`. Stages run in
+order; each transforms 0..N messages.
 
 ### `filter` — keep/drop whole messages
 
@@ -81,7 +83,7 @@ Exactly one form applies, checked in this order: `script` → `quality` → `fie
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `script` | string | — | Rhai boolean predicate over the [message view](#rhai-scope); keep when it returns `true`. |
+| `script` | string \| `{file}` | — | Rhai boolean predicate over the [message view](#rhai-scope); keep when it returns `true`. Inline source, or `{"file": "rules/keep.rhai"}` — see [`script`](#script-stage). |
 | `quality` | string | — | Shorthand: keep only when **every** `body.samples[].quality` equals this (and ≥1 sample exists). |
 | `field` | string (path) | — | Built-in predicate path (supports `[]` array spread → any-element match). |
 | `op` | string | `eq` | `eq` \| `ne` \| `gt` \| `lt` \| `ge` \| `le` \| `exists` \| `contains` (symbolic aliases `==`/`!=`/`>`/…/`>=` also parse). |
@@ -99,6 +101,7 @@ Exactly one form applies, checked in this order: `script` → `quality` → `fie
 
 > Needs exactly one of `everyMs` / `everyN`.
 
+<a id="aggregate-stage"></a>
 ### `aggregate` — tumbling windowed reduction
 
 Emits one [`ProcessedTelemetry`](messaging-interface.md#aggregate-output-processedtelemetry) per
@@ -109,24 +112,36 @@ Emits one [`ProcessedTelemetry`](messaging-interface.md#aggregate-output-process
 | `window` | string | **required** | Time window `"10s"` / `"500ms"`, or a bare record **count** `"100"`. |
 | `by` | string (path) | the route `key` | Per-key path. |
 | `fn` | string[] | **required (non-empty)** | Reducers: `avg` \| `max` \| `min` \| `sum` \| `count` \| `first` \| `last`. The **first** listed is the *primary* (lands in `samples[0].value`). |
+| `value` | string (path) | `body.samples[].value` ▸ whole body | Path to the value(s) to fold (supports `[]` to spread an array). Defaults to every `body.samples[].value`, falling back to the whole body for a payload with no `samples`. **Set this for a non-`SouthboundSignalUpdate` payload** — e.g. `"body.temperature"`. |
 
 > Time windows close on the worker flush tick or when a message for a newer window arrives; **count**
 > windows close in-line when N is reached. Numeric reducers (`avg`/`max`/`min`/`sum`) skip
-> non-numeric samples; `count` counts all; `first`/`last` keep the raw sample value.
+> non-numeric samples; `count` counts all; `first`/`last` keep the raw value.
 
 ### `project` — reshape / whitelist the body
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `keep` | string[] | — | Body paths to retain. **Only the first path segment (top-level body key) is kept** — e.g. `"tag.id"` retains the whole `tag` object. |
+| `keep` | string[] | — | Body paths to retain. **Only the first path segment (top-level body key) is kept** — e.g. `"signal.id"` retains the whole `signal` object. |
 | `set` | object | — | Literal fields overlaid onto the body. |
 
 > With neither `keep` nor `set`, the body passes through unchanged.
 
+<a id="script-stage"></a>
 ### `script` — Rhai transform
 
-`{"script": "<rhai source>"}` — a Rhai program run per message that returns a new body map, or `()`
-to **drop** the message. Compiled once at startup; the shared engine is bounded (1,000,000 ops).
+A Rhai program run per message that returns a new body map, or `()` to **drop** the message. The
+source is given **inline** or from an **external file**:
+
+| Form | Meaning |
+|------|---------|
+| `{"script": "<rhai source>"}` | Inline source. Good for a one-liner. |
+| `{"script": {"file": "rules/x.rhai"}}` | Read the program from a `.rhai` file at startup. The path resolves against [`global.defaults.scriptsDir`](#componentglobaldefaults) when relative, or is used as-is when absolute. Use this for anything beyond a one-liner — see [Use an external script file](../how-to-guides.md#use-an-external-script-file). |
+
+Both forms are **compiled once at startup** (a bad path or a compile error fails fast, before any
+message flows); the shared engine is bounded (1,000,000 ops/eval) so a runaway script cannot wedge a
+worker. For the full scripting model — scope, state, return values, examples — see the
+[Scripting explanation](../explanation.md#scripting-with-rhai).
 
 <a id="rhai-scope"></a>**Rhai scope** (available to both `filter` `script` and the `script` stage):
 
@@ -134,7 +149,7 @@ to **drop** the message. Compiled once at startup; the shared engine is bounded 
 |---------|------|-------|
 | `topic` | string | the source topic |
 | `body` | map | the message body |
-| `tags` | map | the envelope `tags{}` |
+| `tags` | map | the envelope `tags{}` (message metadata — *not* the signal) |
 | `samples` | array | `body.samples` (or `[]`) |
 | `value` | any | the first sample's `value` |
 | `quality` | string | the first sample's `quality` |
@@ -142,7 +157,7 @@ to **drop** the message. Compiled once at startup; the shared engine is bounded 
 <a id="key-paths"></a>
 > **Key paths** are dotted paths over the message: roots `body.` (the default when no known root
 > prefix is present), `tags.`, `header.`; a `[]` suffix on a segment spreads across an array. Examples:
-> `body.tag.id`, `body.samples[].quality`, `tags.site`.
+> `body.signal.id`, `body.samples[].quality`, `tags.site`.
 
 ## Template variables
 
@@ -153,7 +168,7 @@ config):
 |----------|-------------|
 | `{ThingName}` | the `-t/--thing` value (or platform identity) |
 | `{ComponentName}` / `{ComponentFullName}` | the component's short / fully-qualified name |
-| `{<key>}` | any key under top-level `tags` — e.g. `{site}`, `{appId}`, `{shop}`, `{line}`, `{tag}` if defined |
+| `{<key>}` | any key under top-level `tags` — e.g. `{site}`, `{appId}`, `{shop}`, `{line}`, or any custom key |
 
 ## The `streaming` section
 
@@ -192,15 +207,35 @@ Rolling Parquet/Avro files for later bulk upload to a cloud data lake. Files lan
 | `rollEverySecs` | number | `0` (disabled) | Roll the open file after this age, evaluated on the next send. |
 | `onFull` | enum | `dropOldest` | At `maxFiles`: `dropOldest` (delete the oldest finalized file) or `stop` (refuse to open a new file → buffer applies backpressure). |
 | `compression` | enum | `snappy` | `none` \| `snappy` \| `zstd` \| `gzip` (mapped to the format's native codec). |
+| `rows` | object | — | **`rows` mode only.** A declared column projection (below). Absent → the built-in `SouthboundSignalUpdate` default projection. |
 
 > **`maxFileBytes` is a soft cap.** Size is checked at **row-group (batch) granularity** after each
 > batch's row group is flushed, and the measured size **excludes the not-yet-written footer**. A
 > finalized file can therefore overshoot `maxFileBytes` by up to one batch's row group plus the
 > footer. Keep `batch.maxBytes` comfortably **below** `maxFileBytes`.
 
-> A `rows`-mode payload that is **not** a `SouthboundTagUpdate` (not JSON, or no `body.samples`) is
-> never dropped — it is written to a sibling `_unmapped` **raw** file. See
-> [data-types.md](data-types.md#raw-schema).
+#### `rows` projection — declared columns (payload-agnostic)
+
+With `mode: "rows"` and **no `rows` block**, the sink uses its built-in default projection (decode a
+`SouthboundSignalUpdate`, one row per `body.samples[]`, envelope `tags` as one JSON column — see
+[data-types.md](data-types.md#rows-default-projection)). Supply a
+`rows` block to declare your **own** columns from arbitrary paths — the file schema is fixed from your
+list at open time and makes no assumption about a southbound shape.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `columns` | object[] | **required** | Ordered column list. Each is `{ name, path, type? }`. |
+| `columns[].name` | string | **required** | Output column name. |
+| `columns[].path` | string (path) | **required** | Dotted JSON path into the message (`body.`/`tags.`/`header.`; `<explode>[]…` is element-relative). A missing/incompatible value → a **null** cell. |
+| `columns[].type` | enum | `string` | `string` \| `long` \| `double` \| `bool` \| `json` (`json` serializes an object/array — e.g. the whole `tags`). See the [coercion table](data-types.md#rows-user-projection). |
+| `explode` | string (path) | — | Path to an array; emit **one row per element**. Columns whose path begins with `<explode>[]` resolve against the current element; all others against the whole message. |
+
+> A user projection is **never** routed to `_unmapped` — an unmatched path is a null cell. See
+> [data-types.md](data-types.md#rows-user-projection) for a worked example.
+
+> With the **default** projection, a `rows`-mode payload that is **not** a `SouthboundSignalUpdate`
+> (not JSON, or no `body.samples`) is never dropped — it is written to a sibling `_unmapped` **raw**
+> file. See [data-types.md](data-types.md#raw-schema).
 
 ### Required cargo features
 
