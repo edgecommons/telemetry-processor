@@ -1,0 +1,498 @@
+# Scripting with Rhai and Lua
+
+The built-in stages (`filter`, `sample`, `aggregate`, `project`) cover the shapes most routes need, and
+they are the right tool when they fit. **Scripting is the escape hatch** for logic they don't express:
+a derived engineering unit, a reading you only care about when it moves, a vendor payload that doesn't
+match the southbound shape, a decision that depends on the *relationship* between several samples.
+
+The processor embeds **two** script engines, and a route picks one at runtime:
+
+- **Rhai** — a small, pure-Rust language; **always compiled in** and the default. Zero build
+  toolchain, cross-compiles anywhere Rust does.
+- **Lua 5.4** — the mature, widely-known language; available when the binary is built with the
+  `scripting-lua` feature. A Lua script is also **portable across the other language ports** of the
+  processor.
+
+Either way a script is compiled **once at startup** and run per message on the route's hot path, with
+no I/O, a sandbox, and a bounded operation budget — it can shape data but can't reach outside the
+pipeline. This page is the complete guide: choosing an engine, the two roles a script plays, everything
+a script can see and must return, and a **cookbook** whose every example is shown in *both* engines
+(and is backed by a test in the processor's own suite).
+
+## Choosing an engine
+
+Select the engine per route with `scriptEngine` — a global default with a per-route override; the
+default is `rhai`:
+
+```jsonc
+"component": {
+  "global": { "defaults": { "scriptEngine": "rhai" } },   // applies to every route…
+  "instances": [
+    { "id": "vibration", "scriptEngine": "lua", "subscribe": ["…"], "pipeline": [ /* Lua scripts */ ] }
+  ]
+}
+```
+
+- **The script *dialect* follows the engine.** A route set to `lua` writes Lua; a route set to `rhai`
+  writes Rhai. They are different languages — the cookbook below gives every example in both.
+- **`lua` needs the `scripting-lua` build.** Rhai is always available. Lua is compiled in only when the
+  binary was built `--features scripting-lua` (release artifacts are); selecting `lua` in a build
+  without it is a **fail-fast startup error**, not a silent fallback.
+- **Which to pick?** For typical scripts it barely matters — both are marshaling-bound and effectively
+  tied. Lua (5.4) runs **~2–2.5× faster on heavy per-message array/compute** (big reductions, RMS over
+  large arrays); Rhai keeps the pure-Rust, zero-toolchain build. Pick Lua when a route does genuinely
+  heavy math on high volume, or when you want scripts portable across ports; otherwise Rhai is the
+  simplest default.
+
+## The two roles a script plays
+
+Both engines, both roles use the same [scope](#the-scope). They differ only in what they return.
+
+- A **`filter` `script`** is a **predicate** — the message is kept when the result is truthy.
+- A **`script` stage** is a **transform** — it returns the **new body**, or a "nothing" value to
+  **drop** the message.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```jsonc
+{ "filter": { "script": "value > 40.0" } }
+{ "script": "#{ \"tempF\": value * 1.8 + 32.0 }" }
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```jsonc
+{ "filter": { "script": "return value > 40.0" } }
+{ "script": "return { tempF = value * 1.8 + 32.0 }" }
+```
+
+</TabItem>
+</Tabs>
+
+Inline source suits a one-liner; anything longer belongs in a `.rhai`/`.lua` file referenced as
+`{"script": {"file": "rules/derive.lua"}}`, compiled and validated at startup (a missing file or a
+syntax error stops the component immediately). See [Use an external script
+file](how-to-guides.md#use-an-external-script-file).
+
+## The scope
+
+Before each evaluation the engine binds two groups of variables — identical in both engines. The
+**message view** (the data in front of you) and the **runtime context** (constant facts about where the
+script runs).
+
+| Binding | Type | What it is |
+|---|---|---|
+| `topic` | string | the source topic the message arrived on |
+| `header` | map | the envelope header — `header.name` (message type), `header.version`, `header.timestamp` (RFC3339, publisher time), `header.uuid`, `header.correlation_id`, `header.reply_to` |
+| `body` | map | the full message body — `body.signal`, `body.samples`, or *any* JSON your payload carries |
+| `tags` | map | the message-**envelope** metadata (`tags.site`, `tags.thing`, …) — identity, **not** the signal |
+| `samples` | array | `body.samples` (or empty); each element has `value`, `quality`, `sourceTs`, … |
+| `value` | any | the **first** sample's `value` (number, string, bool, **or array**) |
+| `quality` | string | the **first** sample's `quality` |
+| `thingName` | string | the IoT Thing name (`{ThingName}`) |
+| `componentName` | string | the short component name (`{ComponentName}`) |
+| `componentFullName` | string | the fully-qualified component name |
+| `routeId` | string | the id of the route running the script |
+| `recvMs` | integer | this message's broker receive time (Unix ms) |
+
+The *whole* message (`header`, `body`, `tags`) is in scope, so you can branch on the message type,
+carry a source id for dedup/tracing, or compare the publisher timestamp against `recvMs`. `body` always
+holds whatever arrived, so **a script is payload-agnostic** — read your own paths off `body`.
+
+> **Field access differs by language.** Both see the same data; only the syntax changes — Rhai
+> `body.samples[0].value` (0-based), Lua `body.samples[1].value` (**1-based**), and Lua arrays iterate
+> with `ipairs` / length with `#`.
+
+## What a script returns
+
+The return value is the whole contract — a script never mutates the message in place.
+
+- **Filter** → truthy keeps, falsy drops. In Rhai return a `bool`; in Lua, Lua truthiness (`nil`/`false`
+  drop, everything else keeps). An error is treated as *drop* (logged) — **a filter fails closed**.
+- **Transform** → the new body: a **map** (Rhai `#{…}`) / **table** (Lua `{…}`) replaces `body`; the
+  envelope is preserved. Return **`()`** (Rhai) / **`nil`** (Lua) to **drop**. A result that can't
+  convert to JSON, or a runtime error, also drops (logged).
+
+## Scripts are stateless
+
+Each evaluation gets a **fresh view** of only the current message — no variable survives between
+messages in either engine. This keeps a script a pure function and lets one engine instance serve a
+route safely. **Cross-message state lives in the built-in stages** — `sample` for rate limiting,
+`aggregate` for windowed counters/min/max/avg. A common pattern is a `script` that *shapes* each message
+feeding an `aggregate` that *accumulates*.
+
+## Sandbox & limits
+
+Both engines are locked down to the same guarantees:
+
+- **No I/O.** Rhai has none by construction. The Lua engine loads only `string`/`table`/`math` (plus
+  base functions like `ipairs`/`pairs`/`tostring`) and **nils out `os`, `io`, `package`, `require`,
+  `load`, `debug`** — there is no `ffi`, no file, no network, no way to reach the host.
+- **A bounded op budget.** Rhai caps each evaluation at 1,000,000 operations; the Lua engine enforces
+  the same via an instruction-count hook — a runaway loop (`while true do end`) is **aborted and the
+  message dropped**, never hung. (Lua 5.4's interpreter honours the count hook reliably, which is one
+  reason it, not LuaJIT, is the embedded Lua here.)
+- **Compiled once at startup**; editing a script file needs a restart.
+
+## A note on the languages
+
+You don't need to master either language — the subset here is small. Rhai is Rust/JS-like (`#{}` maps,
+`||` closures, `let`, 0-based arrays); Lua is `{}` tables, `function`, `nil`, **1-based** arrays with
+`ipairs`/`#`. Both have `if`/`for`/`while`, user functions, arithmetic with int/float promotion, and the
+usual string/array helpers. The [Rhai book](https://rhai.rs/book/) and the [Lua 5.4
+manual](https://www.lua.org/manual/5.4/) have the full languages.
+
+## Cookbook
+
+Real patterns — each with the goal, the script in **both engines** (pick a tab; the choice syncs across
+the page), and how/why it works. Every snippet is exercised by a test in `src/proc/script.rs`.
+
+### 1. Derive an engineering unit, dropping empty reads
+
+**Goal:** convert a raw Celsius reading to Fahrenheit, but drop a message that carries no sample.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+fn to_fahrenheit(c) { c * 1.8 + 32.0 }
+
+if samples.is_empty() { return (); }        // no reading → drop
+
+#{ "signal": body.signal, "tempF": to_fahrenheit(value) }
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+local function to_fahrenheit(c) return c * 1.8 + 32.0 end
+
+if #samples == 0 then return nil end        -- no reading → drop
+
+return { signal = body.signal, tempF = to_fahrenheit(value) }
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** A helper function names the conversion; the guard runs first and drops a reading-less
+message before anything uses the (absent) `value`. Deriving units at the edge means the cloud stores
+query-ready values, not raw counts.
+
+### 2. Array node: mean, peak, and RMS
+
+**Goal:** an array-valued signal (`value = [10, 20, 30]`); emit summary statistics.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+fn mean(xs) {
+    if xs.is_empty() { return 0.0; }
+    let s = 0.0;
+    for x in xs { s += x; }
+    s / xs.len()
+}
+let peak = value[0];
+for x in value { if x > peak { peak = x; } }
+#{ "mean": mean(value), "peak": peak, "n": value.len() }
+```
+
+RMS is the same shape with a `.sqrt()`:
+
+```rhai
+let sumsq = 0.0;
+for x in value { sumsq += x * x; }
+#{ "rms": (sumsq / value.len()).sqrt() }
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+local function mean(xs)
+    if #xs == 0 then return 0.0 end
+    local s = 0.0
+    for _, x in ipairs(xs) do s = s + x end
+    return s / #xs
+end
+local peak = value[1]
+for _, x in ipairs(value) do if x > peak then peak = x end end
+return { mean = mean(value), peak = peak, n = #value }
+```
+
+RMS is the same shape with `math.sqrt`:
+
+```lua
+local sumsq = 0.0
+for _, x in ipairs(value) do sumsq = sumsq + x * x end
+return { rms = math.sqrt(sumsq / #value) }
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** An array `value` is an ordinary array in either engine — index it, iterate it, take its
+length. Reducing at the edge turns a burst of numbers into the few figures an operator watches.
+
+### 3. Rate of change across consecutive samples
+
+**Goal:** a batched message carries several samples; emit the deltas between consecutive readings.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+let deltas = [];
+for i in 1..samples.len() {
+    deltas.push(samples[i].value - samples[i - 1].value);
+}
+#{ "deltas": deltas }
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+local deltas = {}
+for i = 2, #samples do
+    deltas[#deltas + 1] = samples[i].value - samples[i - 1].value
+end
+return { deltas = deltas }
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** Walk the samples from the second to the last and subtract the previous value. The
+built-in filters test one value at a time and have no notion of "the previous sample"; a rising *rate*
+is often the alarm, not the absolute value.
+
+### 4. Keep only when an array crosses a threshold enough times
+
+**Goal:** a `filter` that keeps a message only when **at least two** elements exceed 50.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+value.filter(|x| x > 50).len() >= 2
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+local c = 0
+for _, x in ipairs(value) do if x > 50 then c = c + 1 end end
+return c >= 2
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** "How many crossed the line" is exactly what the scalar built-in filters can't express. A
+single spike might be noise; two or more is a signal.
+
+### 5. A generic, reusable script that stamps identity
+
+**Goal:** one script, deployed to many components, that tags each message with where it came from —
+without hard-coding those values.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+#{
+    "signal": body.signal,
+    "value": value,
+    "thing": thingName,
+    "component": componentName,
+    "route": routeId,
+    "ingestedMs": recvMs
+}
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+return {
+    signal = body.signal,
+    value = value,
+    thing = thingName,
+    component = componentName,
+    route = routeId,
+    ingestedMs = recvMs
+}
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** `thingName`/`componentName`/`routeId`/`recvMs` come from the runtime context, not the
+message — so the *same* script text produces different identity on each device. That's how you avoid a
+bespoke script per component.
+
+### 6. Normalize a non-southbound vendor payload
+
+**Goal:** reshape `{"dev": "pump-7", "metric": "vibration", "raw": 325}` into the southbound `signal`
+shape so the built-in stages and the file sink's default projection work.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+#{
+    "signal": #{ "id": body.dev, "name": body.metric },
+    "samples": [ #{ "value": body.raw * 0.1, "quality": "GOOD" } ]
+}
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+return {
+    signal = { id = body.dev, name = body.metric },
+    samples = { { value = body.raw * 0.1, quality = "GOOD" } }
+}
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** One `script` stage at the front of a route normalizes an arbitrary payload into the shape
+everything downstream already understands — the payload-agnostic model in action.
+
+### 7. Map a status string to a code
+
+**Goal:** translate a vendor status string into a compact numeric code.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+let code = switch body.status {
+    "RUNNING" => 1,
+    "IDLE" => 0,
+    "FAULT" => -1,
+    _ => 99,
+};
+#{ "statusCode": code }
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+local s = body.status
+local code = 99
+if s == "RUNNING" then code = 1
+elseif s == "IDLE" then code = 0
+elseif s == "FAULT" then code = -1 end
+return { statusCode = code }
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** Rhai has a `switch` expression; Lua uses `if`/`elseif`. Numeric codes are cheaper to
+store and easier to threshold than free-text, and the fall-through case makes "unknown" explicit.
+
+### 8. Total an array
+
+**Goal:** sum an array value.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+#{ "total": value.reduce(|a, v| a + v, 0.0) }
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+local total = 0.0
+for _, x in ipairs(value) do total = total + x end
+return { total = total }
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** Rhai's `reduce` folds the array in one expression; Lua uses an accumulator loop (its
+standard library has no `reduce`). Both are one idea — accumulate across the elements.
+
+### 9. Route by message type and carry provenance
+
+**Goal:** keep only raw signal updates, and stamp each with the source id for dedup/tracing.
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+// filter:
+header.name == "SouthboundSignalUpdate"
+```
+
+```rhai
+// transform:
+#{
+    "signal": body.signal,
+    "value": value,
+    "msgType": header.name,
+    "sourceId": header.uuid,
+    "corrId": header.correlation_id
+}
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+-- filter:
+return header.name == "SouthboundSignalUpdate"
+```
+
+```lua
+-- transform:
+return {
+    signal = body.signal,
+    value = value,
+    msgType = header.name,
+    sourceId = header.uuid,
+    corrId = header.correlation_id
+}
+```
+
+</TabItem>
+</Tabs>
+
+**How & why.** The message *type* (`header.name`) distinguishes a raw update from an aggregated
+`ProcessedTelemetry`; `header.uuid`/`header.correlation_id` are the ids the publisher stamped —
+first-class facts about a message, not implementation detail.
+
+## Limits and gotchas
+
+- **Stateless** — no memory across messages; use `sample`/`aggregate` for cross-message state.
+- **Fail-closed / drop-on-error** — a filter that errors drops the message; a transform that errors or
+  returns a non-JSON value drops it. Scripts never crash the route.
+- **The op budget** bounds each evaluation in both engines — deep loops over large arrays on every
+  message add up; push heavy accumulation into `aggregate`.
+- **No I/O**; the Lua sandbox additionally removes `os`/`io`/`load`/`package`/`debug` (and there is no
+  `ffi`).
+- **Integer vs. float** — a JSON `20` is an integer and `20.0` a float; multiply by a float when you
+  need a float result from integer inputs.
+- **1-based Lua arrays** — `samples[1]` is the first sample in Lua, `samples[0]` in Rhai.
+
+## See also
+
+- [Use an external script file](how-to-guides.md#use-an-external-script-file) · [Ship script files with a deployment](how-to-guides.md#ship-script-files-with-a-deployment)
+- [`script` / `scriptEngine` configuration reference](reference/configuration.md#script-stage)
+- [Explanation — the pipeline](explanation.md)

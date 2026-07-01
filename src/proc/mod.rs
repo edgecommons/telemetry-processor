@@ -11,7 +11,7 @@ use ggcommons::messaging::message::Message;
 use rhai::Engine;
 use smallvec::SmallVec;
 
-use crate::config::{StageConfig, Window};
+use crate::config::{ScriptEngineKind, StageConfig, Window};
 
 pub mod aggregate;
 pub mod filter;
@@ -50,12 +50,14 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Build the pipeline from config. `route_key` is the default aggregation/sample key; `engine`
-    /// is the shared Rhai engine and `ctx` the per-route runtime context (identity + route id)
-    /// bound into every `filter`/`script` evaluation.
+    /// Build the pipeline from config. `route_key` is the default aggregation/sample key;
+    /// `engine_kind` selects the script engine (Rhai or Lua) for this route's `filter`/`script`
+    /// stages; `engine` is the shared Rhai engine and `ctx` the per-route runtime context (identity +
+    /// route id) bound into every evaluation.
     pub fn build(
         stages: &[StageConfig],
         route_key: &str,
+        engine_kind: ScriptEngineKind,
         engine: &Arc<Engine>,
         loader: &script::ScriptLoader,
         ctx: &Arc<script::ScriptContext>,
@@ -65,7 +67,7 @@ impl Pipeline {
         for sc in stages {
             let stage: Box<dyn Processor> = match sc {
                 StageConfig::Filter(spec) => {
-                    Box::new(filter::FilterStage::build(spec, engine, loader, ctx)?)
+                    Box::new(filter::FilterStage::build(spec, engine_kind, engine, loader, ctx)?)
                 }
                 StageConfig::Sample(spec) => Box::new(sample::SampleStage::build(spec, route_key)?),
                 StageConfig::Aggregate(spec) => {
@@ -76,7 +78,7 @@ impl Pipeline {
                 }
                 StageConfig::Project(spec) => Box::new(project::ProjectStage::build(spec)),
                 StageConfig::Script(src) => {
-                    Box::new(script::ScriptStage::build(src, engine, loader, ctx)?)
+                    Box::new(script::ScriptStage::build(src, engine_kind, engine, loader, ctx)?)
                 }
             };
             built.push(stage);
@@ -147,7 +149,7 @@ mod tests {
                 value: None,
             }),
         ];
-        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default(), &Arc::new(script::ScriptContext::default())).unwrap();
+        let mut p = Pipeline::build(&stages, "body.signal.id", ScriptEngineKind::Rhai, &engine(), &script::ScriptLoader::default(), &Arc::new(script::ScriptContext::default())).unwrap();
         assert_eq!(p.min_tick_ms(), None, "a count window needs no flush timer");
 
         // BAD is filtered out; two GOODs fill the count=2 window and emit on the second.
@@ -170,7 +172,7 @@ mod tests {
                 value: None,
             }),
         ];
-        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default(), &Arc::new(script::ScriptContext::default())).unwrap();
+        let mut p = Pipeline::build(&stages, "body.signal.id", ScriptEngineKind::Rhai, &engine(), &script::ScriptLoader::default(), &Arc::new(script::ScriptContext::default())).unwrap();
         assert_eq!(p.min_tick_ms(), Some(1000));
         p.run(one("a", 1.0, "GOOD", 100), None);
         let out = p.run(SmallVec::new(), Some(2000));

@@ -102,7 +102,7 @@ Array values are first-class across the stages; pick the tool for the job:
 
 - **Compute over the array in a script.** An array `value` arrives as a Rhai array — `map`/`filter`/
   `reduce`/`for` over it to emit mean, peak, RMS, counts, etc. See the
-  [Scripting cookbook](scripting.md#2-array-node-mean-peak-and-rms).
+  [Scripting cookbook](scripting.mdx#2-array-node-mean-peak-and-rms).
 
 - **Archive the array.** The file sink's default `rows` projection stores an array as JSON in the
   `valueString` column; to spread it into one row per element, declare a
@@ -146,7 +146,7 @@ Array values are first-class across the stages; pick the tool for the job:
 
 For the full scripting model — every scope binding (incl. the runtime context `thingName` /
 `componentName` / `routeId` / `recvMs`), return/error semantics, a Rhai language primer, array
-handling, and a cookbook of worked examples — see the dedicated **[Scripting guide](scripting.md)**.
+handling, and a cookbook of worked examples — see the dedicated **[Scripting guide](scripting.mdx)**.
 
 ---
 

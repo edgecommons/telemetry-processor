@@ -11,9 +11,9 @@ use rhai::Engine;
 use serde_json::Value;
 use smallvec::smallvec;
 
-use crate::config::FilterSpec;
+use crate::config::{FilterSpec, ScriptEngineKind};
 use crate::json_path::resolve_values;
-use crate::proc::script::{RhaiEval, ScriptContext, ScriptLoader};
+use crate::proc::script::{build_engine, ScriptContext, ScriptEngine, ScriptLoader};
 use crate::proc::{Out, ProcMsg, Processor};
 
 enum Op {
@@ -28,7 +28,8 @@ enum Op {
 }
 
 enum Predicate {
-    Rhai(RhaiEval),
+    /// A Rhai or Lua boolean predicate over the message view.
+    Script(Box<dyn ScriptEngine>),
     /// Keep only when **every** `body.samples[].quality` equals this string (and ≥1 sample exists).
     QualityAll(String),
     /// Keep when **any** resolved value at `path` satisfies `op` against `value`.
@@ -43,12 +44,13 @@ pub struct FilterStage {
 impl FilterStage {
     pub fn build(
         spec: &FilterSpec,
+        kind: ScriptEngineKind,
         engine: &Arc<Engine>,
         loader: &ScriptLoader,
         ctx: &Arc<ScriptContext>,
     ) -> anyhow::Result<Self> {
         let pred = if let Some(src) = &spec.script {
-            Predicate::Rhai(RhaiEval::compile(engine, &loader.load(src)?, ctx)?)
+            Predicate::Script(build_engine(kind, &loader.load(src)?, engine, ctx)?)
         } else if let Some(q) = &spec.quality {
             Predicate::QualityAll(q.clone())
         } else if let Some(field) = &spec.field {
@@ -63,7 +65,7 @@ impl FilterStage {
 
     fn keep(&self, m: &ProcMsg) -> bool {
         match &self.pred {
-            Predicate::Rhai(e) => e.eval_bool(m),
+            Predicate::Script(e) => e.eval_bool(m),
             Predicate::QualityAll(q) => {
                 let qs = resolve_values(&m.msg, "body.samples[].quality");
                 !qs.is_empty() && qs.iter().all(|v| v.as_str() == Some(q.as_str()))
@@ -169,7 +171,7 @@ mod tests {
     #[test]
     fn quality_all_keeps_only_all_good() {
         let spec = FilterSpec { quality: Some("GOOD".into()), ..Default::default() };
-        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = FilterStage::build(&spec, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let good = msg(json!([{ "value": 1, "quality": "GOOD" }, { "value": 2, "quality": "GOOD" }]));
         let mixed = msg(json!([{ "value": 1, "quality": "GOOD" }, { "value": 2, "quality": "BAD" }]));
         assert_eq!(s.process(good).len(), 1);
@@ -184,7 +186,7 @@ mod tests {
             value: Some(json!(50)),
             ..Default::default()
         };
-        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = FilterStage::build(&spec, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         assert_eq!(s.process(msg(json!([{ "value": 99 }]))).len(), 1);
         assert_eq!(s.process(msg(json!([{ "value": 10 }]))).len(), 0);
     }
@@ -195,7 +197,7 @@ mod tests {
             script: Some(ScriptSource::Inline("samples.all(|s| s.quality == \"GOOD\")".into())),
             ..Default::default()
         };
-        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = FilterStage::build(&spec, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         assert_eq!(s.process(msg(json!([{ "value": 1, "quality": "GOOD" }]))).len(), 1);
         assert_eq!(s.process(msg(json!([{ "value": 1, "quality": "BAD" }]))).len(), 0);
     }
@@ -208,6 +210,7 @@ mod tests {
                 value,
                 ..Default::default()
             },
+            ScriptEngineKind::Rhai,
             &engine(),
             &ScriptLoader::default(),
             &ctx(),
@@ -233,7 +236,7 @@ mod tests {
     #[test]
     fn build_and_op_parse_errors() {
         // No predicate form configured.
-        assert!(FilterStage::build(&FilterSpec::default(), &engine(), &ScriptLoader::default(), &ctx()).is_err());
+        assert!(FilterStage::build(&FilterSpec::default(), ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).is_err());
         // Unknown op.
         assert!(Op::parse("bogus").is_err());
         // Symbolic aliases parse.

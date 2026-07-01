@@ -34,6 +34,12 @@ streaming-kinesis = ["streaming", "ggcommons/streaming-kinesis"]
 streaming-kafka = ["streaming", "ggcommons/streaming-kafka"]
 streaming-file-parquet = ["streaming", "ggcommons/streaming-file-parquet"]
 streaming-file-avro = ["streaming", "ggcommons/streaming-file-avro"]
+# Optional second script engine, runtime-selectable per route via `scriptEngine: "lua"`. OFF by
+# default so the standard build stays pure-Rust and toolchain-free (Rhai only); enable it (release
+# artifacts do) to ship a binary that can also run Lua 5.4 scripts. Pulls mlua's vendored PUC Lua
+# 5.4 — a C build (builds on any Linux/macOS/Windows host with a C compiler, and cross-compiles for
+# aarch64 via `cross`; see docs/scripting.md).
+scripting-lua = ["dep:mlua"]
 
 [dependencies]
 # The ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building this
@@ -53,6 +59,9 @@ smallvec = "1"
 # `sync` makes Engine/AST/Dynamic Send+Sync (shared across route workers); `serde` converts the
 # message JSON to/from a Rhai value.
 rhai = { version = "1", features = ["sync", "serde"] }
+# Optional Lua 5.4 engine (feature `scripting-lua`): vendored PUC Lua (C), `send` for the per-route
+# worker task, `serialize` to marshal the message view. Sandboxed + instruction-budgeted at runtime.
+mlua = { version = "0.10", features = ["lua54", "vendored", "serialize", "send"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

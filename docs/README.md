@@ -11,7 +11,7 @@ wherever you deploy it — as a Greengrass v2 component, a standalone process, o
 |-----|------------------------------|
 | **[Tutorial](tutorial.md)** | learn by doing — bring the processor up against a local broker and watch it downsample and archive telemetry, end to end |
 | **[How-to guides](how-to-guides.md)** | accomplish a specific task — filter, downsample, window-aggregate, handle array signals, script, archive to Parquet, forward alarms northbound, deploy |
-| **[Scripting](scripting.md)** | write Rhai `filter`/`script` logic — the scope (incl. runtime context), return semantics, a language primer, array handling, and a worked cookbook |
+| **[Scripting](scripting.mdx)** | write `filter`/`script` logic in **Rhai or Lua** (runtime-selectable) — engine selection, the shared scope, return semantics, sandbox/budget, and a cookbook shown in both engines |
 | **[Reference](reference/)** | look up an exact option, topic, payload, or column type |
 | **[Explanation](explanation.md)** | understand how it works and why — the route/worker model, the processing-and-timing pipeline, targets and the file sink |
 
@@ -22,7 +22,7 @@ wherever you deploy it — as a Greengrass v2 component, a standalone process, o
 - **"What message do I subscribe to / publish, and on which topic?"** → [Reference — Messaging Interface](reference/messaging-interface.md).
 - **"How are values stored in the Parquet / AVRO files?"** → [Reference — Data Types](reference/data-types.md).
 - **"How do I downsample a fast signal or aggregate per signal?"** → [How-to guides](how-to-guides.md).
-- **"How do I write a script, and what can it see/return?"** → [Scripting](scripting.md).
+- **"How do I write a script, and what can it see/return?"** → [Scripting](scripting.mdx).
 - **"My signal's value is an array — how do I handle it?"** → [Handle array-valued signals](how-to-guides.md#handle-array-valued-signals).
 - **"How do I control file rotation — by size, time, or count?"** → [How-to guides](how-to-guides.md).
 - **"Why is my data too fast / slow / laggy, and how does windowing work?"** → [Explanation — the processing-and-timing pipeline](explanation.md).

@@ -18,7 +18,7 @@ use rhai::Engine;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::config::{GlobalDefaults, RouteConfig, Target};
+use crate::config::{GlobalDefaults, RouteConfig, ScriptEngineKind, Target};
 use crate::proc::route::{run_worker, Dispatcher};
 use crate::proc::{now_ms, Pipeline, ProcMsg};
 
@@ -47,6 +47,8 @@ struct RouteBuildCtx<'a> {
     component_name: &'a str,
     /// `{ComponentFullName}` — the fully-qualified name, injected as `componentFullName`.
     component_full_name: &'a str,
+    /// Default script engine (from `global.defaults.scriptEngine`); a route may override per-route.
+    default_script_engine: ScriptEngineKind,
 }
 
 /// The running processor: its subscriptions, channel senders, and worker tasks.
@@ -96,6 +98,7 @@ impl ProcessorApp {
             thing_name: &thing_name,
             component_name: &component_name,
             component_full_name: &component_full_name,
+            default_script_engine: defaults.script_engine.unwrap_or_default(),
         };
 
         let mut app = Self {
@@ -184,8 +187,15 @@ impl ProcessorApp {
             component_full_name: ctx.component_full_name.to_string(),
             route_id: route.id.clone(),
         });
-        let pipeline =
-            Pipeline::build(&route.pipeline, &route_key, ctx.engine, ctx.loader, &script_ctx)?;
+        let engine_kind = route.script_engine.unwrap_or(ctx.default_script_engine);
+        let pipeline = Pipeline::build(
+            &route.pipeline,
+            &route_key,
+            engine_kind,
+            ctx.engine,
+            ctx.loader,
+            &script_ctx,
+        )?;
         let dispatcher = Dispatcher::new(
             self.messaging.clone(),
             target,
