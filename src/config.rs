@@ -20,6 +20,18 @@ fn lenient_opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Er
     }
 }
 
+/// Which engine runs a route's `filter`/`script` stages. Selected at runtime via `scriptEngine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptEngineKind {
+    /// Rhai — pure-Rust, always compiled in (the default).
+    #[default]
+    Rhai,
+    /// Lua 5.4 — available only when the binary is built with the `scripting-lua` feature; selecting
+    /// it in a build without that feature is a fail-fast startup error.
+    Lua,
+}
+
 /// Cross-route defaults under `component.global.defaults`, overlaid by each route.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -31,6 +43,8 @@ pub struct GlobalDefaults {
     /// Base directory for `{"file": "…"}` script references (template-substituted). Relative script
     /// paths resolve against it; defaults to the process working directory.
     pub scripts_dir: Option<String>,
+    /// Default script engine for every route (`rhai` | `lua`); per-route `scriptEngine` overrides.
+    pub script_engine: Option<ScriptEngineKind>,
 }
 
 /// A Rhai script: inline source, or a path to a `.rhai` file read at startup.
@@ -65,6 +79,10 @@ pub struct RouteConfig {
     /// (drop-on-full). Default 256.
     #[serde(default, deserialize_with = "lenient_opt_u64")]
     pub max_queue: Option<u64>,
+    /// Script engine for this route's `filter`/`script` stages (`rhai` | `lua`); falls back to
+    /// `global.defaults.scriptEngine`, then `rhai`.
+    #[serde(default)]
+    pub script_engine: Option<ScriptEngineKind>,
 }
 
 /// One pipeline stage — externally tagged (`{"filter": {...}}`, `{"sample": {...}}`, …).
@@ -251,6 +269,20 @@ mod tests {
             StageConfig::Sample(s) => assert_eq!(s.every_n, Some(100)),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn script_engine_parses_and_defaults() {
+        // Per-route override + global default; the default engine is Rhai.
+        let r: RouteConfig =
+            serde_json::from_value(json!({ "id": "r", "scriptEngine": "lua", "subscribe": ["a"] })).unwrap();
+        assert_eq!(r.script_engine, Some(ScriptEngineKind::Lua));
+        let d: GlobalDefaults = serde_json::from_value(json!({ "scriptEngine": "rhai" })).unwrap();
+        assert_eq!(d.script_engine, Some(ScriptEngineKind::Rhai));
+        assert_eq!(ScriptEngineKind::default(), ScriptEngineKind::Rhai);
+        // Absent → None (falls back to Rhai at wiring time).
+        let r2: RouteConfig = serde_json::from_value(json!({ "id": "r", "subscribe": ["a"] })).unwrap();
+        assert_eq!(r2.script_engine, None);
     }
 
     #[test]

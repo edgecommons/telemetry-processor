@@ -45,6 +45,7 @@ Cross-route defaults overlaid by each route (`global ⊕ instance`, instance win
 | `key` | string | `body.signal.id` | Default aggregation / sample / stream-partition key path (a [dotted path](#key-paths)). |
 | `target` | string | — | Default `target` for a route that omits one (`local` \| `northbound` \| `stream:<name>`). |
 | `scriptsDir` | string (template) | the process working dir | Base directory for `script` **file** references (`{"file": "rules/x.rhai"}`). A relative script path resolves against it; an absolute path is used as-is. Template-resolved at startup. See [Use an external script file](../how-to-guides.md#use-an-external-script-file). |
+| `scriptEngine` | enum | `rhai` | Default engine for `filter`/`script` stages: `rhai` (pure-Rust, always available) or `lua` (Lua 5.4 — needs the `scripting-lua` build). Per-route `scriptEngine` overrides. See [Scripting — choosing an engine](../scripting.mdx#choosing-an-engine). |
 
 ## `component.instances[]` (one route)
 
@@ -59,6 +60,7 @@ Each entry is one independent route: subscribe → pipeline → target.
 | `publish` | object | — | Output topic / partition key / QoS (below). |
 | `key` | string | `global.defaults.key` ▸ `body.signal.id` | Route default key path for `sample`/`aggregate`/stream partitioning. |
 | `maxQueue` | number | `256` | Per-route internal queue depth. **Drop-on-full**: when the route's worker can't keep up, new messages are dropped (logged at debug). |
+| `scriptEngine` | enum | `global.defaults.scriptEngine` ▸ `rhai` | Engine for this route's `filter`/`script` stages (`rhai` \| `lua`). The script *dialect* follows the engine. |
 
 > Numeric fields accept an integer **or** an integer-valued float (Greengrass delivers config numbers
 > as doubles).
@@ -128,20 +130,21 @@ Emits one [`ProcessedTelemetry`](messaging-interface.md#aggregate-output-process
 > With neither `keep` nor `set`, the body passes through unchanged.
 
 <a id="script-stage"></a>
-### `script` — Rhai transform
+### `script` — a transform (Rhai or Lua)
 
-A Rhai program run per message that returns a new body map, or `()` to **drop** the message. The
-source is given **inline** or from an **external file**:
+A program run per message that returns a new body map/table, or `()` (Rhai) / `nil` (Lua) to **drop**
+the message. It runs in the route's [`scriptEngine`](#componentglobaldefaults) — the script *dialect*
+follows the engine. The source is given **inline** or from an **external file**:
 
 | Form | Meaning |
 |------|---------|
-| `{"script": "<rhai source>"}` | Inline source. Good for a one-liner. |
-| `{"script": {"file": "rules/x.rhai"}}` | Read the program from a `.rhai` file at startup. The path resolves against [`global.defaults.scriptsDir`](#componentglobaldefaults) when relative, or is used as-is when absolute. Use this for anything beyond a one-liner — see [Use an external script file](../how-to-guides.md#use-an-external-script-file). |
+| `{"script": "<source>"}` | Inline source. Good for a one-liner. |
+| `{"script": {"file": "rules/x.rhai"}}` | Read the program from a `.rhai`/`.lua` file at startup. The path resolves against [`global.defaults.scriptsDir`](#componentglobaldefaults) when relative, or is used as-is when absolute. Use this for anything beyond a one-liner — see [Use an external script file](../how-to-guides.md#use-an-external-script-file). |
 
 Both forms are **compiled once at startup** (a bad path or a compile error fails fast, before any
-message flows); the shared engine is bounded (1,000,000 ops/eval) so a runaway script cannot wedge a
-worker. For the full scripting model — scope, state, return values, the Rhai language, and a cookbook
-of worked examples — see the dedicated **[Scripting guide](../scripting.md)**.
+message flows), sandboxed, and bounded (1,000,000 ops/eval) so a runaway script cannot wedge a worker.
+For the full scripting model — engine selection, scope, state, return values, both languages, and a
+cookbook of worked examples in **both engines** — see the dedicated **[Scripting guide](../scripting.mdx)**.
 
 <a id="rhai-scope"></a>**Rhai scope** (available to both `filter` `script` and the `script` stage) —
 the per-message **message view** plus the constant **runtime context**:

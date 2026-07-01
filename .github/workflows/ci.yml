@@ -17,5 +17,7 @@ jobs:
     uses: edgecommons/.github/.github/workflows/component-ci.yml@main
     with:
       language: RUST
-      rust-features: "streaming,streaming-file-parquet,streaming-file-avro"
+      # scripting-lua builds the optional Lua 5.4 engine (mlua's vendored PUC Lua — a C build; the
+      # ubuntu runner has gcc) so both script engines are compiled + tested in CI.
+      rust-features: "streaming,streaming-file-parquet,streaming-file-avro,scripting-lua"
     secrets: inherit

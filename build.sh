@@ -19,7 +19,7 @@ BIN_NAME="telemetry-processor"
 # Device artifact uses the Greengrass IPC feature (Linux-only; needs libclang). Add the durable
 # targets you need, e.g. to ship Kinesis + rolling Parquet files:
 #   GGCOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
-FEATURES="${GGCOMMONS_FEATURES:-greengrass,streaming,streaming-kinesis,streaming-file-parquet,streaming-file-avro}"
+FEATURES="${GGCOMMONS_FEATURES:-greengrass,streaming,streaming-kinesis,streaming-file-parquet,streaming-file-avro,scripting-lua}"
 TARGET="${GGCOMMONS_TARGET:-}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 

@@ -69,38 +69,39 @@ the later stages' `process`.
 | `sample` | Per-key downsampling: keep one message per `everyMs` time window, or one in every `everyN`. The key path is `by`, falling back to the route key (`body.signal.id`). | yes (per key) |
 | `aggregate` | Tumbling-window reduction. The window is time (`"10s"`, `"500ms"`) or a bare count (`"100"`); state is keyed by `by`/route key; the folded value is `value` (default `body.samples[].value`); reducers are `avg` `max` `min` `sum` `count` `first` `last`. Emits one `ProcessedTelemetry` message per `(key, window)` when the window closes. | yes (per key) |
 | `project` | Reshape the body: `keep` a whitelist of **top-level** body keys (the first segment of each dotted path — so `keep: ["signal.id"]` retains the whole `signal` object), and/or `set` literal fields onto the body. | no |
-| `script` | A Rhai program (inline or from a `.rhai` file) that returns a new body map, or `()` to drop the message. Its scope exposes `topic`, `body`, `tags`, `samples`, and the conveniences `value`/`quality` (the **first** sample's). See [Scripting with Rhai](#scripting-with-rhai). | no |
+| `script` | A Rhai or Lua program (inline or from a file) that returns a new body map, or a "nothing" value to drop the message. Its scope exposes `topic`, `header`, `body`, `tags`, `samples`, and the conveniences `value`/`quality`. See [Scripting](#scripting). | no |
 
 Rhai is **always compiled in** — there is no feature gate, and the runtime cost is negligible when no
 route uses a script. One engine is shared by every `filter`/`script` stage, bounded to a million
 operations per evaluation so a runaway script cannot wedge a worker. A Rhai error (compile-time is
 caught at startup; runtime errors) drops the message rather than crashing the route.
 
-## Scripting with Rhai
+## Scripting
 
 The built-in stages cover the common shapes — quality gating, value thresholds, downsampling,
 windowed reduction, whitelisting. **Scripting is the escape hatch** for logic they don't express:
 a derived engineering unit, a conditional drop, a reshape of a bespoke payload, a predicate that
-spans several samples or inspects an array. [Rhai](https://rhai.rs) is a small, sandboxed,
-Rust-native language embedded in the processor; a script is compiled **once at startup** and then run
-per message, with no I/O and a bounded op budget, so it can shape data but can't reach outside the
-pipeline.
+spans several samples or inspects an array. The processor embeds **two engines**, selected per route
+with `scriptEngine`: **[Rhai](https://rhai.rs)** (pure-Rust, always compiled in, the default) and
+**Lua 5.4** (mature and widely known, available under the `scripting-lua` build). Either way a script
+is compiled **once at startup**, sandboxed, and bounded, so it can shape data but can't reach outside
+the pipeline.
 
-Scripting appears in **two roles**, both backed by the same engine and the same scope:
+Scripting appears in **two roles**, both backed by the same scope:
 
-- a **`filter` `script`** — a predicate that evaluates to a **boolean**; `true` keeps the message
-  (it fails *closed* — an error or non-boolean drops).
-- a **`script` stage** — a transform that evaluates to the **new body** (a map), or to `()` to
-  **drop** the message.
+- a **`filter` `script`** — a predicate; a truthy result keeps the message (it fails *closed* — an
+  error drops).
+- a **`script` stage** — a transform that returns the **new body**, or a "nothing" value (`()` in
+  Rhai, `nil` in Lua) to **drop** the message.
 
 A script sees the **message view** (`topic`, the `header`/`body`/`tags` maps, `samples`, and the
 first-sample conveniences `value`/`quality`) plus the **runtime context** (`thingName`, `componentName`,
 `componentFullName`, `routeId`, `recvMs`) so a generic, reusable script can branch on which
 component/route/thing it runs in. Scripts are **stateless** — each evaluation sees only the current
-message; cross-message state belongs in `sample`/`aggregate`. Array-valued fields arrive as Rhai
-arrays, so a script can `for`/`map`/`filter`/`reduce` over them like any collection.
+message; cross-message state belongs in `sample`/`aggregate`. Array-valued fields arrive as native
+arrays, so a script can iterate/reduce over them like any collection.
 
-> **Scripting has its own guide.** The dedicated **[Scripting page](scripting.md)** is the full
+> **Scripting has its own guide.** The dedicated **[Scripting page](scripting.mdx)** is the full
 > treatment: every scope binding, return and error semantics, a Rhai language primer (functions,
 > loops, ranges, `switch`, array methods), array handling, and a **cookbook of worked examples**
 > (derived units, array mean/peak/RMS, rate-of-change, reusable identity-stamping, payload

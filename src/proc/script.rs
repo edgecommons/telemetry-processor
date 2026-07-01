@@ -20,7 +20,7 @@ use rhai::{Dynamic, Engine, Scope, AST};
 use serde_json::Value;
 use smallvec::smallvec;
 
-use crate::config::ScriptSource;
+use crate::config::{ScriptEngineKind, ScriptSource};
 use crate::proc::{Out, ProcMsg, Processor};
 
 /// Per-route runtime context injected into every `filter`/`script` evaluation as **constant**
@@ -75,6 +75,44 @@ impl Default for ScriptLoader {
     }
 }
 
+/// Runtime-evaluation seam over a compiled script, so a route can run either engine. Both engines
+/// expose the same two operations; per-message scope construction + result conversion live in the
+/// impl. `Send` so a stage holding a `Box<dyn ScriptEngine>` can move into the route worker task.
+pub trait ScriptEngine: Send {
+    /// Evaluate as a `filter` predicate. Truthy → keep; error → `false` (drop), logged. Fails closed.
+    fn eval_bool(&self, m: &ProcMsg) -> bool;
+    /// Evaluate as a `script` transform: `Some(new_body)` or `None` to drop. Error / non-JSON → `None`.
+    fn eval_body(&self, m: &ProcMsg) -> Option<Value>;
+}
+
+/// Compile `src` into the engine selected by `kind`, sharing the Rhai `engine` (Rhai) or building a
+/// fresh sandboxed Lua state (Lua). Selecting `lua` in a binary built without the `scripting-lua`
+/// feature is a fail-fast error.
+pub fn build_engine(
+    kind: ScriptEngineKind,
+    src: &str,
+    engine: &Arc<Engine>,
+    ctx: &Arc<ScriptContext>,
+) -> anyhow::Result<Box<dyn ScriptEngine>> {
+    match kind {
+        ScriptEngineKind::Rhai => Ok(Box::new(RhaiEval::compile(engine, src, ctx)?)),
+        ScriptEngineKind::Lua => {
+            #[cfg(feature = "scripting-lua")]
+            {
+                Ok(Box::new(lua::LuaEngine::compile(src, ctx)?))
+            }
+            #[cfg(not(feature = "scripting-lua"))]
+            {
+                let _ = (src, ctx);
+                anyhow::bail!(
+                    "scriptEngine \"lua\" was selected but this binary was built without the \
+                     `scripting-lua` feature; rebuild with `--features scripting-lua`"
+                )
+            }
+        }
+    }
+}
+
 /// A compiled Rhai program plus the shared engine and the per-route runtime context.
 pub struct RhaiEval {
     engine: Arc<Engine>,
@@ -125,8 +163,11 @@ impl RhaiEval {
         scope
     }
 
-    /// Evaluate to a boolean (the Rhai `filter` option). Errors → `false` (drop), logged.
-    pub fn eval_bool(&self, m: &ProcMsg) -> bool {
+}
+
+impl ScriptEngine for RhaiEval {
+    /// Errors → `false` (drop), logged.
+    fn eval_bool(&self, m: &ProcMsg) -> bool {
         let mut scope = self.scope_for(m);
         match self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &self.ast) {
             Ok(d) => d.as_bool().unwrap_or(false),
@@ -137,8 +178,8 @@ impl RhaiEval {
         }
     }
 
-    /// Evaluate to a new body (the `script` stage). `()` → drop; non-convertible/error → drop, logged.
-    pub fn eval_body(&self, m: &ProcMsg) -> Option<Value> {
+    /// `()` → drop; non-convertible/error → drop, logged.
+    fn eval_body(&self, m: &ProcMsg) -> Option<Value> {
         let mut scope = self.scope_for(m);
         match self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &self.ast) {
             Ok(d) if d.is_unit() => None,
@@ -163,18 +204,19 @@ fn to_dyn(v: &Value) -> Dynamic {
 
 /// A `script` pipeline stage: replace the message body with the script's result, or drop it.
 pub struct ScriptStage {
-    eval: RhaiEval,
+    eval: Box<dyn ScriptEngine>,
 }
 
 impl ScriptStage {
     pub fn build(
         src: &ScriptSource,
+        kind: ScriptEngineKind,
         engine: &Arc<Engine>,
         loader: &ScriptLoader,
         ctx: &Arc<ScriptContext>,
     ) -> anyhow::Result<Self> {
         let text = loader.load(src)?;
-        Ok(Self { eval: RhaiEval::compile(engine, &text, ctx)? })
+        Ok(Self { eval: build_engine(kind, &text, engine, ctx)? })
     }
 }
 
@@ -186,6 +228,141 @@ impl Processor for ScriptStage {
                 smallvec![m]
             }
             None => smallvec![],
+        }
+    }
+}
+
+/// Lua 5.4 engine (feature `scripting-lua`): a sandboxed `mlua` state per stage, with the **same
+/// scope** and return contract as Rhai — `topic`/`header`/`body`/`tags`/`samples`/`value`/`quality`
+/// plus the runtime context, a table return (or `nil` to drop), Lua truthiness for filters, and a
+/// per-eval instruction budget mirroring Rhai's `max_operations`. Built via [`build_engine`].
+#[cfg(feature = "scripting-lua")]
+mod lua {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, VmState};
+    use serde_json::Value;
+
+    use super::{ProcMsg, ScriptContext, ScriptEngine};
+
+    /// Per-evaluation instruction budget, mirroring Rhai's `max_operations`.
+    const OP_BUDGET: i64 = 1_000_000;
+    /// The count hook fires every this many VM instructions.
+    const HOOK_EVERY: u32 = 4096;
+
+    pub struct LuaEngine {
+        lua: Lua,
+        func: mlua::Function,
+        /// Instructions left for the current eval; reset before each call, decremented by the hook.
+        budget: Arc<AtomicI64>,
+    }
+
+    impl LuaEngine {
+        pub fn compile(src: &str, ctx: &Arc<ScriptContext>) -> anyhow::Result<Self> {
+            // Safe stdlib only — string/table/math + base functions; no io/os/package/debug.
+            let lua = Lua::new_with(StdLib::STRING | StdLib::TABLE | StdLib::MATH, LuaOptions::default())
+                .map_err(|e| anyhow::anyhow!("lua init: {e}"))?;
+
+            {
+                let g = lua.globals();
+                // Belt-and-suspenders: remove anything that could reach the host or reload code.
+                for name in [
+                    "os", "io", "package", "require", "dofile", "loadfile", "load", "loadstring",
+                    "debug", "collectgarbage", "print",
+                ] {
+                    let _ = g.set(name, LuaValue::Nil);
+                }
+                // Constant runtime context (globals persist across calls; set once).
+                g.set("thingName", ctx.thing_name.clone())?;
+                g.set("componentName", ctx.component_name.clone())?;
+                g.set("componentFullName", ctx.component_full_name.clone())?;
+                g.set("routeId", ctx.route_id.clone())?;
+            }
+
+            // Instruction budget: the count hook decrements a shared counter and aborts at zero.
+            let budget = Arc::new(AtomicI64::new(OP_BUDGET));
+            let b = budget.clone();
+            lua.set_hook(HookTriggers::new().every_nth_instruction(HOOK_EVERY), move |_lua, _debug| {
+                if b.fetch_sub(HOOK_EVERY as i64, Ordering::Relaxed) <= HOOK_EVERY as i64 {
+                    Err(mlua::Error::runtime("script exceeded the operation budget"))
+                } else {
+                    Ok(VmState::Continue)
+                }
+            });
+
+            let func = lua
+                .load(src)
+                .into_function()
+                .map_err(|e| anyhow::anyhow!("lua compile error in `{src}`: {e}"))?;
+
+            Ok(Self { lua, func, budget })
+        }
+
+        /// Marshal the per-message data into globals + reset the op budget.
+        fn bind(&self, m: &ProcMsg) {
+            self.budget.store(OP_BUDGET, Ordering::Relaxed);
+            let g = self.lua.globals();
+            let _ = g.set("topic", m.topic.clone());
+            let _ = g.set("recvMs", m.recv_ms as i64);
+            if let Ok(v) = self.lua.to_value(&m.msg.body) {
+                let _ = g.set("body", v);
+            }
+            if let Ok(h) = serde_json::to_value(&m.msg.header) {
+                if let Ok(v) = self.lua.to_value(&h) {
+                    let _ = g.set("header", v);
+                }
+            }
+            if let Ok(t) = serde_json::to_value(&m.msg.tags) {
+                if let Ok(v) = self.lua.to_value(&t) {
+                    let _ = g.set("tags", v);
+                }
+            }
+            let samples = m.msg.body.get("samples").cloned().unwrap_or(Value::Array(vec![]));
+            if let Ok(v) = self.lua.to_value(&samples) {
+                let _ = g.set("samples", v);
+            }
+            let first = m.msg.body.get("samples").and_then(|s| s.as_array()).and_then(|a| a.first());
+            let value = first.and_then(|s| s.get("value")).cloned().unwrap_or(Value::Null);
+            let quality =
+                first.and_then(|s| s.get("quality")).and_then(|q| q.as_str()).unwrap_or("").to_string();
+            if let Ok(v) = self.lua.to_value(&value) {
+                let _ = g.set("value", v);
+            }
+            let _ = g.set("quality", quality);
+        }
+    }
+
+    impl ScriptEngine for LuaEngine {
+        fn eval_bool(&self, m: &ProcMsg) -> bool {
+            self.bind(m);
+            match self.func.call::<LuaValue>(()) {
+                // Lua truthiness: only `nil` and `false` drop; everything else keeps.
+                Ok(LuaValue::Nil) | Ok(LuaValue::Boolean(false)) => false,
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "lua filter eval error; dropping message");
+                    false
+                }
+            }
+        }
+
+        fn eval_body(&self, m: &ProcMsg) -> Option<Value> {
+            self.bind(m);
+            match self.func.call::<LuaValue>(()) {
+                Ok(LuaValue::Nil) => None,
+                Ok(v) => match self.lua.from_value::<Value>(v) {
+                    Ok(val) => Some(val),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "lua result not convertible to JSON; dropping");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "lua script eval error; dropping message");
+                    None
+                }
+            }
         }
     }
 }
@@ -214,6 +391,7 @@ mod tests {
     fn script_transforms_body_using_value_binding() {
         let mut s = ScriptStage::build(
             &ScriptSource::Inline(r#"#{ "doubled": value * 2 }"#.into()),
+            ScriptEngineKind::Rhai,
             &engine(),
             &ScriptLoader::default(),
             &ctx(),
@@ -228,6 +406,7 @@ mod tests {
     fn script_can_read_topic_and_tags() {
         let mut s = ScriptStage::build(
             &ScriptSource::Inline(r#"#{ "thing": tags.thing, "q": quality }"#.into()),
+            ScriptEngineKind::Rhai,
             &engine(),
             &ScriptLoader::default(),
             &ctx(),
@@ -242,6 +421,7 @@ mod tests {
     fn script_unit_result_drops_message() {
         let mut s = ScriptStage::build(
             &ScriptSource::Inline("()".into()),
+            ScriptEngineKind::Rhai,
             &engine(),
             &ScriptLoader::default(),
             &ctx(),
@@ -254,6 +434,7 @@ mod tests {
     fn compile_error_is_reported() {
         assert!(ScriptStage::build(
             &ScriptSource::Inline("this is not valid rhai @@".into()),
+            ScriptEngineKind::Rhai,
             &engine(),
             &ScriptLoader::default(),
             &ctx(),
@@ -271,13 +452,13 @@ mod tests {
 
         let loader = ScriptLoader::new(&dir);
         let src = ScriptSource::File { file: "double.rhai".into() };
-        let mut s = ScriptStage::build(&src, &engine(), &loader, &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &loader, &ctx()).unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": 21, "quality": "GOOD" }] })));
         assert_eq!(out[0].msg.body["doubled"], json!(42));
 
         // A missing file is a build error (surfaced at startup, not silently ignored).
         let missing = ScriptSource::File { file: "nope.rhai".into() };
-        assert!(ScriptStage::build(&missing, &engine(), &loader, &ctx()).is_err());
+        assert!(ScriptStage::build(&missing, ScriptEngineKind::Rhai, &engine(), &loader, &ctx()).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -300,7 +481,7 @@ mod tests {
                 .into(),
         );
         let ctx = ctx_with("edge-42", "TelemetryProcessor", "com.acme.TelemetryProcessor", "archive");
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx).unwrap();
         let out = s.process(pm(json!({ "samples": [] })));
         let b = &out[0].msg.body;
         assert_eq!(b["t"], json!("edge-42"));
@@ -329,7 +510,7 @@ mod tests {
             "#
             .into(),
         );
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": [10.0, 20.0, 30.0], "quality": "GOOD" }] })));
         let b = &out[0].msg.body;
         assert_eq!(b["mean"], json!(20.0));
@@ -366,7 +547,7 @@ mod tests {
             "#
             .into(),
         );
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(pm(json!({ "status": "FAULT", "samples": [] })));
         assert_eq!(out[0].msg.body["statusCode"], json!(-1));
     }
@@ -376,7 +557,7 @@ mod tests {
         // Sum an array value with `reduce` (seed 0.0).
         let src =
             ScriptSource::Inline(r#"#{ "total": value.reduce(|a, v| a + v, 0.0) }"#.into());
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": [1.5, 2.5, 4.0], "quality": "GOOD" }] })));
         assert_eq!(out[0].msg.body["total"], json!(8.0));
     }
@@ -394,7 +575,7 @@ mod tests {
             "#
             .into(),
         );
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(pm(json!({
             "samples": [ { "value": 10.0 }, { "value": 13.0 }, { "value": 12.0 } ]
         })));
@@ -413,7 +594,7 @@ mod tests {
             "#
             .into(),
         );
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(pm(json!({ "dev": "pump-7", "metric": "vibration", "raw": 325 })));
         let b = &out[0].msg.body;
         assert_eq!(b["signal"]["id"], json!("pump-7"));
@@ -432,7 +613,7 @@ mod tests {
             "#
             .into(),
         );
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(pm(json!({ "signal": { "id": "t" }, "samples": [{ "value": 20.0 }] })));
         assert_eq!(out[0].msg.body["tempF"], json!(68.0));
         // No sample → the guard drops the message.
@@ -450,7 +631,7 @@ mod tests {
             "#
             .into(),
         );
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": [3.0, 4.0], "quality": "GOOD" }] })));
         let rms = out[0].msg.body["rms"].as_f64().unwrap();
         assert!((rms - 3.535_533).abs() < 1e-4, "rms was {rms}");
@@ -476,7 +657,7 @@ mod tests {
             .correlation_id("corr-123")
             .payload(json!({ "samples": [] }))
             .build();
-        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let mut s = ScriptStage::build(&src, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let out = s.process(ProcMsg { topic: "t".into(), msg: m, recv_ms: now_ms() });
         let b = &out[0].msg.body;
         assert_eq!(b["name"], json!("ProcessedTelemetry"));
@@ -512,5 +693,165 @@ mod tests {
     // Resolve an inline ScriptSource to text for a direct RhaiEval compile in tests.
     fn loader_load(src: &ScriptSource) -> String {
         ScriptLoader::default().load(src).unwrap()
+    }
+
+    // The Lua engine (feature `scripting-lua`) — same scope + contract as Rhai, plus sandbox + budget.
+    #[cfg(feature = "scripting-lua")]
+    mod lua_tests {
+        use super::*;
+
+        fn lua_body(src: &str, m: ProcMsg) -> Option<Value> {
+            build_engine(ScriptEngineKind::Lua, src, &engine(), &ctx()).unwrap().eval_body(&m)
+        }
+
+        #[test]
+        fn lua_transform_reshapes_body() {
+            let out = lua_body(
+                r#"return { scaled = value * 0.1, id = body.signal.id }"#,
+                pm(json!({ "signal": { "id": "s1" }, "samples": [{ "value": 100, "quality": "GOOD" }] })),
+            )
+            .unwrap();
+            assert_eq!(out["scaled"], json!(10.0));
+            assert_eq!(out["id"], json!("s1"));
+        }
+
+        #[test]
+        fn lua_filter_reads_context_and_header() {
+            let e = build_engine(
+                ScriptEngineKind::Lua,
+                r#"return header.name == "SouthboundSignalUpdate" and thingName == "edge-1" and #samples >= 1"#,
+                &engine(),
+                &ctx_with("edge-1", "TP", "com.x.TP", "r1"),
+            )
+            .unwrap();
+            let msg = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+                .payload(json!({ "samples": [{ "value": 1 }] }))
+                .build();
+            let m = ProcMsg { topic: "t".into(), msg, recv_ms: now_ms() };
+            assert!(e.eval_bool(&m));
+        }
+
+        #[test]
+        fn lua_array_reduce() {
+            let out = lua_body(
+                r#"local s = 0.0 for _, x in ipairs(value) do s = s + x end return { sum = s, n = #value }"#,
+                pm(json!({ "samples": [{ "value": [1.0, 2.0, 3.0, 4.0] }] })),
+            )
+            .unwrap();
+            assert_eq!(out["sum"], json!(10.0));
+            assert_eq!(out["n"], json!(4));
+        }
+
+        #[test]
+        fn lua_sandbox_denies_os_and_io() {
+            // os/io are nil'd → any use errors → the message is dropped, never executed on the host.
+            assert!(lua_body(r#"return { t = os.time() }"#, pm(json!({ "samples": [] }))).is_none());
+            assert!(lua_body(r#"io.write("x") return {}"#, pm(json!({ "samples": [] }))).is_none());
+        }
+
+        #[test]
+        fn lua_op_budget_caps_runaway() {
+            // An infinite loop is aborted by the instruction budget (dropped), not hung.
+            assert!(lua_body(r#"while true do end"#, pm(json!({ "samples": [] }))).is_none());
+        }
+
+        #[test]
+        fn lua_nil_return_drops() {
+            assert!(lua_body(r#"return nil"#, pm(json!({ "samples": [] }))).is_none());
+        }
+
+        fn lua_bool(src: &str, m: ProcMsg) -> bool {
+            build_engine(ScriptEngineKind::Lua, src, &engine(), &ctx()).unwrap().eval_bool(&m)
+        }
+
+        // The cookbook examples (Lua tab), each the semantic twin of its Rhai counterpart.
+
+        #[test]
+        fn lua_cookbook_mean_and_peak() {
+            let out = lua_body(
+                r#"
+                local function mean(xs)
+                    if #xs == 0 then return 0.0 end
+                    local s = 0.0
+                    for _, x in ipairs(xs) do s = s + x end
+                    return s / #xs
+                end
+                local peak = value[1]
+                for _, x in ipairs(value) do if x > peak then peak = x end end
+                return { mean = mean(value), peak = peak, n = #value }
+                "#,
+                pm(json!({ "samples": [{ "value": [10.0, 20.0, 30.0] }] })),
+            )
+            .unwrap();
+            assert_eq!(out["mean"], json!(20.0));
+            assert_eq!(out["peak"], json!(30.0));
+            assert_eq!(out["n"], json!(3));
+        }
+
+        #[test]
+        fn lua_cookbook_deltas() {
+            let out = lua_body(
+                r#"
+                local d = {}
+                for i = 2, #samples do d[#d + 1] = samples[i].value - samples[i - 1].value end
+                return { deltas = d }
+                "#,
+                pm(json!({ "samples": [{ "value": 10.0 }, { "value": 13.0 }, { "value": 12.0 }] })),
+            )
+            .unwrap();
+            assert_eq!(out["deltas"], json!([3.0, -1.0]));
+        }
+
+        #[test]
+        fn lua_cookbook_status_map() {
+            let out = lua_body(
+                r#"
+                local s = body.status
+                local code = 99
+                if s == "RUNNING" then code = 1
+                elseif s == "IDLE" then code = 0
+                elseif s == "FAULT" then code = -1 end
+                return { statusCode = code }
+                "#,
+                pm(json!({ "status": "FAULT", "samples": [] })),
+            )
+            .unwrap();
+            assert_eq!(out["statusCode"], json!(-1));
+        }
+
+        #[test]
+        fn lua_cookbook_normalize() {
+            let out = lua_body(
+                r#"return {
+                    signal = { id = body.dev, name = body.metric },
+                    samples = { { value = body.raw * 0.1, quality = "GOOD" } }
+                }"#,
+                pm(json!({ "dev": "pump-7", "metric": "vibration", "raw": 325 })),
+            )
+            .unwrap();
+            assert_eq!(out["signal"]["id"], json!("pump-7"));
+            assert_eq!(out["samples"][0]["value"], json!(32.5));
+        }
+
+        #[test]
+        fn lua_cookbook_unit_with_guard() {
+            let src = r#"
+                local function to_f(c) return c * 1.8 + 32.0 end
+                if #samples == 0 then return nil end
+                return { signal = body.signal, tempF = to_f(value) }
+            "#;
+            let out = lua_body(src, pm(json!({ "signal": { "id": "t" }, "samples": [{ "value": 20.0 }] })));
+            assert_eq!(out.unwrap()["tempF"], json!(68.0));
+            assert!(lua_body(src, pm(json!({ "signal": { "id": "t" }, "samples": [] }))).is_none());
+        }
+
+        #[test]
+        fn lua_cookbook_threshold_count_filter() {
+            let src = r#"local c = 0
+                for _, x in ipairs(value) do if x > 50 then c = c + 1 end end
+                return c >= 2"#;
+            assert!(lua_bool(src, pm(json!({ "samples": [{ "value": [10, 60, 70, 20] }] }))));
+            assert!(!lua_bool(src, pm(json!({ "samples": [{ "value": [10, 60, 20, 30] }] }))));
+        }
     }
 }
