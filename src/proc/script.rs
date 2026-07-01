@@ -4,9 +4,12 @@
 //! message). The same [`RhaiEval`] backs the Rhai `filter` option (evaluating to a boolean). The
 //! engine is shared across all routes; each stage compiles its source to an `AST` once at build.
 //!
-//! Scope exposed to a script: `topic` (string), `body` / `tags` (maps), `samples` (array), and the
-//! convenience bindings `value` / `quality` (the first sample's). A `filter` script returns a
-//! boolean; a `script` stage returns the new body map (or `()` to drop).
+//! Scope exposed to a script: the message view (`topic`, `body` / `tags` maps, `samples` array, and
+//! the convenience bindings `value` / `quality` — the first sample's), plus the **runtime context**
+//! (`thingName`, `componentName`, `componentFullName`, `routeId`, `recvMs`) so a generic script can
+//! branch on which component/route/thing it runs in. A `filter` script returns a boolean; a `script`
+//! stage returns the new body map (or `()` to drop). Array-valued fields arrive as Rhai arrays, so a
+//! script can `for`/`map`/`filter`/`reduce` over them like any other collection.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +21,27 @@ use smallvec::smallvec;
 
 use crate::config::ScriptSource;
 use crate::proc::{Out, ProcMsg, Processor};
+
+/// Per-route runtime context injected into every `filter`/`script` evaluation as **constant**
+/// bindings, alongside the per-message view. It carries the component identity and the route id so a
+/// single reusable script can behave differently per component/route (e.g. stamp `thingName`, or gate
+/// on `routeId`) without hard-coding those values in the script text.
+///
+/// The identity mirrors the config template variables: `thing_name` = `{ThingName}`, `component_name`
+/// = `{ComponentName}` (the short name — the segment after the last `.`), `component_full_name` =
+/// `{ComponentFullName}`. Values are the **raw** identity (not topic-sanitized like the template
+/// resolver's output). Cheap to clone; the app builds one `Arc<ScriptContext>` per route.
+#[derive(Debug, Default, Clone)]
+pub struct ScriptContext {
+    /// IoT Thing name — exposed to scripts as `thingName`.
+    pub thing_name: String,
+    /// Short component name (after the last `.`) — exposed as `componentName`.
+    pub component_name: String,
+    /// Fully-qualified component name — exposed as `componentFullName`.
+    pub component_full_name: String,
+    /// The owning route's id — exposed as `routeId`.
+    pub route_id: String,
+}
 
 /// Resolves [`ScriptSource`]s to Rhai source text. `File` paths resolve against `base` (the
 /// `global.defaults.scriptsDir`) when relative, or are used as-is when absolute.
@@ -50,24 +74,35 @@ impl Default for ScriptLoader {
     }
 }
 
-/// A compiled Rhai program plus the shared engine.
+/// A compiled Rhai program plus the shared engine and the per-route runtime context.
 pub struct RhaiEval {
     engine: Arc<Engine>,
     ast: AST,
+    ctx: Arc<ScriptContext>,
 }
 
 impl RhaiEval {
-    /// Compile `src` against the shared engine.
-    pub fn compile(engine: &Arc<Engine>, src: &str) -> anyhow::Result<Self> {
+    /// Compile `src` against the shared engine, binding the runtime `ctx` into every evaluation.
+    pub fn compile(
+        engine: &Arc<Engine>,
+        src: &str,
+        ctx: &Arc<ScriptContext>,
+    ) -> anyhow::Result<Self> {
         let ast = engine
             .compile(src)
             .map_err(|e| anyhow::anyhow!("rhai compile error in `{src}`: {e}"))?;
-        Ok(Self { engine: engine.clone(), ast })
+        Ok(Self { engine: engine.clone(), ast, ctx: ctx.clone() })
     }
 
     fn scope_for(&self, m: &ProcMsg) -> Scope<'static> {
         let mut scope = Scope::new();
         scope.push("topic", m.topic.clone());
+        // Runtime context — constant per route, so a generic/reused script can branch on identity.
+        scope.push("thingName", self.ctx.thing_name.clone());
+        scope.push("componentName", self.ctx.component_name.clone());
+        scope.push("componentFullName", self.ctx.component_full_name.clone());
+        scope.push("routeId", self.ctx.route_id.clone());
+        scope.push("recvMs", m.recv_ms as i64);
         scope.push_dynamic("body", to_dyn(&m.msg.body));
         if let Ok(tags) = serde_json::to_value(&m.msg.tags) {
             scope.push_dynamic("tags", to_dyn(&tags));
@@ -130,9 +165,10 @@ impl ScriptStage {
         src: &ScriptSource,
         engine: &Arc<Engine>,
         loader: &ScriptLoader,
+        ctx: &Arc<ScriptContext>,
     ) -> anyhow::Result<Self> {
         let text = loader.load(src)?;
-        Ok(Self { eval: RhaiEval::compile(engine, &text)? })
+        Ok(Self { eval: RhaiEval::compile(engine, &text, ctx)? })
     }
 }
 
@@ -164,12 +200,17 @@ mod tests {
         Arc::new(Engine::new())
     }
 
+    fn ctx() -> Arc<ScriptContext> {
+        Arc::new(ScriptContext::default())
+    }
+
     #[test]
     fn script_transforms_body_using_value_binding() {
         let mut s = ScriptStage::build(
             &ScriptSource::Inline(r#"#{ "doubled": value * 2 }"#.into()),
             &engine(),
             &ScriptLoader::default(),
+            &ctx(),
         )
         .unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": 21, "quality": "GOOD" }] })));
@@ -183,6 +224,7 @@ mod tests {
             &ScriptSource::Inline(r#"#{ "thing": tags.thing, "q": quality }"#.into()),
             &engine(),
             &ScriptLoader::default(),
+            &ctx(),
         )
         .unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": 1, "quality": "GOOD" }] })));
@@ -196,6 +238,7 @@ mod tests {
             &ScriptSource::Inline("()".into()),
             &engine(),
             &ScriptLoader::default(),
+            &ctx(),
         )
         .unwrap();
         assert_eq!(s.process(pm(json!({ "samples": [] }))).len(), 0);
@@ -207,6 +250,7 @@ mod tests {
             &ScriptSource::Inline("this is not valid rhai @@".into()),
             &engine(),
             &ScriptLoader::default(),
+            &ctx(),
         )
         .is_err());
     }
@@ -221,14 +265,193 @@ mod tests {
 
         let loader = ScriptLoader::new(&dir);
         let src = ScriptSource::File { file: "double.rhai".into() };
-        let mut s = ScriptStage::build(&src, &engine(), &loader).unwrap();
+        let mut s = ScriptStage::build(&src, &engine(), &loader, &ctx()).unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": 21, "quality": "GOOD" }] })));
         assert_eq!(out[0].msg.body["doubled"], json!(42));
 
         // A missing file is a build error (surfaced at startup, not silently ignored).
         let missing = ScriptSource::File { file: "nope.rhai".into() };
-        assert!(ScriptStage::build(&missing, &engine(), &loader).is_err());
+        assert!(ScriptStage::build(&missing, &engine(), &loader, &ctx()).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A `ScriptContext` with real identity, for the runtime-context test.
+    fn ctx_with(thing: &str, comp: &str, full: &str, route: &str) -> Arc<ScriptContext> {
+        Arc::new(ScriptContext {
+            thing_name: thing.into(),
+            component_name: comp.into(),
+            component_full_name: full.into(),
+            route_id: route.into(),
+        })
+    }
+
+    #[test]
+    fn script_sees_runtime_context() {
+        // The runtime identity is available so one generic script can stamp/branch on where it runs.
+        let src = ScriptSource::Inline(
+            r#"#{ "t": thingName, "c": componentName, "cf": componentFullName, "r": routeId, "gotTs": recvMs > 0 }"#
+                .into(),
+        );
+        let ctx = ctx_with("edge-42", "TelemetryProcessor", "com.acme.TelemetryProcessor", "archive");
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx).unwrap();
+        let out = s.process(pm(json!({ "samples": [] })));
+        let b = &out[0].msg.body;
+        assert_eq!(b["t"], json!("edge-42"));
+        assert_eq!(b["c"], json!("TelemetryProcessor"));
+        assert_eq!(b["cf"], json!("com.acme.TelemetryProcessor"));
+        assert_eq!(b["r"], json!("archive"));
+        assert_eq!(b["gotTs"], json!(true));
+    }
+
+    #[test]
+    fn script_processes_array_value_with_fn_and_loop() {
+        // An array-typed sample value arrives as a Rhai array; a user fn + `for` loop reduce it.
+        // Goal: emit the mean and peak of an OPC UA array node's readings.
+        let src = ScriptSource::Inline(
+            r#"
+            fn mean(xs) {
+                if xs.is_empty() { return 0.0; }
+                let s = 0.0;
+                for x in xs { s += x; }
+                s / xs.len()
+            }
+            let readings = value;              // the first sample's value — an array here
+            let peak = readings[0];
+            for x in readings { if x > peak { peak = x; } }
+            #{ "mean": mean(readings), "peak": peak, "n": readings.len() }
+            "#
+            .into(),
+        );
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(pm(json!({ "samples": [{ "value": [10.0, 20.0, 30.0], "quality": "GOOD" }] })));
+        let b = &out[0].msg.body;
+        assert_eq!(b["mean"], json!(20.0));
+        assert_eq!(b["peak"], json!(30.0));
+        assert_eq!(b["n"], json!(3));
+    }
+
+    #[test]
+    fn script_filters_array_with_map_filter() {
+        // A filter script over an array value: keep only when ≥2 elements exceed a threshold.
+        // Demonstrates array `.filter` + `.len` in a boolean predicate.
+        let src = ScriptSource::Inline(
+            r#"value.filter(|x| x > 50).len() >= 2"#.into(),
+        );
+        let e = RhaiEval::compile(&engine(), &loader_load(&src), &ctx()).unwrap();
+        let keep = pm(json!({ "samples": [{ "value": [10, 60, 70, 20], "quality": "GOOD" }] }));
+        let drop = pm(json!({ "samples": [{ "value": [10, 60, 20, 30], "quality": "GOOD" }] }));
+        assert!(e.eval_bool(&keep));
+        assert!(!e.eval_bool(&drop));
+    }
+
+    #[test]
+    fn script_maps_status_with_switch() {
+        // Map a vendor status string to a numeric code with a `switch` expression.
+        let src = ScriptSource::Inline(
+            r#"
+            let code = switch body.status {
+                "RUNNING" => 1,
+                "IDLE" => 0,
+                "FAULT" => -1,
+                _ => 99,
+            };
+            #{ "statusCode": code }
+            "#
+            .into(),
+        );
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(pm(json!({ "status": "FAULT", "samples": [] })));
+        assert_eq!(out[0].msg.body["statusCode"], json!(-1));
+    }
+
+    #[test]
+    fn script_reduces_array_with_reduce() {
+        // Sum an array value with `reduce` (seed 0.0).
+        let src =
+            ScriptSource::Inline(r#"#{ "total": value.reduce(|a, v| a + v, 0.0) }"#.into());
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(pm(json!({ "samples": [{ "value": [1.5, 2.5, 4.0], "quality": "GOOD" }] })));
+        assert_eq!(out[0].msg.body["total"], json!(8.0));
+    }
+
+    #[test]
+    fn script_computes_deltas_over_samples() {
+        // Rate-of-change: the delta between each pair of consecutive samples, via a range loop.
+        let src = ScriptSource::Inline(
+            r#"
+            let deltas = [];
+            for i in 1..samples.len() {
+                deltas.push(samples[i].value - samples[i - 1].value);
+            }
+            #{ "deltas": deltas }
+            "#
+            .into(),
+        );
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(pm(json!({
+            "samples": [ { "value": 10.0 }, { "value": 13.0 }, { "value": 12.0 } ]
+        })));
+        assert_eq!(out[0].msg.body["deltas"], json!([3.0, -1.0]));
+    }
+
+    #[test]
+    fn script_normalizes_non_southbound_payload() {
+        // Reshape a vendor body into the southbound signal shape so downstream stages/sinks work.
+        let src = ScriptSource::Inline(
+            r#"
+            #{
+                "signal": #{ "id": body.dev, "name": body.metric },
+                "samples": [ #{ "value": body.raw * 0.1, "quality": "GOOD" } ]
+            }
+            "#
+            .into(),
+        );
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(pm(json!({ "dev": "pump-7", "metric": "vibration", "raw": 325 })));
+        let b = &out[0].msg.body;
+        assert_eq!(b["signal"]["id"], json!("pump-7"));
+        assert_eq!(b["signal"]["name"], json!("vibration"));
+        assert_eq!(b["samples"][0]["value"], json!(32.5));
+    }
+
+    #[test]
+    fn script_derives_unit_with_helper_and_guard() {
+        // A helper fn for the conversion + an early guard that drops a reading-less message.
+        let src = ScriptSource::Inline(
+            r#"
+            fn to_fahrenheit(c) { c * 1.8 + 32.0 }
+            if samples.is_empty() { return (); }
+            #{ "signal": body.signal, "tempF": to_fahrenheit(value) }
+            "#
+            .into(),
+        );
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(pm(json!({ "signal": { "id": "t" }, "samples": [{ "value": 20.0 }] })));
+        assert_eq!(out[0].msg.body["tempF"], json!(68.0));
+        // No sample → the guard drops the message.
+        assert_eq!(s.process(pm(json!({ "signal": { "id": "t" }, "samples": [] }))).len(), 0);
+    }
+
+    #[test]
+    fn script_computes_rms_with_sqrt() {
+        // Root-mean-square across an array value — uses the float `.sqrt()` from Rhai's math package.
+        let src = ScriptSource::Inline(
+            r#"
+            let sumsq = 0.0;
+            for x in value { sumsq += x * x; }
+            #{ "rms": (sumsq / value.len()).sqrt() }
+            "#
+            .into(),
+        );
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(pm(json!({ "samples": [{ "value": [3.0, 4.0], "quality": "GOOD" }] })));
+        let rms = out[0].msg.body["rms"].as_f64().unwrap();
+        assert!((rms - 3.535_533).abs() < 1e-4, "rms was {rms}");
+    }
+
+    // Resolve an inline ScriptSource to text for a direct RhaiEval compile in tests.
+    fn loader_load(src: &ScriptSource) -> String {
+        ScriptLoader::default().load(src).unwrap()
     }
 }

@@ -140,10 +140,11 @@ source is given **inline** or from an **external file**:
 
 Both forms are **compiled once at startup** (a bad path or a compile error fails fast, before any
 message flows); the shared engine is bounded (1,000,000 ops/eval) so a runaway script cannot wedge a
-worker. For the full scripting model — scope, state, return values, examples — see the
-[Scripting explanation](../explanation.md#scripting-with-rhai).
+worker. For the full scripting model — scope, state, return values, the Rhai language, and a cookbook
+of worked examples — see the dedicated **[Scripting guide](../scripting.md)**.
 
-<a id="rhai-scope"></a>**Rhai scope** (available to both `filter` `script` and the `script` stage):
+<a id="rhai-scope"></a>**Rhai scope** (available to both `filter` `script` and the `script` stage) —
+the per-message **message view** plus the constant **runtime context**:
 
 | Binding | Type | Value |
 |---------|------|-------|
@@ -151,8 +152,13 @@ worker. For the full scripting model — scope, state, return values, examples �
 | `body` | map | the message body |
 | `tags` | map | the envelope `tags{}` (message metadata — *not* the signal) |
 | `samples` | array | `body.samples` (or `[]`) |
-| `value` | any | the first sample's `value` |
+| `value` | any | the first sample's `value` (scalar **or array**) |
 | `quality` | string | the first sample's `quality` |
+| `thingName` | string | the IoT Thing name (`{ThingName}`) |
+| `componentName` | string | the short component name (`{ComponentName}`) |
+| `componentFullName` | string | the fully-qualified component name (`{ComponentFullName}`) |
+| `routeId` | string | the id of the route running the script |
+| `recvMs` | integer | this message's broker receive time (Unix ms) |
 
 <a id="key-paths"></a>
 > **Key paths** are dotted paths over the message: roots `body.` (the default when no known root

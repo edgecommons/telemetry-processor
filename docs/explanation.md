@@ -80,90 +80,31 @@ caught at startup; runtime errors) drops the message rather than crashing the ro
 
 The built-in stages cover the common shapes — quality gating, value thresholds, downsampling,
 windowed reduction, whitelisting. **Scripting is the escape hatch** for logic they don't express:
-a derived field, a conditional drop, a reshape into a bespoke body, a multi-condition predicate.
-[Rhai](https://rhai.rs) is a small, sandboxed expression language embedded in the processor; you
-reach for it only when a built-in won't do, because the built-ins are faster and need no parsing.
+a derived engineering unit, a conditional drop, a reshape of a bespoke payload, a predicate that
+spans several samples or inspects an array. [Rhai](https://rhai.rs) is a small, sandboxed,
+Rust-native language embedded in the processor; a script is compiled **once at startup** and then run
+per message, with no I/O and a bounded op budget, so it can shape data but can't reach outside the
+pipeline.
 
-Scripting appears in **two places**, both backed by the same engine and the same message view:
+Scripting appears in **two roles**, both backed by the same engine and the same scope:
 
-- a **`filter` `script`** — a predicate that evaluates to a **boolean**; `true` keeps the message.
+- a **`filter` `script`** — a predicate that evaluates to a **boolean**; `true` keeps the message
+  (it fails *closed* — an error or non-boolean drops).
 - a **`script` stage** — a transform that evaluates to the **new body** (a map), or to `()` to
   **drop** the message.
 
-### Where the source lives — inline or a file
+A script sees the **message view** (`topic`, `body`, `tags`, `samples`, and the first-sample
+conveniences `value`/`quality`) plus the **runtime context** (`thingName`, `componentName`,
+`componentFullName`, `routeId`, `recvMs`) so a generic, reusable script can branch on which
+component/route/thing it runs in. Scripts are **stateless** — each evaluation sees only the current
+message; cross-message state belongs in `sample`/`aggregate`. Array-valued fields arrive as Rhai
+arrays, so a script can `for`/`map`/`filter`/`reduce` over them like any collection.
 
-A script's source is given **inline** (`{"script": "<source>"}`) or read from an external **file**
-(`{"script": {"file": "rules/derive.rhai"}}`). A relative file path resolves against
-`component.global.defaults.scriptsDir` (default: the working directory); an absolute path is used
-as-is. Both forms are **compiled once at startup** — a missing file or a syntax error fails the
-component immediately, before any telemetry flows, rather than at the first message. Inline is for a
-one-liner; once a script grows past a line or two, move it to a file (it version-controls cleanly,
-needs no JSON string-escaping, and ships as a deployment artifact — see [the how-to](how-to-guides.md#use-an-external-script-file)).
-
-### The scope a script sees
-
-Before each evaluation the stage builds a fresh **scope** from the current message and binds these
-variables (the same set for a `filter` predicate and a `script` transform):
-
-| Binding | Type | What it is |
-|---|---|---|
-| `topic` | string | the source topic the message arrived on |
-| `body` | map | the full message body (`body.signal`, `body.samples`, `body.device`, …) |
-| `tags` | map | the message-**envelope** `tags` metadata (`tags.site`, `tags.thing`, …) — **not** the signal |
-| `samples` | array | `body.samples` (or `[]` if absent) — each element a map with `value`, `quality`, … |
-| `value` | any | a convenience: the **first** sample's `value` (number, string, or bool) |
-| `quality` | string | a convenience: the **first** sample's `quality` (`""` if absent) |
-
-`body` and `tags` are the two roots. `value`/`quality`/`samples` are conveniences derived from the
-southbound shape — on a non-southbound payload `samples` is `[]` and `value`/`quality` are
-empty/`""`, but `body` always holds whatever JSON arrived, so a script is **payload-agnostic**: read
-your own paths off `body`.
-
-### What a script returns
-
-The return value is the whole contract — there is no other output channel:
-
-- **`filter` `script`** → a **boolean**. `true` keeps the message, `false` drops it. A non-boolean
-  result or a runtime error is treated as `false` (drop) and logged at WARN — a filter fails *closed*.
-- **`script` stage** → the **new body**. A map (`#{ … }`) replaces `body`; the envelope (`header`,
-  `tags`) is preserved. **`()`** (Rhai unit) **drops** the message. A result that can't convert to
-  JSON, or a runtime error, also drops the message (logged at WARN).
-
-So a transform either reshapes (`return a map`) or drops (`return ()`); a predicate either keeps
-(`true`) or drops (`false`). Nothing partially mutates the message in place.
-
-### Scripts are stateless (one message in, one decision out)
-
-Each evaluation gets a **fresh scope** and sees **only the current message** — there is no variable
-that persists from one message to the next, no counter, no rolling window inside a script. This is
-deliberate: it keeps a script a pure function (easy to reason about, impossible to leak memory
-across messages, safe to share one engine across every route). **Cross-message state lives in the
-built-in stages**, which the worker owns and drives on a timer: use `sample` for rate state and
-`aggregate` for windowed counters/min/max/avg. (A future revision may add an opt-in per-key script
-state object; it is intentionally not in this version.)
-
-### Worked examples
-
-```jsonc
-// filter: keep only when every sample is GOOD and under 100
-{ "filter": { "script": "samples.all(|s| s.quality == \"GOOD\" && s.value < 100.0)" } }
-
-// transform: rescale the first value and stamp the source topic, keeping the signal identity
-{ "script": "#{ \"signal\": body.signal, \"scaled\": value * 0.1, \"src\": topic }" }
-
-// conditional drop: keep the body as-is below the limit, drop it above
-{ "script": "if value > 1000.0 { () } else { body }" }
-
-// payload-agnostic: a non-southbound body, read your own paths and fold in envelope metadata
-{ "script": "#{ \"site\": tags.site, \"tempF\": body.temperature * 1.8 + 32.0 }" }
-
-// from a file (multi-line logic): rules/derive.rhai resolved under scriptsDir
-{ "script": { "file": "rules/derive.rhai" } }
-```
-
-`#{ … }` is a Rhai object-map literal; `||` is a closure; arrays have `.all` / `.any` / `.map`; `()`
-is unit (drop). JSON numbers arrive as integers or floats and `quality` as a string. Keep a script
-short — it runs on **every** message on the route's hot path, under the shared 1,000,000-op budget.
+> **Scripting has its own guide.** The dedicated **[Scripting page](scripting.md)** is the full
+> treatment: every scope binding, return and error semantics, a Rhai language primer (functions,
+> loops, ranges, `switch`, array methods), array handling, and a **cookbook of worked examples**
+> (derived units, array mean/peak/RMS, rate-of-change, reusable identity-stamping, payload
+> normalization, status mapping) — each explained goal → how → why, and each backed by a test.
 
 ## The two flows: from adapter to cloud
 

@@ -5,3 +5,4 @@ greengrass-build/
 *.avro
 /data/
 /out/
+/logs/
