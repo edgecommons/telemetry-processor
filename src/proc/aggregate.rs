@@ -51,7 +51,17 @@ impl Acc {
         }
     }
 
+    /// Fold one value into the accumulator. An **array** value is folded element-wise (each element
+    /// counts and contributes to the numeric reducers), so an array-typed signal — an OPC UA array
+    /// node, or a `value` path that resolves to an array — aggregates across its elements instead of
+    /// being dropped as non-numeric. Nested arrays recurse; an empty array folds nothing.
     fn fold_value(&mut self, v: &Value) {
+        if let Some(arr) = v.as_array() {
+            for el in arr {
+                self.fold_value(el);
+            }
+            return;
+        }
         self.count += 1;
         if self.first.is_none() {
             self.first = Some(v.clone());
@@ -271,6 +281,38 @@ mod tests {
         let out = s.process(msg("a", 2.0, 1500)); // window [1000,2000) → closes prior
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].msg.body["agg"]["count"], json!(1));
+    }
+
+    #[test]
+    fn aggregate_folds_array_values_elementwise() {
+        // An array-typed signal (e.g. an OPC UA array node): each sample's value is an array. The
+        // reducers fold across ALL elements of ALL samples in the window (a time window here, so the
+        // close is time-driven and independent of how many elements each message carries).
+        let spec = AggregateSpec {
+            window: "1s".into(),
+            by: None,
+            fns: vec!["avg".into(), "min".into(), "max".into(), "sum".into(), "count".into()],
+            value: None,
+        };
+        let mut s = AggregateStage::build(&spec, "body.signal.id").unwrap();
+        let mk = |arr: serde_json::Value, recv: u64| {
+            let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+                .payload(json!({ "signal": { "id": "a" }, "samples": [ { "value": arr, "quality": "GOOD" } ] }))
+                .build();
+            ProcMsg { topic: "t".into(), msg: m, recv_ms: recv }
+        };
+        // Window [0,1000): two array-valued messages.
+        assert!(s.process(mk(json!([1.0, 2.0, 3.0]), 100)).is_empty());
+        assert!(s.process(mk(json!([4.0, 5.0]), 200)).is_empty());
+        let out = s.on_tick(1000);
+        assert_eq!(out.len(), 1);
+        let agg = &out[0].msg.body["agg"];
+        // elements folded across both messages: 1,2,3,4,5  → avg 3, min 1, max 5, sum 15, count 5
+        assert_eq!(agg["avg"], json!(3.0));
+        assert_eq!(agg["min"], json!(1.0));
+        assert_eq!(agg["max"], json!(5.0));
+        assert_eq!(agg["sum"], json!(15.0));
+        assert_eq!(agg["count"], json!(5));
     }
 
     #[test]

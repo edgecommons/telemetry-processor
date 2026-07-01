@@ -78,6 +78,38 @@ A `filter` stage takes exactly one form, checked in this order:
 
 ---
 
+<a id="handle-array-valued-signals"></a>
+## Handle array-valued signals
+
+**Goal:** process a signal whose sample `value` is an **array** (an OPC UA array node, a batched
+register read, a vector) — the OPC UA adapter and the wire format both carry these.
+
+Array values are first-class across the stages; pick the tool for the job:
+
+- **Aggregate across the elements.** The `aggregate` stage folds an array value **element-wise**, so
+  the numeric reducers span every element of every sample in the window — no special syntax:
+
+  ```jsonc
+  { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "min", "max", "count"] } }
+  // value [10,20,30] then [40,50] in a window → avg 30, min 10, max 50, count 5
+  ```
+
+- **Filter on the elements.** A trailing `[]` flattens the array so an **any-element** predicate works:
+
+  ```jsonc
+  { "filter": { "field": "body.samples[].value[]", "op": "gt", "value": 100 } }  // keep if any element > 100
+  ```
+
+- **Compute over the array in a script.** An array `value` arrives as a Rhai array — `map`/`filter`/
+  `reduce`/`for` over it to emit mean, peak, RMS, counts, etc. See the
+  [Scripting cookbook](scripting.md#2-array-node-mean-peak-and-rms).
+
+- **Archive the array.** The file sink's default `rows` projection stores an array as JSON in the
+  `valueString` column; to spread it into one row per element, declare a
+  [`rows` projection](reference/data-types.md#rows-user-projection) with `explode`.
+
+---
+
 ## Reshape a message
 
 **Goal:** keep a whitelist of fields and/or stamp in literals.
@@ -107,12 +139,14 @@ A `filter` stage takes exactly one form, checked in this order:
 
 - A **`filter` `script`** returns a boolean — `true` keeps the message.
 - A **`script`** stage returns the **new body** map, or `()` to **drop** the message.
-- Scope exposed to both: `topic` (string), `body` and `tags` (maps — `tags` is envelope metadata, not
-  the signal), `samples` (array), and the convenience bindings `value` / `quality` (the first
-  sample's). An eval error or a non-JSON result drops the message (logged at WARN).
+- Scope exposed to both: the message view — `topic`, `body` and `tags` (maps; `tags` is envelope
+  metadata, not the signal), `samples`, and the conveniences `value` / `quality` (the first sample's) —
+  **plus the runtime context** `thingName` / `componentName` / `componentFullName` / `routeId` /
+  `recvMs`. An eval error or a non-JSON result drops the message (logged at WARN).
 
-For the full scripting model — bindings, return values, statelessness, more examples — see
-[Scripting with Rhai](explanation.md#scripting-with-rhai).
+For the full scripting model — every scope binding (incl. the runtime context `thingName` /
+`componentName` / `routeId` / `recvMs`), return/error semantics, a Rhai language primer, array
+handling, and a cookbook of worked examples — see the dedicated **[Scripting guide](scripting.md)**.
 
 ---
 

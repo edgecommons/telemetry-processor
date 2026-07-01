@@ -51,19 +51,21 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Build the pipeline from config. `route_key` is the default aggregation/sample key; `engine`
-    /// is the shared Rhai engine for `filter`/`script` stages.
+    /// is the shared Rhai engine and `ctx` the per-route runtime context (identity + route id)
+    /// bound into every `filter`/`script` evaluation.
     pub fn build(
         stages: &[StageConfig],
         route_key: &str,
         engine: &Arc<Engine>,
         loader: &script::ScriptLoader,
+        ctx: &Arc<script::ScriptContext>,
     ) -> anyhow::Result<Self> {
         let mut built: Vec<Box<dyn Processor>> = Vec::with_capacity(stages.len());
         let mut tick_hints: Vec<u64> = Vec::new();
         for sc in stages {
             let stage: Box<dyn Processor> = match sc {
                 StageConfig::Filter(spec) => {
-                    Box::new(filter::FilterStage::build(spec, engine, loader)?)
+                    Box::new(filter::FilterStage::build(spec, engine, loader, ctx)?)
                 }
                 StageConfig::Sample(spec) => Box::new(sample::SampleStage::build(spec, route_key)?),
                 StageConfig::Aggregate(spec) => {
@@ -74,7 +76,7 @@ impl Pipeline {
                 }
                 StageConfig::Project(spec) => Box::new(project::ProjectStage::build(spec)),
                 StageConfig::Script(src) => {
-                    Box::new(script::ScriptStage::build(src, engine, loader)?)
+                    Box::new(script::ScriptStage::build(src, engine, loader, ctx)?)
                 }
             };
             built.push(stage);
@@ -145,7 +147,7 @@ mod tests {
                 value: None,
             }),
         ];
-        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default()).unwrap();
+        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default(), &Arc::new(script::ScriptContext::default())).unwrap();
         assert_eq!(p.min_tick_ms(), None, "a count window needs no flush timer");
 
         // BAD is filtered out; two GOODs fill the count=2 window and emit on the second.
@@ -168,7 +170,7 @@ mod tests {
                 value: None,
             }),
         ];
-        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default()).unwrap();
+        let mut p = Pipeline::build(&stages, "body.signal.id", &engine(), &script::ScriptLoader::default(), &Arc::new(script::ScriptContext::default())).unwrap();
         assert_eq!(p.min_tick_ms(), Some(1000));
         p.run(one("a", 1.0, "GOOD", 100), None);
         let out = p.run(SmallVec::new(), Some(2000));

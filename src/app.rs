@@ -33,14 +33,20 @@ struct RouteWire {
     tx: mpsc::Sender<ProcMsg>,
 }
 
-/// Per-route-invariant build context: the shared Rhai engine, the script-file loader, and the
-/// cross-route defaults. Bundled so `build_route` takes the route plus one context, not a long
-/// argument list.
+/// Per-route-invariant build context: the shared Rhai engine, the script-file loader, the
+/// cross-route defaults, and the component identity injected into scripts. Bundled so `build_route`
+/// takes the route plus one context, not a long argument list.
 struct RouteBuildCtx<'a> {
     engine: &'a Arc<Engine>,
     loader: &'a crate::proc::script::ScriptLoader,
     default_key: &'a str,
     default_target: Option<&'a str>,
+    /// `{ThingName}` — raw (not topic-sanitized), injected into scripts as `thingName`.
+    thing_name: &'a str,
+    /// `{ComponentName}` — the short name (segment after the last `.`), injected as `componentName`.
+    component_name: &'a str,
+    /// `{ComponentFullName}` — the fully-qualified name, injected as `componentFullName`.
+    component_full_name: &'a str,
 }
 
 /// The running processor: its subscriptions, channel senders, and worker tasks.
@@ -76,11 +82,20 @@ impl ProcessorApp {
             .map(|d| resolve(&config, d))
             .unwrap_or_else(|| ".".to_string());
         let loader = crate::proc::script::ScriptLoader::new(scripts_dir);
+        // Component identity for the script runtime context. Read the raw values (the template
+        // resolver would sanitize them for topic/path safety, which we don't want in a script).
+        let component_full_name = config.component_name.clone();
+        let component_name =
+            component_full_name.rsplit('.').next().unwrap_or(&component_full_name).to_string();
+        let thing_name = config.thing_name.clone();
         let ctx = RouteBuildCtx {
             engine: &engine,
             loader: &loader,
             default_key: &default_key,
             default_target: defaults.target.as_deref(),
+            thing_name: &thing_name,
+            component_name: &component_name,
+            component_full_name: &component_full_name,
         };
 
         let mut app = Self {
@@ -163,7 +178,14 @@ impl ProcessorApp {
             _ => None,
         };
 
-        let pipeline = Pipeline::build(&route.pipeline, &route_key, ctx.engine, ctx.loader)?;
+        let script_ctx = Arc::new(crate::proc::script::ScriptContext {
+            thing_name: ctx.thing_name.to_string(),
+            component_name: ctx.component_name.to_string(),
+            component_full_name: ctx.component_full_name.to_string(),
+            route_id: route.id.clone(),
+        });
+        let pipeline =
+            Pipeline::build(&route.pipeline, &route_key, ctx.engine, ctx.loader, &script_ctx)?;
         let dispatcher = Dispatcher::new(
             self.messaging.clone(),
             target,

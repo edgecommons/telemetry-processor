@@ -13,7 +13,7 @@ use smallvec::smallvec;
 
 use crate::config::FilterSpec;
 use crate::json_path::resolve_values;
-use crate::proc::script::{RhaiEval, ScriptLoader};
+use crate::proc::script::{RhaiEval, ScriptContext, ScriptLoader};
 use crate::proc::{Out, ProcMsg, Processor};
 
 enum Op {
@@ -45,9 +45,10 @@ impl FilterStage {
         spec: &FilterSpec,
         engine: &Arc<Engine>,
         loader: &ScriptLoader,
+        ctx: &Arc<ScriptContext>,
     ) -> anyhow::Result<Self> {
         let pred = if let Some(src) = &spec.script {
-            Predicate::Rhai(RhaiEval::compile(engine, &loader.load(src)?)?)
+            Predicate::Rhai(RhaiEval::compile(engine, &loader.load(src)?, ctx)?)
         } else if let Some(q) = &spec.quality {
             Predicate::QualityAll(q.clone())
         } else if let Some(field) = &spec.field {
@@ -157,6 +158,10 @@ mod tests {
         ProcMsg { topic: "southbound/x".into(), msg: m, recv_ms: now_ms() }
     }
 
+    fn ctx() -> Arc<ScriptContext> {
+        Arc::new(ScriptContext::default())
+    }
+
     fn engine() -> Arc<Engine> {
         Arc::new(Engine::new())
     }
@@ -164,7 +169,7 @@ mod tests {
     #[test]
     fn quality_all_keeps_only_all_good() {
         let spec = FilterSpec { quality: Some("GOOD".into()), ..Default::default() };
-        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default()).unwrap();
+        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         let good = msg(json!([{ "value": 1, "quality": "GOOD" }, { "value": 2, "quality": "GOOD" }]));
         let mixed = msg(json!([{ "value": 1, "quality": "GOOD" }, { "value": 2, "quality": "BAD" }]));
         assert_eq!(s.process(good).len(), 1);
@@ -179,7 +184,7 @@ mod tests {
             value: Some(json!(50)),
             ..Default::default()
         };
-        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default()).unwrap();
+        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         assert_eq!(s.process(msg(json!([{ "value": 99 }]))).len(), 1);
         assert_eq!(s.process(msg(json!([{ "value": 10 }]))).len(), 0);
     }
@@ -190,7 +195,7 @@ mod tests {
             script: Some(ScriptSource::Inline("samples.all(|s| s.quality == \"GOOD\")".into())),
             ..Default::default()
         };
-        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default()).unwrap();
+        let mut s = FilterStage::build(&spec, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
         assert_eq!(s.process(msg(json!([{ "value": 1, "quality": "GOOD" }]))).len(), 1);
         assert_eq!(s.process(msg(json!([{ "value": 1, "quality": "BAD" }]))).len(), 0);
     }
@@ -205,6 +210,7 @@ mod tests {
             },
             &engine(),
             &ScriptLoader::default(),
+            &ctx(),
         )
         .unwrap()
     }
@@ -227,7 +233,7 @@ mod tests {
     #[test]
     fn build_and_op_parse_errors() {
         // No predicate form configured.
-        assert!(FilterStage::build(&FilterSpec::default(), &engine(), &ScriptLoader::default()).is_err());
+        assert!(FilterStage::build(&FilterSpec::default(), &engine(), &ScriptLoader::default(), &ctx()).is_err());
         // Unknown op.
         assert!(Op::parse("bogus").is_err());
         // Symbolic aliases parse.

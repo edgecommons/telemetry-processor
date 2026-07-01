@@ -127,6 +127,10 @@ A sample `value` is narrowed to one typed column:
 > may lose precision for `|value| > 2^53`. An unsigned value above `2^63` is cast into the signed
 > int64 column.
 
+> **Array values** land in `valueString` as compact JSON (`valueType = "string"`) under the default
+> projection. To spread an array into one row per element, or to fold it in `aggregate`, filter, or a
+> script instead, see [Handle array-valued signals](../how-to-guides.md#handle-array-valued-signals).
+
 ## Quality & timestamps
 
 - **`quality`** is the normalized, protocol-independent verdict — `GOOD` \| `BAD` \| `UNCERTAIN`
