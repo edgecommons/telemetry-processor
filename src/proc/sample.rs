@@ -2,7 +2,7 @@
 //!
 //! Keep one message per key per time window (`everyMs`) or one in every N (`everyN`). State is a
 //! per-key map owned by the single route worker, so it is lock-free. The key path defaults to the
-//! route key (e.g. `body.tag.id`).
+//! route key (e.g. `body.signal.id`).
 
 use std::collections::HashMap;
 
@@ -75,9 +75,9 @@ mod tests {
     use ggcommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
-    fn msg(tag: &str, recv_ms: u64) -> ProcMsg {
-        let m = MessageBuilder::new("SouthboundTagUpdate", "1.0")
-            .payload(json!({ "tag": { "id": tag } }))
+    fn msg(signal: &str, recv_ms: u64) -> ProcMsg {
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .payload(json!({ "signal": { "id": signal } }))
             .build();
         ProcMsg { topic: "t".into(), msg: m, recv_ms }
     }
@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn every_n_keeps_one_in_n_per_key() {
         let spec = SampleSpec { every_n: Some(3), ..Default::default() };
-        let mut s = SampleStage::build(&spec, "body.tag.id").unwrap();
+        let mut s = SampleStage::build(&spec, "body.signal.id").unwrap();
         let kept: usize =
             (0..9).map(|i| s.process(msg("a", i)).len()).sum();
         assert_eq!(kept, 3); // i = 0, 3, 6
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn every_ms_is_per_key() {
         let spec = SampleSpec { every_ms: Some(1000), ..Default::default() };
-        let mut s = SampleStage::build(&spec, "body.tag.id").unwrap();
+        let mut s = SampleStage::build(&spec, "body.signal.id").unwrap();
         assert_eq!(s.process(msg("a", 0)).len(), 1); // first for a
         assert_eq!(s.process(msg("a", 500)).len(), 0); // within window
         assert_eq!(s.process(msg("a", 1000)).len(), 1); // window elapsed

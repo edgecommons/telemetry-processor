@@ -16,7 +16,12 @@ name = "telemetry-processor"
 path = "src/main.rs"
 
 [features]
-default = ["standalone"]
+# Batteries-included by default: the HOST / Kubernetes binary ships with MQTT + streaming + the
+# Kinesis and Parquet/AVRO file sinks + CloudWatch, so a config "just works" without recompiling.
+# Two capabilities stay opt-in for hard build reasons: `greengrass` (the AWS GG IPC SDK is a
+# Linux-only C-FFI crate — it would break `cargo build` on Windows/macOS; the device build opts in
+# via build.sh) and `streaming-kafka` (rdkafka vendors librdkafka through cmake + a C toolchain).
+default = ["standalone", "streaming", "streaming-kinesis", "streaming-file-parquet", "streaming-file-avro", "cloudwatch"]
 # Runtime selection (mirrors the library): standalone = dual-broker MQTT (containers/laptops);
 # greengrass = IPC (device; Linux-only build).
 standalone = ["ggcommons/standalone"]
@@ -36,7 +41,7 @@ streaming-file-avro = ["streaming", "ggcommons/streaming-file-avro"]
 # .cargo/config.toml); locally it uses your gh/git credential helper, and in CI the reusable workflow
 # rewrites this https URL with the EDGECOMMONS_READ_TOKEN PAT. For local development against an
 # unpushed change, temporarily swap this for `path = "../ggcommons-monorepo/libs/rust"`.
-ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "a5b5fd5e0afcae28baed4e232b2a0692d925eb1d", default-features = false }
+ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "cc037a92c1780c3d88cc98885cfdefec0403a898", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

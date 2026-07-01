@@ -37,6 +37,8 @@ This page is organized as:
   Greengrass (IPC) and in-cluster Kubernetes (ConfigMap) shapes.
 - **[§8](#8-fan-out-multiple-routes-sharing-one-subscribe-filter)**–**[§10](#10-avro-instead-of-parquet)**
   — fan-out across routes, the Rhai escape hatch, and Avro as a landing format.
+- **[§11](#sample-payload-agnostic)** — payload-agnostic end to end: external `.rhai` script files +
+  a declared file projection on a non-southbound body.
 
 Closes with **[Where settings resolve from (precedence)](#where-settings-resolve-from-precedence)**.
 
@@ -60,11 +62,11 @@ its own subscription, pipeline, and target. A route may omit any field present i
 | `pipeline` | `[stage]` — an ordered list of transform stages (below). Order matters: stages run left to right. |
 | `target` | `"local"` \| `"northbound"` \| `"stream:<name>"`. Falls back to `global.defaults.target`; a route with no target at all is skipped with an error. |
 | `publish` | `{ topic, partitionKey, qos }` — the output address. `topic` (for `local`/`northbound`) is template-resolved at startup; `partitionKey` (for `stream:`) and `qos` are described per scenario. |
-| `key` | Default aggregation/partition key **path** for the route (e.g. `body.tag.id`). Falls back to `global.defaults.key`, then the built-in `body.tag.id`. |
+| `key` | Default aggregation/partition key **path** for the route (e.g. `body.signal.id`). Falls back to `global.defaults.key`, then the built-in `body.signal.id`. |
 | `maxQueue` | Depth of the route's bounded inbound queue (also the broker-side subscribe queue depth). Default `256`; **drop-on-full at the edge** (a full queue logs and drops, it does not block the broker). |
 
 > **`key`/`by`/`partitionKey` are JSON paths, not templates.** They address a field inside each
-> message (`body.tag.id`, `body.samples[].value`, `tags.site`) via the dotted-path resolver — a `[]`
+> message (`body.signal.id`, `body.samples[].value`, `tags.site`) via the dotted-path resolver — a `[]`
 > suffix spreads across an array. Only `subscribe[]` and `publish.topic` go through `{…}` template
 > substitution. Don't put `{ThingName}` in a `key`/`partitionKey`, and don't put a `body....` path in
 > a topic.
@@ -79,9 +81,9 @@ to 0 or 1, an `aggregate` accumulates and emits on window close, the rest pass 1
 | `filter` | `{ "filter": { "quality": "GOOD" } }` | Keep the message only when **every** `body.samples[].quality` equals the string (and at least one sample exists). |
 | `filter` | `{ "filter": { "field": "body.samples[].value", "op": "gt", "value": 50 } }` | Keep when **any** value resolved at `field` satisfies `op` vs `value`. Ops: `eq`, `ne`, `gt`, `lt`, `ge`, `le`, `exists`, `contains`. `[]` spreads across an array (any-element match). Numbers compare numerically (strings that parse as numbers are coerced). |
 | `filter` | `{ "filter": { "script": "samples.all(\|s\| s.quality == \"GOOD\")" } }` | A Rhai boolean predicate over a read-only view; keep when it returns `true`. An eval error drops the message (logged). |
-| `sample` | `{ "sample": { "everyMs": 1000, "by": "body.tag.id" } }` or `{ "everyN": 100 }` | Per-key downsample: keep one message per key per `everyMs` window, or one in every `everyN`. `by` falls back to the route `key`. |
-| `aggregate` | `{ "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg","max","min","sum","count","first","last"] } }` | Tumbling-window reduction per key. `window` is time (`"10s"` / `"500ms"`) or a bare record count (`"100"`). Emits one `ProcessedTelemetry` message per `(key, window)` on close (§2). |
-| `project` | `{ "project": { "keep": ["tag","samples"], "set": { "origin": "processor" } } }` | `keep` whitelists **top-level body keys** (the first segment of each listed path); `set` overlays literal fields onto the body. With neither, the body passes through. |
+| `sample` | `{ "sample": { "everyMs": 1000, "by": "body.signal.id" } }` or `{ "everyN": 100 }` | Per-key downsample: keep one message per key per `everyMs` window, or one in every `everyN`. `by` falls back to the route `key`. |
+| `aggregate` | `{ "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg","max","min","sum","count","first","last"] } }` | Tumbling-window reduction per key. `window` is time (`"10s"` / `"500ms"`) or a bare record count (`"100"`). Emits one `ProcessedTelemetry` message per `(key, window)` on close (§2). |
+| `project` | `{ "project": { "keep": ["signal","samples"], "set": { "origin": "processor" } } }` | `keep` whitelists **top-level body keys** (the first segment of each listed path); `set` overlays literal fields onto the body. With neither, the body passes through. |
 | `script` | `{ "script": "#{ \"scaled\": value * 0.1 }" }` | A Rhai program that returns a new body map; `()` drops the message (§9). |
 
 The Rhai engine is always compiled in. A `filter`/`script` scope exposes `topic` (string),
@@ -107,7 +109,7 @@ only), `streaming`, and the sink features `streaming-kinesis`, `streaming-file-p
 ## 1. Minimal HOST dev: filter, sample, local
 
 The smallest useful pipeline. One route subscribes to the southbound bus, keeps only GOOD-quality
-updates, downsamples each tag to 1 Hz, and republishes the result on the local bus under a `processed/…`
+updates, downsamples each signal to 1 Hz, and republishes the result on the local bus under a `processed/…`
 topic. This is the shape you run against a local broker and a southbound adapter (or a replay) while
 developing.
 
@@ -128,14 +130,14 @@ On HOST the dual-MQTT transport needs broker details. You can supply them inline
   "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
 
   "component": {
-    "global": { "defaults": { "key": "body.tag.id" } },
+    "global": { "defaults": { "key": "body.signal.id" } },
     "instances": [
       {
         "id": "downsample-local",
         "subscribe": [ "southbound/factory-1/+/+/+" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
-          { "sample": { "everyMs": 1000, "by": "body.tag.id" } }
+          { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
         ],
         "target": "local",
         "publish": { "topic": "processed/{ThingName}/downsampled" }
@@ -162,12 +164,12 @@ cargo run --features standalone -- --platform HOST --transport MQTT ./standalone
 | `messaging.local` | The local MQTT broker the processor both **subscribes to** (the `southbound/…` source) and **publishes to** (the `processed/…` output). On HOST this is one half of the dual-MQTT transport; `clientId` must be unique per process or the broker drops the older session. Omit it here and pass the same block as the positional `--transport MQTT ./standalone-messaging.json` instead. |
 | `metricEmission` | Standard ggcommons metric target (`log` / `messaging` / `cloudwatch` / `prometheus`). Observability only — it does not change processing. |
 | `tags` | Site/asset identity attached to messages and usable as topic template variables (`{site}`, `{appId}`). Pure metadata. |
-| `global.defaults.key` | Default key **path** every route inherits for `sample`/`aggregate`/`partitionKey` when it doesn't set its own. `body.tag.id` is the southbound contract's stable canonical id. |
+| `global.defaults.key` | Default key **path** every route inherits for `sample`/`aggregate`/`partitionKey` when it doesn't set its own. `body.signal.id` is the southbound contract's stable canonical id. |
 | `global.defaults.target` | Default `target` a route inherits when it omits one. |
 | `instances[].id` | Stable route id (**required**); appears in logs. |
-| `subscribe` | The topic filter(s) this route consumes. `southbound/factory-1/+/+/+` matches every `{ComponentName}/{InstanceId}/{tagId}` published by adapters under `factory-1`. `+`/`#` wildcards are honored; the filter is template-resolved first. |
+| `subscribe` | The topic filter(s) this route consumes. `southbound/factory-1/+/+/+` matches every `{ComponentName}/{InstanceId}/{signalId}` published by adapters under `factory-1`. `+`/`#` wildcards are honored; the filter is template-resolved first. |
 | `filter.quality: "GOOD"` | Drops any message unless **all** its `samples[].quality` are `GOOD` — the cheap way to shed BAD/UNCERTAIN readings before they cost downstream work. |
-| `sample.everyMs` / `by` | Per-key downsample: at most one message **per tag** (`by: body.tag.id`) per 1000 ms. The first message for a key always passes; later ones within the window are dropped. Turns an adapter's high-rate feed into a steady 1 Hz stream. |
+| `sample.everyMs` / `by` | Per-key downsample: at most one message **per signal** (`by: body.signal.id`) per 1000 ms. The first message for a key always passes; later ones within the window are dropped. Turns an adapter's high-rate feed into a steady 1 Hz stream. |
 | `target: "local"` | Republishes each surviving message on the local bus. |
 | `publish.topic` | Output topic template (resolved at startup). Omit it and the processed message is republished on its **source topic** — set it (as here) to land on a distinct `processed/…` topic so consumers don't see both raw and processed copies. |
 
@@ -175,7 +177,7 @@ cargo run --features standalone -- --platform HOST --transport MQTT ./standalone
 
 ## 2. Windowed aggregate to a durable Parquet archive
 
-The archetypal edge-analytics route: collapse a high-rate per-tag feed into 10-second tumbling
+The archetypal edge-analytics route: collapse a high-rate per-signal feed into 10-second tumbling
 windows (avg/max/min/count/last) and land the rollups as **columnar Parquet** under a date/hour
 partition layout, ready for bulk upload to a cloud data lake (S3/Glue/Athena, ADLS, BigQuery). The
 file destination is a normal stream sink, so the route forwards to `stream:archive` and the
@@ -213,17 +215,17 @@ file destination is a normal stream sink, so the route forwards to `stream:archi
   },
 
   "component": {
-    "global": { "defaults": { "key": "body.tag.id" } },
+    "global": { "defaults": { "key": "body.signal.id" } },
     "instances": [
       {
         "id": "archive-good",
         "subscribe": [ "southbound/factory-1/+/+/+" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
-          { "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] } }
+          { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
         ],
         "target": "stream:archive",
-        "publish": { "partitionKey": "body.tag.id" }
+        "publish": { "partitionKey": "body.signal.id" }
       }
     ]
   }
@@ -237,15 +239,15 @@ telemetry-processor --platform HOST --transport MQTT ./standalone-messaging.json
 cargo run --features standalone,streaming,streaming-file-parquet -- --platform HOST ...
 ```
 
-The `aggregate` stage emits one `ProcessedTelemetry` message per `(tag, window)` when the window
+The `aggregate` stage emits one `ProcessedTelemetry` message per `(signal, window)` when the window
 closes (on the worker's flush tick, or when a message for a newer window arrives). Its body carries
 `samples[0].value` = the **first-listed** reducer (here `avg`, so the file sink's rows mode lands a
 value), the full reducer set under `agg`, and a `window` block (`{ startMs, endMs, count }`):
 
 ```jsonc
-// emitted ProcessedTelemetry body (per tag, per 10s window)
+// emitted ProcessedTelemetry body (per signal, per 10s window)
 "body": {
-  "tag": { "id": "ns=3;i=1001", "name": "Temp" },
+  "signal": { "id": "ns=3;i=1001", "name": "Temp" },
   "samples": [ { "value": 21.4, "quality": "GOOD" } ],   // value = avg (first fn)
   "agg": { "avg": 21.4, "max": 23.1, "min": 19.8, "count": 412, "last": 22.0 },
   "window": { "startMs": 1719705600000, "endMs": 1719705610000, "count": 412 }
@@ -258,7 +260,7 @@ value), the full reducer set under `agg`, and a `window` block (`{ startMs, endM
 |--------|----------------------------|
 | `sink.type: "file"` | Selects the rolling-file sink (vs `kinesis`/`kafka`). Built only when the binary includes `streaming-file-parquet` (or `-avro`); otherwise the stream buffers but never drains. |
 | `sink.format: "parquet"` | Output encoding — `parquet` (default, columnar, query-ready, best compression + column pruning) or `avro` (§10). |
-| `sink.mode: "rows"` | `rows` flattens each `SouthboundTagUpdate` / `ProcessedTelemetry` sample into one **typed** row (sparse `valueDouble`/`valueLong`/`valueBool`/`valueString` columns + a `valueType` discriminator, plus `site`/`shop`/`line`/`adapter`/`tagId`/`tagName`/`quality`/`sourceTs`/`serverTs`). A payload that is **not** a southbound-shaped envelope is **never dropped** — it lands in a sibling `_unmapped` **raw** file. |
+| `sink.mode: "rows"` | `rows` flattens each `SouthboundSignalUpdate` / `ProcessedTelemetry` sample into one **typed** row (sparse `valueDouble`/`valueLong`/`valueBool`/`valueString` columns + a `valueType` discriminator, plus `site`/`shop`/`line`/`adapter`/`signalId`/`signalName`/`quality`/`sourceTs`/`serverTs`). A payload that is **not** a southbound-shaped envelope is **never dropped** — it lands in a sibling `_unmapped` **raw** file. |
 | `sink.dir` | Output directory root (template vars like `{ThingName}` resolved by the library). Finalized files are written under `<dir>/<partitionBy>/`. |
 | `sink.partitionBy` | Hive-style partition sub-path appended to `dir`. UTC time tokens `{yyyy}` / `{MM}` / `{dd}` / `{HH}` and the compound `{yyyy-MM-dd}` are resolved **per file at roll time** → `dt=2026-06-30/hr=14/`. (Per-message-field partition directories are a deferral; `site`/`adapter` ride as columns today.) |
 | `sink.maxFileBytes` | Roll a new file once the current one **would exceed** this many bytes (default `134217728` = 128 MiB — large enough to avoid the analytics "small files" problem). **Soft cap:** it is checked at row-group granularity, so a finalized Parquet file can exceed `maxFileBytes` by up to one row group plus the footer. For tight files, keep `batch.maxBytes` well **below** `maxFileBytes` so each appended batch is small relative to the roll threshold. |
@@ -283,7 +285,7 @@ value), the full reducer set under `agg`, and a `window` block (`{ startMs, endM
 > crash: **Parquet discards the unclosed footer-less `*.inprogress` file**, so loss is bounded by the
 > open-file window (`rollEverySecs` / `maxFileBytes`); **Avro recovers to its last sync block** (§10).
 > The pipeline is at-least-once, so a crash between sink-write and buffer-commit can re-deliver a
-> batch — consumers de-duplicate on `(tagId, sourceTs)`.
+> batch — consumers de-duplicate on `(signalId, sourceTs)`.
 
 ---
 
@@ -322,14 +324,14 @@ upload.
     ]
   },
   "component": {
-    "global": { "defaults": { "key": "body.tag.id" } },
+    "global": { "defaults": { "key": "body.signal.id" } },
     "instances": [
       {
         "id": "archive-all-raw",
         "subscribe": [ "southbound/factory-1/#" ],
         "pipeline": [],
         "target": "stream:raw-archive",
-        "publish": { "partitionKey": "body.tag.id" },
+        "publish": { "partitionKey": "body.signal.id" },
         "maxQueue": 20000
       }
     ]
@@ -340,7 +342,7 @@ upload.
 | Option | Effect on runtime behavior |
 |--------|----------------------------|
 | `pipeline: []` | No transform — every matched message is forwarded verbatim. The route is pure transport from the local bus into the durable archive. |
-| `subscribe: ["southbound/factory-1/#"]` | The multi-level `#` wildcard captures the **entire** southbound subtree under `factory-1` (all components/instances/tags, including nested `…/alarms/#`). |
+| `subscribe: ["southbound/factory-1/#"]` | The multi-level `#` wildcard captures the **entire** southbound subtree under `factory-1` (all components/instances/signals, including nested `…/alarms/#`). |
 | `mode: "raw"` | One row per message; payload kept opaque. Accepts non-southbound shapes (this is also the `_unmapped` fallback rows mode uses). Use for replay/forensics where you want bytes, not typed columns. |
 | `maxFileBytes: 8388608` | Small (8 MiB) cap so files rotate frequently by size. Combined with `rollEverySecs: 0`, **size is the only trigger** — at a steady ingest rate you get a predictable cadence of ~8 MiB objects. Remember the soft cap: a file finalizes at the first row-group boundary past 8 MiB, so keep `batch.maxBytes` (512 KiB here) well below it. |
 | `rollEverySecs: 0` | Disables time-based rolling. Without it, a slow period would still roll a half-empty file every N seconds; with it, files only roll when full — uniform sizes, fewer tiny objects. |
@@ -357,7 +359,7 @@ upload.
 ## 4. Hot path: aggregate to Kinesis
 
 Bulk process telemetry destined for cloud analytics goes on the **streaming channel** to Kinesis. The
-route aggregates per tag, then forwards to `stream:hot`, whose sink is Kinesis. The durable buffer in
+route aggregates per signal, then forwards to `stream:hot`, whose sink is Kinesis. The durable buffer in
 front of Kinesis means a WAN outage parks records on disk and drains them when connectivity returns.
 
 ```jsonc
@@ -379,17 +381,17 @@ front of Kinesis means a WAN outage parks records on disk and drains them when c
     ]
   },
   "component": {
-    "global": { "defaults": { "key": "body.tag.id" } },
+    "global": { "defaults": { "key": "body.signal.id" } },
     "instances": [
       {
         "id": "hot-rollup",
         "subscribe": [ "southbound/factory-1/+/+/+" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
-          { "aggregate": { "window": "5s", "by": "body.tag.id", "fn": ["avg", "max", "count"] } }
+          { "aggregate": { "window": "5s", "by": "body.signal.id", "fn": ["avg", "max", "count"] } }
         ],
         "target": "stream:hot",
-        "publish": { "partitionKey": "body.tag.id" }
+        "publish": { "partitionKey": "body.signal.id" }
       }
     ]
   }
@@ -407,7 +409,7 @@ cargo run --features standalone,streaming,streaming-kinesis -- --platform HOST \
 | `sink.streamName` | Target Kinesis stream (supports template vars). |
 | `sink.region` | AWS region for the stream. Optional — falls back to the SDK's default region resolution. |
 | `sink.endpointUrl` | (Not shown) override the Kinesis endpoint for LocalStack/floci/VPC-endpoint testing; the default credential/endpoint chain applies otherwise. |
-| `publish.partitionKey` | Resolved per record as the **Kinesis partition key** (default = route `key` = `body.tag.id`), so a tag's records hash to a consistent shard and stay ordered. |
+| `publish.partitionKey` | Resolved per record as the **Kinesis partition key** (default = route `key` = `body.signal.id`), so a signal's records hash to a consistent shard and stay ordered. |
 | `delivery.maxRetries: -1` | Retry a batch **forever** (the disconnected-edge case) with exponential backoff (`backoffBaseMs`→`backoffMaxMs`). Records sit safely in the durable buffer until accepted. |
 | `buffer.maxDiskBytes` | Caps the on-disk parking lot (256 MiB). On a long outage, `onFull: dropOldest` sheds the oldest undelivered records to stay within budget. |
 
@@ -442,7 +444,7 @@ publishes them to IoT Core at a chosen QoS.
     }
   },
   "component": {
-    "global": { "defaults": { "key": "body.tag.id" } },
+    "global": { "defaults": { "key": "body.signal.id" } },
     "instances": [
       {
         "id": "alarms-northbound",
@@ -527,16 +529,16 @@ ComponentConfiguration:
       tags: { appId: "Demo", site: "Chantilly", shop: "test_shop", line: "test_line" }
       component:
         global:
-          defaults: { key: "body.tag.id" }
+          defaults: { key: "body.signal.id" }
         instances:
           # Route 1: downsample + window-aggregate GOOD telemetry → durable Parquet archive.
           - id: "archive-good"
             subscribe: [ "southbound/{site}/+/+/+" ]
             pipeline:
               - filter: { quality: "GOOD" }
-              - aggregate: { window: "10s", by: "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] }
+              - aggregate: { window: "10s", by: "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] }
             target: "stream:archive"
-            publish: { partitionKey: "body.tag.id" }
+            publish: { partitionKey: "body.signal.id" }
           # Route 2: forward alarm-flagged updates northbound to IoT Core (low rate, control plane).
           - id: "alarms-northbound"
             subscribe: [ "southbound/{site}/+/+/alarms/#" ]
@@ -611,17 +613,17 @@ data:
       },
       "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
       "component": {
-        "global": { "defaults": { "key": "body.tag.id" } },
+        "global": { "defaults": { "key": "body.signal.id" } },
         "instances": [
           {
             "id": "archive-good",
             "subscribe": [ "southbound/factory-1/+/+/+" ],
             "pipeline": [
               { "filter": { "quality": "GOOD" } },
-              { "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] } }
+              { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
             ],
             "target": "stream:archive",
-            "publish": { "partitionKey": "body.tag.id" }
+            "publish": { "partitionKey": "body.signal.id" }
           }
         ]
       }
@@ -661,20 +663,20 @@ volumeMounts:
 
 Several routes can consume the **same** source feed and send it different places. When two routes
 share an identical `subscribe` filter, the processor opens **one** broker subscription and fans each
-arriving message out to every route's queue — so a tag update is delivered once over the wire but
+arriving message out to every route's queue — so a signal update is delivered once over the wire but
 processed independently by each route's pipeline and target.
 
 ```jsonc
 // config.json — component section (with a `streaming.streams[].archive` file sink as in §2)
 "component": {
-  "global": { "defaults": { "key": "body.tag.id" } },
+  "global": { "defaults": { "key": "body.signal.id" } },
   "instances": [
     {
       "id": "downsample-local",
       "subscribe": [ "southbound/factory-1/+/+/+" ],
       "pipeline": [
         { "filter": { "quality": "GOOD" } },
-        { "sample": { "everyMs": 1000, "by": "body.tag.id" } }
+        { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
       ],
       "target": "local",
       "publish": { "topic": "processed/{ThingName}/downsampled" }
@@ -684,10 +686,10 @@ processed independently by each route's pipeline and target.
       "subscribe": [ "southbound/factory-1/+/+/+" ],
       "pipeline": [
         { "filter": { "quality": "GOOD" } },
-        { "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] } }
+        { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
       ],
       "target": "stream:archive",
-      "publish": { "partitionKey": "body.tag.id" }
+      "publish": { "partitionKey": "body.signal.id" }
     }
   ]
 }
@@ -714,14 +716,14 @@ When the built-in operators don't fit, drop to Rhai. A `filter` `script` is a bo
 ```jsonc
 // config.json — component section
 "component": {
-  "global": { "defaults": { "key": "body.tag.id" } },
+  "global": { "defaults": { "key": "body.signal.id" } },
   "instances": [
     {
       "id": "good-and-in-range",
       "subscribe": [ "southbound/factory-1/+/+/+" ],
       "pipeline": [
         { "filter": { "script": "samples.all(|s| s.quality == \"GOOD\" && s.value < 100.0)" } },
-        { "script": "#{ \"tag\": tag, \"scaled\": value * 0.1, \"q\": quality, \"src\": topic }" }
+        { "script": "#{ \"signal\": body.signal, \"scaled\": value * 0.1, \"q\": quality, \"src\": topic }" }
       ],
       "target": "local",
       "publish": { "topic": "processed/{ThingName}/scaled" }
@@ -733,7 +735,7 @@ When the built-in operators don't fit, drop to Rhai. A `filter` `script` is a bo
 | Stage | Effect on runtime behavior |
 |-------|----------------------------|
 | `filter.script` | An arbitrary Rhai boolean over the message view. Here it keeps a message only when **every** sample is GOOD **and** under 100.0 — a compound condition the `field`/`op`/`value` form can't express in one step. An eval error (or a non-boolean result) drops the message and is logged. |
-| `script` (transform) | Replaces the body with the map the script returns (Rhai object syntax `#{ … }`). This one rescales the first value (`value * 0.1`) and reshapes the body, carrying `tag`, `quality`, and the source `topic` through. Returning `()` instead drops the message. A result that can't convert to JSON drops it (logged). |
+| `script` (transform) | Replaces the body with the map the script returns (Rhai object syntax `#{ … }`). This one rescales the first value (`value * 0.1`) and reshapes the body, carrying `signal`, `quality`, and the source `topic` through. Returning `()` instead drops the message. A result that can't convert to JSON drops it (logged). |
 | Scope bindings | `value`/`quality` are the **first** sample's; use `samples` (the full array) for multi-sample logic. `tags` exposes the envelope tags (`tags.site`, `tags.thing`). |
 | Engine bound | The shared engine caps operations per evaluation (`max_operations = 1_000_000`) so a pathological script can't stall the route worker. |
 
@@ -787,6 +789,117 @@ cargo run --features standalone,streaming,streaming-file-avro -- --platform HOST
 
 ---
 
+<a id="sample-payload-agnostic"></a>
+## 11. Payload-agnostic: external script files + a custom file projection
+
+Nothing about the processor requires the `SouthboundSignalUpdate` shape. This example ingests a
+**non-southbound** sensor body, normalizes it with an **external `.rhai` script file**, aggregates a
+custom `value` path, and archives the rollup through a **declared file projection** — so neither the
+script nor the file schema assumes a signal shape. It exercises every "v2" lever at once: on-by-default
+features, a payload-agnostic pipeline, scripts that live in version-controlled files, and a
+caller-declared Parquet schema.
+
+Incoming bus message (no `body.signal`, no `body.samples`):
+
+```jsonc
+// topic: sensors/plant-3/pump-7/vibration
+{ "header": { "name": "SensorReading", "version": "1.0" },
+  "tags":   { "site": "plant-3" },
+  "body":   { "deviceId": "pump-7", "metric": "vibration", "raw": 3214, "ts": "2026-06-30T12:00:00Z" } }
+```
+
+```jsonc
+// config.json
+{
+  "component": {
+    "global": {
+      "defaults": {
+        "key": "body.deviceId",                       // not body.signal.id — this payload has no signal
+        "scriptsDir": "{ComponentName}/scripts"        // where the .rhai files are shipped (see below)
+      }
+    },
+    "instances": [
+      {
+        "id": "vibration-rollup",
+        "subscribe": [ "sensors/+/+/vibration" ],
+        "pipeline": [
+          { "filter": { "script": { "file": "keep_active.rhai" } } },   // external predicate
+          { "script": { "file": "normalize.rhai" } },                   // external transform
+          { "aggregate": { "window": "30s", "by": "body.deviceId",
+                           "value": "body.value", "fn": ["avg", "max", "count"] } }
+        ],
+        "target": "stream:archive"
+      }
+    ]
+  },
+  "tags": { "site": "plant-3" },
+  "streaming": {
+    "streams": [
+      {
+        "name": "archive",
+        "sink": {
+          "type": "file", "format": "parquet", "mode": "rows",
+          "dir": "/data/vibration", "partitionBy": "dt={yyyy-MM-dd}",
+          "rows": {
+            "columns": [
+              { "name": "deviceId",  "path": "body.signal.id" },        // aggregate sets signal.id = the key
+              { "name": "site",      "path": "tags.site" },
+              { "name": "avgMmS",    "path": "body.agg.avg",    "type": "double" },
+              { "name": "maxMmS",    "path": "body.agg.max",    "type": "double" },
+              { "name": "samples",   "path": "body.agg.count",  "type": "long" },
+              { "name": "windowEnd", "path": "body.window.endMs", "type": "long" }
+            ]
+          }
+        },
+        "buffer": { "path": "/data/stream-archive", "onFull": "dropOldest" }
+      }
+    ]
+  }
+}
+```
+
+```rhai
+// scripts/keep_active.rhai — a filter predicate (returns a bool)
+body.raw != () && body.raw > 0          // drop missing or zero readings
+```
+
+```rhai
+// scripts/normalize.rhai — a transform (returns the new body, or () to drop)
+#{
+  "deviceId": body.deviceId,
+  "value":    body.raw * 0.001,         // raw counts → mm/s
+  "unit":     "mm/s",
+  "site":     tags.site                  // fold in envelope metadata
+}
+```
+
+```bash
+# all of these features are on by default, so the standard build covers it:
+cargo run -- --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
+  -c FILE ./config.json -t my-thing
+```
+
+What each lever does here:
+
+- **`scriptsDir` + `{"file": …}`** — `keep_active.rhai` and `normalize.rhai` are read from
+  `scriptsDir` (template-resolved) and **compiled once at startup**; a missing file or a typo fails the
+  component immediately, not at the first message. Keeping them as files means real line breaks, no
+  JSON escaping, and clean diffs. Ship them as Greengrass artifacts or a Kubernetes ConfigMap — see
+  [Ship script files with a deployment](how-to-guides.md#ship-script-files-with-a-deployment).
+- **`key` / aggregate `by` + `value`** — the pipeline keys by `body.deviceId` and folds `body.value`
+  (the normalized field), so no part of it touches `body.signal` / `body.samples`.
+- **`rows` projection** — the file schema is **declared**, not inferred: six typed columns pulled from
+  the aggregate's `ProcessedTelemetry` body (`body.agg.*`, `body.window.endMs`, and `body.signal.id`,
+  which the aggregate stage sets to the key). No `explode` → one row per rollup. A missing path would
+  be a null cell, never an `_unmapped` file. See
+  [data-types.md](reference/data-types.md#rows-user-projection).
+
+> The same config works unchanged for a genuinely southbound payload — drop the two scripts, set
+> `key` back to `body.signal.id`, and omit the `rows` block to fall back to the built-in projection.
+> Payload-agnostic is the default posture; the southbound shape is just the most common case.
+
+---
+
 ## Where settings resolve from (precedence)
 
 Most route settings resolve from the most specific source that provides them:
@@ -797,10 +910,10 @@ route (instances[]) value  ▸  component.global.defaults  ▸  built-in default
 
 | Setting | Resolution | Built-in default |
 |---------|-----------|------------------|
-| `key` (aggregation/partition key path) | route `key` ▸ `global.defaults.key` ▸ built-in | `body.tag.id` |
+| `key` (aggregation/partition key path) | route `key` ▸ `global.defaults.key` ▸ built-in | `body.signal.id` |
 | `target` | route `target` ▸ `global.defaults.target` ▸ (none → route skipped) | — (required) |
-| `by` (in `sample`/`aggregate`) | stage `by` ▸ the resolved route `key` | `body.tag.id` |
-| `partitionKey` (for `stream:`) | `publish.partitionKey` ▸ the resolved route `key` | `body.tag.id` |
+| `by` (in `sample`/`aggregate`) | stage `by` ▸ the resolved route `key` | `body.signal.id` |
+| `partitionKey` (for `stream:`) | `publish.partitionKey` ▸ the resolved route `key` | `body.signal.id` |
 | `publish.topic` (for `local`/`northbound`) | `publish.topic` ▸ the message's **source topic** | source topic |
 | `publish.qos` (for `northbound`) | `publish.qos` (`atLeastOnce`/`atMostOnce`) | `atLeastOnce` |
 | `maxQueue` | route `maxQueue` | `256` |

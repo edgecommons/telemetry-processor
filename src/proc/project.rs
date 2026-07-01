@@ -61,8 +61,8 @@ mod tests {
     use serde_json::json;
 
     fn msg() -> ProcMsg {
-        let m = MessageBuilder::new("SouthboundTagUpdate", "1.0")
-            .payload(json!({ "tag": { "id": "t1", "name": "Temp" }, "samples": [1, 2], "noise": "drop me" }))
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .payload(json!({ "signal": { "id": "t1", "name": "Temp" }, "samples": [1, 2], "noise": "drop me" }))
             .build();
         ProcMsg { topic: "t".into(), msg: m, recv_ms: now_ms() }
     }
@@ -70,12 +70,12 @@ mod tests {
     #[test]
     fn keep_whitelists_top_level_keys() {
         let mut s = ProjectStage::build(&ProjectSpec {
-            keep: Some(vec!["tag.id".into(), "samples".into()]),
+            keep: Some(vec!["signal.id".into(), "samples".into()]),
             set: None,
         });
         let out = s.process(msg());
         let body = &out[0].msg.body;
-        assert!(body.get("tag").is_some());
+        assert!(body.get("signal").is_some());
         assert!(body.get("samples").is_some());
         assert!(body.get("noise").is_none());
     }

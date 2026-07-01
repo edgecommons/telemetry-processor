@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use smallvec::SmallVec;
 
 use crate::config::{AggregateSpec, Window};
-use crate::json_path::resolve_first_string;
+use crate::json_path::{resolve_first_string, resolve_values};
 use crate::proc::{Out, ProcMsg, Processor};
 
 #[derive(Clone)]
@@ -70,6 +70,8 @@ impl Acc {
 pub struct AggregateStage {
     window: Window,
     key_path: String,
+    /// Path to the value(s) to fold; `None` → the default (`body.samples[].value` / whole body).
+    value_path: Option<String>,
     fns: Vec<String>,
     accs: HashMap<String, Acc>,
 }
@@ -80,6 +82,7 @@ impl AggregateStage {
         Ok(Self {
             window: Window::parse(&spec.window)?,
             key_path: spec.by.clone().unwrap_or_else(|| route_key.to_string()),
+            value_path: spec.value.clone(),
             fns: spec.fns.clone(),
             accs: HashMap::new(),
         })
@@ -89,20 +92,16 @@ impl AggregateStage {
         resolve_first_string(&m.msg, &self.key_path).unwrap_or_default()
     }
 
-    /// Fold every `body.samples[].value` of `m` into the accumulator.
-    fn fold_message(acc: &mut Acc, m: &ProcMsg) {
+    /// The value(s) of `m` to fold this message: the configured `value` path (supports `[]`), or —
+    /// by default — every `body.samples[].value`, falling back to the whole body for payloads with
+    /// no `samples`. Returns owned values so the caller folds them without holding a `self` borrow.
+    fn extract_values(&self, m: &ProcMsg) -> Vec<Value> {
+        if let Some(path) = &self.value_path {
+            return resolve_values(&m.msg, path);
+        }
         match m.msg.body.get("samples").and_then(|s| s.as_array()) {
-            Some(samples) => {
-                for s in samples {
-                    if let Some(v) = s.get("value") {
-                        acc.fold_value(v);
-                    }
-                }
-            }
-            None => {
-                // Non-southbound shape: fold the whole body as a single value.
-                acc.fold_value(&m.msg.body);
-            }
+            Some(samples) => samples.iter().filter_map(|s| s.get("value").cloned()).collect(),
+            None => vec![m.msg.body.clone()],
         }
     }
 
@@ -124,16 +123,16 @@ impl AggregateStage {
         }
         let primary = agg.get(&self.fns[0]).cloned().unwrap_or(Value::Null);
 
-        // Preserve the source tag identity where present.
-        let tag = acc
+        // Preserve the source signal identity where present.
+        let signal = acc
             .base
             .body
-            .get("tag")
+            .get("signal")
             .cloned()
             .unwrap_or_else(|| json!({ "id": key }));
 
         let body = json!({
-            "tag": tag,
+            "signal": signal,
             "samples": [ { "value": primary, "quality": "GOOD" } ],
             "agg": Value::Object(agg),
             "window": { "startMs": acc.window_start, "endMs": acc.window_end, "count": acc.count }
@@ -165,6 +164,7 @@ impl AggregateStage {
 impl Processor for AggregateStage {
     fn process(&mut self, m: ProcMsg) -> Out {
         let key = self.key(&m);
+        let values = self.extract_values(&m);
         let mut out: Out = SmallVec::new();
 
         match self.window {
@@ -183,14 +183,18 @@ impl Processor for AggregateStage {
                     .accs
                     .entry(key.clone())
                     .or_insert_with(|| Acc::new(m.msg.clone(), m.topic.clone(), ws, we));
-                Self::fold_message(acc, &m);
+                for v in &values {
+                    acc.fold_value(v);
+                }
             }
             Window::Count { n } => {
                 let acc = self
                     .accs
                     .entry(key.clone())
                     .or_insert_with(|| Acc::new(m.msg.clone(), m.topic.clone(), m.recv_ms, m.recv_ms));
-                Self::fold_message(acc, &m);
+                for v in &values {
+                    acc.fold_value(v);
+                }
                 if acc.count >= n {
                     if let Some(acc) = self.accs.remove(&key) {
                         out.push(self.emit(acc, &key));
@@ -215,9 +219,9 @@ mod tests {
     use ggcommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
-    fn msg(tag: &str, value: f64, recv_ms: u64) -> ProcMsg {
-        let m = MessageBuilder::new("SouthboundTagUpdate", "1.0")
-            .payload(json!({ "tag": { "id": tag }, "samples": [ { "value": value, "quality": "GOOD" } ] }))
+    fn msg(signal: &str, value: f64, recv_ms: u64) -> ProcMsg {
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .payload(json!({ "signal": { "id": signal }, "samples": [ { "value": value, "quality": "GOOD" } ] }))
             .build();
         ProcMsg { topic: "t".into(), msg: m, recv_ms }
     }
@@ -228,8 +232,9 @@ mod tests {
             window: "3".into(),
             by: None,
             fns: vec!["avg".into(), "max".into(), "min".into(), "count".into()],
+            value: None,
         };
-        let mut s = AggregateStage::build(&spec, "body.tag.id").unwrap();
+        let mut s = AggregateStage::build(&spec, "body.signal.id").unwrap();
         assert!(s.process(msg("a", 10.0, 1)).is_empty());
         assert!(s.process(msg("a", 20.0, 2)).is_empty());
         let out = s.process(msg("a", 30.0, 3));
@@ -245,8 +250,8 @@ mod tests {
 
     #[test]
     fn time_window_closes_on_tick() {
-        let spec = AggregateSpec { window: "1s".into(), by: None, fns: vec!["count".into()] };
-        let mut s = AggregateStage::build(&spec, "body.tag.id").unwrap();
+        let spec = AggregateSpec { window: "1s".into(), by: None, fns: vec!["count".into()], value: None };
+        let mut s = AggregateStage::build(&spec, "body.signal.id").unwrap();
         // Two messages in window [0,1000)
         assert!(s.process(msg("a", 1.0, 100)).is_empty());
         assert!(s.process(msg("a", 2.0, 900)).is_empty());
@@ -260,11 +265,34 @@ mod tests {
 
     #[test]
     fn time_window_closes_on_newer_window_message() {
-        let spec = AggregateSpec { window: "1s".into(), by: None, fns: vec!["count".into()] };
-        let mut s = AggregateStage::build(&spec, "body.tag.id").unwrap();
+        let spec = AggregateSpec { window: "1s".into(), by: None, fns: vec!["count".into()], value: None };
+        let mut s = AggregateStage::build(&spec, "body.signal.id").unwrap();
         assert!(s.process(msg("a", 1.0, 500)).is_empty()); // window [0,1000)
         let out = s.process(msg("a", 2.0, 1500)); // window [1000,2000) → closes prior
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].msg.body["agg"]["count"], json!(1));
+    }
+
+    #[test]
+    fn aggregate_custom_value_path_non_southbound() {
+        // A non-SouthboundSignalUpdate payload: aggregate `body.temp`, keyed by `body.id`.
+        let spec = AggregateSpec {
+            window: "2".into(),
+            by: Some("body.id".into()),
+            fns: vec!["avg".into(), "count".into()],
+            value: Some("body.temp".into()),
+        };
+        let mut s = AggregateStage::build(&spec, "body.id").unwrap();
+        let mk = |id: &str, temp: f64| {
+            let m = MessageBuilder::new("Custom", "1.0")
+                .payload(json!({ "id": id, "temp": temp }))
+                .build();
+            ProcMsg { topic: "t".into(), msg: m, recv_ms: 1 }
+        };
+        assert!(s.process(mk("d", 10.0)).is_empty());
+        let out = s.process(mk("d", 20.0));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].msg.body["agg"]["avg"], json!(15.0));
+        assert_eq!(out[0].msg.body["agg"]["count"], json!(2));
     }
 }

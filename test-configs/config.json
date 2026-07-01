@@ -30,14 +30,14 @@
   },
   "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
   "component": {
-    "global": { "defaults": { "key": "body.tag.id" } },
+    "global": { "defaults": { "key": "body.signal.id" } },
     "instances": [
       {
         "id": "downsample-local",
         "subscribe": [ "southbound/factory-1/+/+/+" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
-          { "sample": { "everyMs": 1000, "by": "body.tag.id" } }
+          { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
         ],
         "target": "local",
         "publish": { "topic": "processed/{ThingName}/downsampled" }
@@ -47,10 +47,10 @@
         "subscribe": [ "southbound/factory-1/+/+/+" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
-          { "aggregate": { "window": "5s", "by": "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] } }
+          { "aggregate": { "window": "5s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
         ],
         "target": "stream:archive",
-        "publish": { "partitionKey": "body.tag.id" }
+        "publish": { "partitionKey": "body.signal.id" }
       }
     ]
   }

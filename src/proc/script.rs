@@ -8,13 +8,47 @@
 //! convenience bindings `value` / `quality` (the first sample's). A `filter` script returns a
 //! boolean; a `script` stage returns the new body map (or `()` to drop).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use rhai::{Dynamic, Engine, Scope, AST};
 use serde_json::Value;
 use smallvec::smallvec;
 
+use crate::config::ScriptSource;
 use crate::proc::{Out, ProcMsg, Processor};
+
+/// Resolves [`ScriptSource`]s to Rhai source text. `File` paths resolve against `base` (the
+/// `global.defaults.scriptsDir`) when relative, or are used as-is when absolute.
+pub struct ScriptLoader {
+    base: PathBuf,
+}
+
+impl ScriptLoader {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self { base: base_dir.into() }
+    }
+
+    /// Load a script source to its Rhai text (reading the file for [`ScriptSource::File`]).
+    pub fn load(&self, src: &ScriptSource) -> anyhow::Result<String> {
+        match src {
+            ScriptSource::Inline(s) => Ok(s.clone()),
+            ScriptSource::File { file } => {
+                let p = Path::new(file);
+                let path = if p.is_absolute() { p.to_path_buf() } else { self.base.join(p) };
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading script file {}", path.display()))
+            }
+        }
+    }
+}
+
+impl Default for ScriptLoader {
+    fn default() -> Self {
+        Self::new(".")
+    }
+}
 
 /// A compiled Rhai program plus the shared engine.
 pub struct RhaiEval {
@@ -92,8 +126,13 @@ pub struct ScriptStage {
 }
 
 impl ScriptStage {
-    pub fn build(src: &str, engine: &Arc<Engine>) -> anyhow::Result<Self> {
-        Ok(Self { eval: RhaiEval::compile(engine, src)? })
+    pub fn build(
+        src: &ScriptSource,
+        engine: &Arc<Engine>,
+        loader: &ScriptLoader,
+    ) -> anyhow::Result<Self> {
+        let text = loader.load(src)?;
+        Ok(Self { eval: RhaiEval::compile(engine, &text)? })
     }
 }
 
@@ -127,7 +166,12 @@ mod tests {
 
     #[test]
     fn script_transforms_body_using_value_binding() {
-        let mut s = ScriptStage::build(r#"#{ "doubled": value * 2 }"#, &engine()).unwrap();
+        let mut s = ScriptStage::build(
+            &ScriptSource::Inline(r#"#{ "doubled": value * 2 }"#.into()),
+            &engine(),
+            &ScriptLoader::default(),
+        )
+        .unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": 21, "quality": "GOOD" }] })));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].msg.body["doubled"], json!(42));
@@ -135,7 +179,12 @@ mod tests {
 
     #[test]
     fn script_can_read_topic_and_tags() {
-        let mut s = ScriptStage::build(r#"#{ "thing": tags.thing, "q": quality }"#, &engine()).unwrap();
+        let mut s = ScriptStage::build(
+            &ScriptSource::Inline(r#"#{ "thing": tags.thing, "q": quality }"#.into()),
+            &engine(),
+            &ScriptLoader::default(),
+        )
+        .unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": 1, "quality": "GOOD" }] })));
         assert_eq!(out[0].msg.body["thing"], json!("thing-1"));
         assert_eq!(out[0].msg.body["q"], json!("GOOD"));
@@ -143,12 +192,43 @@ mod tests {
 
     #[test]
     fn script_unit_result_drops_message() {
-        let mut s = ScriptStage::build("()", &engine()).unwrap();
+        let mut s = ScriptStage::build(
+            &ScriptSource::Inline("()".into()),
+            &engine(),
+            &ScriptLoader::default(),
+        )
+        .unwrap();
         assert_eq!(s.process(pm(json!({ "samples": [] }))).len(), 0);
     }
 
     #[test]
     fn compile_error_is_reported() {
-        assert!(ScriptStage::build("this is not valid rhai @@", &engine()).is_err());
+        assert!(ScriptStage::build(
+            &ScriptSource::Inline("this is not valid rhai @@".into()),
+            &engine(),
+            &ScriptLoader::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn loads_script_from_external_file() {
+        // A `{"file": "..."}` source is read relative to the loader base dir.
+        let dir = std::env::temp_dir().join("tp-script-load-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("double.rhai");
+        std::fs::write(&path, r#"#{ "doubled": value * 2 }"#).unwrap();
+
+        let loader = ScriptLoader::new(&dir);
+        let src = ScriptSource::File { file: "double.rhai".into() };
+        let mut s = ScriptStage::build(&src, &engine(), &loader).unwrap();
+        let out = s.process(pm(json!({ "samples": [{ "value": 21, "quality": "GOOD" }] })));
+        assert_eq!(out[0].msg.body["doubled"], json!(42));
+
+        // A missing file is a build error (surfaced at startup, not silently ignored).
+        let missing = ScriptSource::File { file: "nope.rhai".into() };
+        assert!(ScriptStage::build(&missing, &engine(), &loader).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -3,7 +3,7 @@
 //! Used by the filter / aggregate / project stages and the stream partition-key extractor to pull
 //! values out of a message by a dotted path. Path roots: `body.` (the default when no known root
 //! prefix is present), `tags.`, `header.`. A `[]` suffix on a segment spreads across an array
-//! (matching any element). Examples: `body.tag.id`, `body.samples[].quality`, `tags.site`.
+//! (matching any element). Examples: `body.signal.id`, `body.samples[].quality`, `tags.site`.
 
 use ggcommons::messaging::message::Message;
 use serde_json::Value;
@@ -25,7 +25,7 @@ pub fn resolve_values(msg: &Message, path: &str) -> Vec<Value> {
             walk(&v, rest, &mut acc);
         }
     } else {
-        // Bare path defaults into the body (e.g. `tag.id`, `samples[].quality`).
+        // Bare path defaults into the body (e.g. `signal.id`, `samples[].quality`).
         walk(&msg.body, path, &mut acc);
     }
     acc
@@ -84,11 +84,11 @@ mod tests {
     use serde_json::json;
 
     fn sample_msg() -> Message {
-        MessageBuilder::new("SouthboundTagUpdate", "1.0")
+        MessageBuilder::new("SouthboundSignalUpdate", "1.0")
             .thing_name("thing-1")
             .payload(json!({
                 "device": { "adapter": "opcua", "instance": "inst1" },
-                "tag": { "id": "ns=3;i=1001", "name": "Temp" },
+                "signal": { "id": "ns=3;i=1001", "name": "Temp" },
                 "samples": [
                     { "value": 21.5, "quality": "GOOD" },
                     { "value": 99.0, "quality": "BAD" }
@@ -100,8 +100,8 @@ mod tests {
     #[test]
     fn resolves_nested_body_path() {
         let m = sample_msg();
-        assert_eq!(resolve_first_string(&m, "body.tag.id").as_deref(), Some("ns=3;i=1001"));
-        assert_eq!(resolve_first_string(&m, "tag.name").as_deref(), Some("Temp"));
+        assert_eq!(resolve_first_string(&m, "body.signal.id").as_deref(), Some("ns=3;i=1001"));
+        assert_eq!(resolve_first_string(&m, "signal.name").as_deref(), Some("Temp"));
     }
 
     #[test]

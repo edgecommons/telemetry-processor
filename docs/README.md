@@ -20,7 +20,7 @@ wherever you deploy it — as a Greengrass v2 component, a standalone process, o
 - **"What does this config option do?"** → [Reference — Configuration](reference/configuration.md).
 - **"What message do I subscribe to / publish, and on which topic?"** → [Reference — Messaging Interface](reference/messaging-interface.md).
 - **"How are values stored in the Parquet / AVRO files?"** → [Reference — Data Types](reference/data-types.md).
-- **"How do I downsample a fast tag or aggregate per tag?"** → [How-to guides](how-to-guides.md).
+- **"How do I downsample a fast signal or aggregate per signal?"** → [How-to guides](how-to-guides.md).
 - **"How do I control file rotation — by size, time, or count?"** → [How-to guides](how-to-guides.md).
 - **"Why is my data too fast / slow / laggy, and how does windowing work?"** → [Explanation — the processing-and-timing pipeline](explanation.md).
 - **"How does one route share a topic with another?"** → [Explanation — one route, one worker](explanation.md).

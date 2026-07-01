@@ -77,7 +77,7 @@ ComponentConfiguration:
         # Cross-route defaults, overlaid by each route (global ⊕ instance).
         global:
           defaults:
-            key: "body.tag.id"
+            key: "body.signal.id"
         # Each instances[] entry is one route.
         instances:
           # Route 1: downsample + window-aggregate GOOD process telemetry → durable Parquet archive.
@@ -86,10 +86,10 @@ ComponentConfiguration:
               - "southbound/{site}/+/+/+"
             pipeline:
               - filter: { quality: "GOOD" }
-              - aggregate: { window: "10s", by: "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] }
+              - aggregate: { window: "10s", by: "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] }
             target: "stream:archive"
             publish:
-              partitionKey: "body.tag.id"
+              partitionKey: "body.signal.id"
           # Route 2: forward alarm-flagged updates northbound to IoT Core (low rate, control plane).
           - id: "alarms-northbound"
             subscribe:

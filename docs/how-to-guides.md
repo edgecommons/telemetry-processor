@@ -11,7 +11,7 @@ messages, and survivors go to the route's `target`.
 
 ---
 
-## Filter out bad-quality samples / select tags by value
+## Filter out bad-quality samples / select signals by value
 
 **Goal:** drop messages you don't want before they cost any downstream work.
 
@@ -32,32 +32,33 @@ A `filter` stage takes exactly one form, checked in this order:
 
 ---
 
-## Downsample a high-rate tag
+## Downsample a high-rate signal
 
-**Goal:** thin a 1 kHz tag down to 1 Hz (or 1-in-N) without aggregating.
+**Goal:** thin a 1 kHz signal down to 1 Hz (or 1-in-N) without aggregating.
 
 ```jsonc
 "pipeline": [
   { "filter": { "quality": "GOOD" } },
-  { "sample": { "everyMs": 1000, "by": "body.tag.id" } }   // ≤ 1 message/sec, per tag
+  { "sample": { "everyMs": 1000, "by": "body.signal.id" } }   // ≤ 1 message/sec, per signal
 ]
 ```
 
 - `everyMs` keeps the first message in each time window and drops the rest; `everyN` keeps one in every
   N. Set one, not both.
-- `by` is the per-key path — a separate budget per distinct value (here, per tag). It defaults to the
-  route `key` (`body.tag.id`), so you can usually omit it. Sampling state is per-key and lock-free.
+- `by` is the per-key path — a separate budget per distinct value (here, per signal). It defaults to
+  the route `key` (`body.signal.id`), so you can usually omit it. Sampling state is per-key and
+  lock-free.
 
 ---
 
-## Window-aggregate per tag
+## Window-aggregate per signal
 
-**Goal:** emit one rolled-up record per tag per time (or count) window.
+**Goal:** emit one rolled-up record per signal per time (or count) window.
 
 ```jsonc
 "pipeline": [
   { "filter": { "quality": "GOOD" } },
-  { "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg", "max", "min", "count", "last"] } }
+  { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
 ]
 ```
 
@@ -65,9 +66,12 @@ A `filter` stage takes exactly one form, checked in this order:
   for a **count** window. Time windows close on the flush tick or when a newer-window message arrives;
   count windows close at N.
 - `fn` reducers: `avg`, `max`, `min`, `sum`, `count`, `first`, `last` (numeric reducers skip non-numbers).
+- `by` keys the windows (defaults to the route `key`, `body.signal.id`); `value` is the path folded
+  (defaults to `body.samples[].value`). Set `value` for a non-southbound payload — see
+  [Aggregate a non-southbound payload](#aggregate-a-non-southbound-payload).
 - The emitted message is renamed `ProcessedTelemetry`: the **first-listed `fn`** lands in
   `samples[0].value` (so a file sink's `rows` mode gets a value), the **full reducer set** under `agg`,
-  and a `window` block `{ startMs, endMs, count }`. The source `tag` identity is preserved.
+  and a `window` block `{ startMs, endMs, count }`. The source `signal` identity is preserved.
 
 > A time-windowed route derives its flush tick from the smallest aggregate window automatically; a
 > route with no time-windowed aggregate runs no flush timer.
@@ -80,7 +84,7 @@ A `filter` stage takes exactly one form, checked in this order:
 
 ```jsonc
 "pipeline": [
-  { "project": { "keep": ["tag", "samples"], "set": { "origin": "processor" } } }
+  { "project": { "keep": ["signal", "samples"], "set": { "origin": "processor" } } }
 ]
 ```
 
@@ -97,15 +101,126 @@ A `filter` stage takes exactly one form, checked in this order:
 ```jsonc
 "pipeline": [
   { "filter": { "script": "samples.all(|s| s.quality == \"GOOD\" && s.value < 100.0)" } },
-  { "script": "#{ \"tag\": body.tag, \"scaled\": value * 0.1, \"src\": topic }" }
+  { "script": "#{ \"signal\": body.signal, \"scaled\": value * 0.1, \"src\": topic }" }
 ]
 ```
 
 - A **`filter` `script`** returns a boolean — `true` keeps the message.
 - A **`script`** stage returns the **new body** map, or `()` to **drop** the message.
-- Scope exposed to both: `topic` (string), `body` and `tags` (maps), `samples` (array), and the
-  convenience bindings `value` / `quality` (the first sample's). An eval error or a non-JSON result
-  drops the message (logged at WARN).
+- Scope exposed to both: `topic` (string), `body` and `tags` (maps — `tags` is envelope metadata, not
+  the signal), `samples` (array), and the convenience bindings `value` / `quality` (the first
+  sample's). An eval error or a non-JSON result drops the message (logged at WARN).
+
+For the full scripting model — bindings, return values, statelessness, more examples — see
+[Scripting with Rhai](explanation.md#scripting-with-rhai).
+
+---
+
+<a id="use-an-external-script-file"></a>
+## Use an external script file
+
+**Goal:** keep a non-trivial script out of the JSON config — version-controlled, un-escaped, shippable.
+
+Inline source is fine for a one-liner, but anything longer is painful to embed (every `"` escaped, no
+line breaks, no diffing). Reference a `.rhai` **file** instead — give `script` an object `{ "file":
+"<path>" }` in either a `filter` or a `script` stage:
+
+```jsonc
+"global": { "defaults": { "scriptsDir": "{ComponentName}/scripts" } },
+"instances": [
+  { "id": "derive", "subscribe": ["southbound/+/+/+/+"],
+    "pipeline": [
+      { "filter": { "script": { "file": "keep_in_range.rhai" } } },
+      { "script": { "file": "rules/derive.rhai" } }
+    ],
+    "target": "local" }
+]
+```
+
+```rhai
+// rules/derive.rhai — runs per message; returns the new body, or () to drop
+let celsius = body.temperature;
+if celsius == () { return (); }            // no reading → drop
+#{
+  "signalId": body.signal.id,
+  "tempF":    celsius * 1.8 + 32.0,
+  "site":     tags.site,                    // envelope metadata
+  "src":      topic
+}
+```
+
+- A relative path resolves against `global.defaults.scriptsDir`; an absolute path is used verbatim.
+  `scriptsDir` is template-resolved (`{ComponentName}`, `{ThingName}`, `tags{}`).
+- Files are **read and compiled once at startup**. A missing file or a syntax error stops the
+  component immediately with a clear error — it never starts in a half-broken state.
+- See [Ship script files with a deployment](#ship-script-files-with-a-deployment) for getting the
+  `.rhai` files onto a Greengrass device or into a Kubernetes pod.
+
+---
+
+<a id="aggregate-a-non-southbound-payload"></a>
+## Aggregate a non-southbound payload
+
+**Goal:** window-reduce a body that isn't `SouthboundSignalUpdate`-shaped (no `body.samples`).
+
+The processor doesn't mandate the southbound schema — point the stages at your own paths. Set the
+aggregate `value` (the field to fold) and `by` (the per-key path); a `script` or `field` filter can
+gate on any path too:
+
+```jsonc
+// incoming body: { "deviceId": "pump-7", "temperature": 41.9, "rpm": 1180 }
+"instances": [
+  { "id": "temp-rollup", "subscribe": ["sensors/+/temperature"],
+    "key": "body.deviceId",
+    "pipeline": [
+      { "filter": { "field": "body.temperature", "op": "gt", "value": 0 } },
+      { "aggregate": { "window": "30s", "by": "body.deviceId",
+                       "value": "body.temperature", "fn": ["avg", "max", "count"] } }
+    ],
+    "target": "stream:archive" }
+]
+```
+
+- `value` defaults to `body.samples[].value`, falling back to the whole body; set it explicitly
+  (`body.temperature`) for any non-sample shape.
+- Set the route `key` / aggregate `by` to your own identity path (`body.deviceId`) instead of the
+  southbound `body.signal.id`.
+- To archive this to files, declare a [rows projection](#project-custom-file-columns) — the default
+  projection assumes the southbound shape.
+
+---
+
+<a id="project-custom-file-columns"></a>
+## Project custom file columns (payload-agnostic archiving)
+
+**Goal:** land your own typed columns in the file sink, from any payload shape.
+
+With no `rows` block the file sink uses its built-in `SouthboundSignalUpdate` projection. Supply a
+`rows` block to declare columns from arbitrary paths — the schema is fixed from your list and a
+missing/incompatible value becomes a null cell (never `_unmapped`):
+
+```jsonc
+"sink": {
+  "type": "file", "format": "parquet", "mode": "rows", "dir": "/data/archive",
+  "rows": {
+    "explode": "body.samples",
+    "columns": [
+      { "name": "deviceId", "path": "body.deviceId" },
+      { "name": "site",     "path": "tags.site" },
+      { "name": "value",    "path": "body.samples[].value", "type": "double" },
+      { "name": "quality",  "path": "body.samples[].quality" },
+      { "name": "ts",       "path": "body.samples[].sourceTs" }
+    ]
+  }
+}
+```
+
+- `explode` fans an array out to one row per element; a column path starting `<explode>[]` resolves
+  against the current element, all others against the whole message. Omit `explode` for one row per
+  message.
+- `type` is `string` (default) \| `long` \| `double` \| `bool` \| `json` (use `json` to land an
+  object/array such as the whole `tags` in one column). See
+  [data-types.md](reference/data-types.md#rows-user-projection).
 
 ---
 
@@ -140,7 +255,7 @@ Three independent rotation levers:
 > **Durability:** clean shutdown finalizes the open file (no loss). On a hard crash Parquet discards
 > the unclosed `*.inprogress` file — loss bounded by the open-file window (`rollEverySecs` /
 > `maxFileBytes`) — while Avro recovers to its last sync block. At-least-once; de-dup downstream on
-> `(tagId, sourceTs)`.
+> `(signalId, sourceTs)`.
 
 ---
 
@@ -155,10 +270,11 @@ Three independent rotation levers:
 - `format`: `parquet` (default) — columnar, best compression + column pruning for Athena / BigQuery /
   Synapse; or `avro` — row-oriented, true union value typing, recover-to-last-sync-block durability
   (good for BigQuery loads and strict no-loss). Build the matching feature.
-- `mode`: `rows` (default) flattens a `SouthboundTagUpdate`-shaped message into one typed row per
-  sample (sparse `valueDouble|valueLong|valueBool|valueString` + `valueType`). Aggregated
-  `ProcessedTelemetry` keeps that shape, so it lands as rows too; a payload that **isn't**
-  `SouthboundTagUpdate`-shaped is never dropped — it spills to a sibling `_unmapped` raw file.
+- `mode`: `rows` (default) flattens telemetry into typed rows. Its built-in projection decodes a
+  `SouthboundSignalUpdate` into one row per sample (sparse `valueDouble|valueLong|valueBool|valueString`
+  + `valueType`); aggregated `ProcessedTelemetry` keeps that shape, so it lands as rows too; a payload
+  that **isn't** `SouthboundSignalUpdate`-shaped is never dropped — it spills to a sibling `_unmapped`
+  raw file. Add a [`rows` block](#project-custom-file-columns) to declare your own columns instead.
   `mode: "raw"` writes one opaque row per message (`topic`, `recvTs`, `name`, `version`, `payload`).
 
 ---
@@ -214,7 +330,7 @@ once and fans every message out to every route that registered it, so the routes
     "pipeline": [ { "filter": { "quality": "GOOD" } }, { "sample": { "everyMs": 1000 } } ],
     "target": "local", "publish": { "topic": "processed/{ThingName}/downsampled" } },
   { "id": "archive", "subscribe": ["southbound/factory-1/+/+/+"],
-    "pipeline": [ { "aggregate": { "window": "10s", "by": "body.tag.id", "fn": ["avg", "max"] } } ],
+    "pipeline": [ { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max"] } } ],
     "target": "stream:archive" }
 ]
 ```
@@ -231,7 +347,7 @@ once and fans every message out to every route that registered it, so the routes
 ```
 
 `publish.partitionKey` is a dotted path resolved per message. It defaults to the route `key`, which
-defaults to `body.tag.id` — the stable canonical tag id. Override it to co-locate records by a
+defaults to `body.signal.id` — the stable canonical signal id. Override it to co-locate records by a
 different dimension (e.g. device or site).
 
 ---
@@ -270,6 +386,67 @@ kubectl apply -f k8s/configmap.yaml -f k8s/deployment.yaml
 # image entrypoint: telemetry-processor --platform KUBERNETES
 # pod args:         -c CONFIGMAP /config        (POD_NAME → Thing name when -t is absent)
 ```
+
+---
+
+<a id="ship-script-files-with-a-deployment"></a>
+## Ship script files with a deployment
+
+**Goal:** get your `.rhai` files onto the device/pod so `{"script": {"file": "…"}}` can load them.
+
+A script file must exist on disk where the process can read it, at the path `scriptsDir` +
+the relative `file`. How you deliver it depends on the platform:
+
+**Greengrass** — ship the `.rhai` files as **component artifacts** and point `scriptsDir` at the
+artifact directory. Greengrass unpacks artifacts under a per-component path exposed as
+`{artifacts:decompressedPath}/…` (or `{artifacts:path}`), so set `scriptsDir` from the recipe:
+
+```yaml
+# recipe.yaml (excerpt)
+Manifests:
+  - Platform: { os: linux }
+    Artifacts:
+      - URI: "s3://.../telemetry-processor.zip"          # contains scripts/derive.rhai
+    Lifecycle:
+      Run: >
+        telemetry-processor --platform GREENGRASS -c GG_CONFIG
+ComponentConfiguration:
+  DefaultConfiguration:
+    component:
+      global:
+        defaults:
+          scriptsDir: "{artifacts:decompressedPath}/telemetry-processor/scripts"
+```
+
+For a local `greengrass-cli` deployment, place the files under your `--artifactDir` and use the same
+`scriptsDir`. Bump the component version (or `--remove` then `--merge`) when the scripts change —
+artifacts are immutable per version.
+
+**Kubernetes** — mount the scripts from a **ConfigMap** (or a volume) and point `scriptsDir` at the
+mount path:
+
+```bash
+kubectl create configmap tp-scripts --from-file=scripts/   # derive.rhai, keep_in_range.rhai, …
+```
+
+```yaml
+# deployment.yaml (excerpt)
+spec:
+  containers:
+    - name: telemetry-processor
+      volumeMounts:
+        - { name: scripts, mountPath: /etc/tp/scripts, readOnly: true }
+  volumes:
+    - name: scripts
+      configMap: { name: tp-scripts }
+# …and in the component ConfigMap: component.global.defaults.scriptsDir = "/etc/tp/scripts"
+```
+
+**HOST / standalone** — just place the files next to the binary (or anywhere) and set `scriptsDir` to
+that directory (an absolute `file` path also works without `scriptsDir`).
+
+> Scripts are read **once at startup**, like the rest of the config — changing a `.rhai` file needs a
+> component restart (a new deployment / pod rollout), not a live reload.
 
 ---
 

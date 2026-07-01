@@ -23,7 +23,7 @@ use crate::proc::route::{run_worker, Dispatcher};
 use crate::proc::{now_ms, Pipeline, ProcMsg};
 
 /// Default aggregation/partition key when neither the route nor the global defaults set one.
-const DEFAULT_KEY: &str = "body.tag.id";
+const DEFAULT_KEY: &str = "body.signal.id";
 /// Default route channel capacity (also the broker-side subscribe queue depth).
 const DEFAULT_QUEUE: usize = 256;
 
@@ -31,6 +31,16 @@ const DEFAULT_QUEUE: usize = 256;
 struct RouteWire {
     filters: Vec<String>,
     tx: mpsc::Sender<ProcMsg>,
+}
+
+/// Per-route-invariant build context: the shared Rhai engine, the script-file loader, and the
+/// cross-route defaults. Bundled so `build_route` takes the route plus one context, not a long
+/// argument list.
+struct RouteBuildCtx<'a> {
+    engine: &'a Arc<Engine>,
+    loader: &'a crate::proc::script::ScriptLoader,
+    default_key: &'a str,
+    default_target: Option<&'a str>,
 }
 
 /// The running processor: its subscriptions, channel senders, and worker tasks.
@@ -59,6 +69,19 @@ impl ProcessorApp {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
         let default_key = defaults.key.clone().unwrap_or_else(|| DEFAULT_KEY.to_string());
+        // Script files (`{"file": "..."}`) resolve relative to this dir (template-substituted).
+        let scripts_dir = defaults
+            .scripts_dir
+            .as_deref()
+            .map(|d| resolve(&config, d))
+            .unwrap_or_else(|| ".".to_string());
+        let loader = crate::proc::script::ScriptLoader::new(scripts_dir);
+        let ctx = RouteBuildCtx {
+            engine: &engine,
+            loader: &loader,
+            default_key: &default_key,
+            default_target: defaults.target.as_deref(),
+        };
 
         let mut app = Self {
             messaging: messaging.clone(),
@@ -82,7 +105,7 @@ impl ProcessorApp {
                     continue;
                 }
             };
-            match app.build_route(gg, &config, &engine, route, &default_key, defaults.target.as_deref()) {
+            match app.build_route(gg, &config, &ctx, route) {
                 Ok(wire) => wires.push(wire),
                 Err(e) => tracing::error!(error = %e, "failed to build route; skipping"),
             }
@@ -111,17 +134,15 @@ impl ProcessorApp {
         &mut self,
         gg: &GgCommons,
         config: &Config,
-        engine: &Arc<Engine>,
+        ctx: &RouteBuildCtx<'_>,
         route: RouteConfig,
-        default_key: &str,
-        default_target: Option<&str>,
     ) -> anyhow::Result<RouteWire> {
         let _ = gg; // used only under the `streaming` feature (stream targets)
-        let route_key = route.key.clone().unwrap_or_else(|| default_key.to_string());
+        let route_key = route.key.clone().unwrap_or_else(|| ctx.default_key.to_string());
         let target_str = route
             .target
             .clone()
-            .or_else(|| default_target.map(String::from))
+            .or_else(|| ctx.default_target.map(String::from))
             .ok_or_else(|| anyhow::anyhow!("route '{}' has no target", route.id))?;
         let target = Target::parse(&target_str)?;
 
@@ -142,7 +163,7 @@ impl ProcessorApp {
             _ => None,
         };
 
-        let pipeline = Pipeline::build(&route.pipeline, &route_key, engine)?;
+        let pipeline = Pipeline::build(&route.pipeline, &route_key, ctx.engine, ctx.loader)?;
         let dispatcher = Dispatcher::new(
             self.messaging.clone(),
             target,
