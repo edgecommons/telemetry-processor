@@ -139,10 +139,10 @@ Array values are first-class across the stages; pick the tool for the job:
 
 - A **`filter` `script`** returns a boolean — `true` keeps the message.
 - A **`script`** stage returns the **new body** map, or `()` to **drop** the message.
-- Scope exposed to both: the message view — `topic`, `body` and `tags` (maps; `tags` is envelope
-  metadata, not the signal), `samples`, and the conveniences `value` / `quality` (the first sample's) —
-  **plus the runtime context** `thingName` / `componentName` / `componentFullName` / `routeId` /
-  `recvMs`. An eval error or a non-JSON result drops the message (logged at WARN).
+- Scope exposed to both: the message view — `topic`, the `header` / `body` / `tags` maps (`tags` is
+  envelope metadata, not the signal), `samples`, and the conveniences `value` / `quality` (the first
+  sample's) — **plus the runtime context** `thingName` / `componentName` / `componentFullName` /
+  `routeId` / `recvMs`. An eval error or a non-JSON result drops the message (logged at WARN).
 
 For the full scripting model — every scope binding (incl. the runtime context `thingName` /
 `componentName` / `routeId` / `recvMs`), return/error semantics, a Rhai language primer, array

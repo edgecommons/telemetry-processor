@@ -59,16 +59,23 @@ script is running). Everything is a plain value — read them, combine them, ret
 | Binding | Type | What it is |
 |---|---|---|
 | `topic` | string | the source topic the message arrived on |
+| `header` | map | the envelope header — `header.name` (message type), `header.version`, `header.timestamp` (RFC3339 UTC, publisher creation time), `header.uuid` (unique message id), `header.correlation_id`, `header.reply_to` |
 | `body` | map | the full message body — `body.signal`, `body.samples`, `body.device`, or *any* JSON your payload carries |
 | `tags` | map | the message-**envelope** metadata (`tags.site`, `tags.thing`, …) — identity, **not** the signal |
 | `samples` | array | `body.samples` (or `[]` when absent); each element is a map with `value`, `quality`, `sourceTs`, … |
 | `value` | any | convenience: the **first** sample's `value` (a number, string, bool, **or array**) |
 | `quality` | string | convenience: the **first** sample's `quality` (`""` when absent) |
 
-`body` and `tags` are the two roots; `value`/`quality`/`samples` are conveniences derived from the
-southbound shape. On a payload that *isn't* southbound-shaped, `samples` is `[]` and `value`/`quality`
-are empty — but `body` always holds whatever arrived, so **a script is payload-agnostic**: read your own
-paths off `body`.
+`header`, `body`, and `tags` are the three maps of the envelope — the *whole* message is in scope, not
+a curated subset, so you can branch on the message type (`header.name`), carry a source id for dedup or
+tracing (`header.uuid`, `header.correlation_id`), or compare the publisher timestamp against `recvMs`.
+`value`/`quality`/`samples` are conveniences derived from the southbound shape. On a payload that
+*isn't* southbound-shaped, `samples` is `[]` and `value`/`quality` are empty — but `body` always holds
+whatever arrived, so **a script is payload-agnostic**: read your own paths off `body`.
+
+> **`header.timestamp` vs. `recvMs`.** `header.timestamp` is when the *publisher* created the message
+> (an RFC3339 string); `recvMs` is when *this processor* received it (Unix ms). They differ by transit
+> latency — both are available so you can use whichever the logic needs.
 
 ### The runtime context
 
@@ -336,6 +343,38 @@ strings, and the `_` arm makes "unknown" explicit instead of silently dropping.
 
 **Why.** For a simple fold, `reduce` is clearer than a `for` loop with an external accumulator, and it
 composes — swap the closure for `if v > a { v } else { a }` and you have `max` instead.
+
+### 9. Route by message type and carry provenance
+
+**Goal:** on a route that sees more than one kind of message, keep only raw signal updates — and stamp
+each surviving message with the source id so a downstream consumer can dedup or trace it.
+
+A `filter` that gates on the envelope type:
+
+```rhai
+header.name == "SouthboundSignalUpdate"
+```
+
+…and a `script` that carries provenance from the header into the body:
+
+```rhai
+#{
+    "signal": body.signal,
+    "value": value,
+    "msgType": header.name,
+    "sourceId": header.uuid,               // unique per source message → dedup / trace key
+    "corrId": header.correlation_id
+}
+```
+
+**How it works.** `header` is the full envelope header, so `header.name` distinguishes a
+`SouthboundSignalUpdate` from an aggregated `ProcessedTelemetry` (or any other type), and `header.uuid`
+/ `header.correlation_id` are the identifiers the publisher stamped at construction. The filter keeps
+one type; the transform threads the ids into the body where a lake or a consumer can see them.
+
+**Why.** The message *type* and its *identity* are first-class facts about a message, not implementation
+detail — routing by type and preserving a stable id (for exactly-once processing downstream, or for
+tracing a value back to its source read) are common needs the built-in stages can't express.
 
 ## Limits and gotchas
 

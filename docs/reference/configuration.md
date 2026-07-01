@@ -149,6 +149,7 @@ the per-message **message view** plus the constant **runtime context**:
 | Binding | Type | Value |
 |---------|------|-------|
 | `topic` | string | the source topic |
+| `header` | map | the envelope header — `name`, `version`, `timestamp`, `uuid`, `correlation_id`, `reply_to` |
 | `body` | map | the message body |
 | `tags` | map | the envelope `tags{}` (message metadata — *not* the signal) |
 | `samples` | array | `body.samples` (or `[]`) |

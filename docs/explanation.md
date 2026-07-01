@@ -93,8 +93,8 @@ Scripting appears in **two roles**, both backed by the same engine and the same 
 - a **`script` stage** — a transform that evaluates to the **new body** (a map), or to `()` to
   **drop** the message.
 
-A script sees the **message view** (`topic`, `body`, `tags`, `samples`, and the first-sample
-conveniences `value`/`quality`) plus the **runtime context** (`thingName`, `componentName`,
+A script sees the **message view** (`topic`, the `header`/`body`/`tags` maps, `samples`, and the
+first-sample conveniences `value`/`quality`) plus the **runtime context** (`thingName`, `componentName`,
 `componentFullName`, `routeId`, `recvMs`) so a generic, reusable script can branch on which
 component/route/thing it runs in. Scripts are **stateless** — each evaluation sees only the current
 message; cross-message state belongs in `sample`/`aggregate`. Array-valued fields arrive as Rhai

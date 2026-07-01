@@ -4,8 +4,9 @@
 //! message). The same [`RhaiEval`] backs the Rhai `filter` option (evaluating to a boolean). The
 //! engine is shared across all routes; each stage compiles its source to an `AST` once at build.
 //!
-//! Scope exposed to a script: the message view (`topic`, `body` / `tags` maps, `samples` array, and
-//! the convenience bindings `value` / `quality` — the first sample's), plus the **runtime context**
+//! Scope exposed to a script: the message view (`topic`, the `header` / `body` / `tags` maps,
+//! `samples` array, and the convenience bindings `value` / `quality` — the first sample's), plus the
+//! **runtime context**
 //! (`thingName`, `componentName`, `componentFullName`, `routeId`, `recvMs`) so a generic script can
 //! branch on which component/route/thing it runs in. A `filter` script returns a boolean; a `script`
 //! stage returns the new body map (or `()` to drop). Array-valued fields arrive as Rhai arrays, so a
@@ -104,6 +105,11 @@ impl RhaiEval {
         scope.push("routeId", self.ctx.route_id.clone());
         scope.push("recvMs", m.recv_ms as i64);
         scope.push_dynamic("body", to_dyn(&m.msg.body));
+        // The whole message envelope, symmetric with `body`/`tags`: `header.name`, `header.version`,
+        // `header.timestamp`, `header.uuid`, `header.correlation_id`, `header.reply_to`.
+        if let Ok(header) = serde_json::to_value(&m.msg.header) {
+            scope.push_dynamic("header", to_dyn(&header));
+        }
         if let Ok(tags) = serde_json::to_value(&m.msg.tags) {
             scope.push_dynamic("tags", to_dyn(&tags));
         }
@@ -448,6 +454,59 @@ mod tests {
         let out = s.process(pm(json!({ "samples": [{ "value": [3.0, 4.0], "quality": "GOOD" }] })));
         let rms = out[0].msg.body["rms"].as_f64().unwrap();
         assert!((rms - 3.535_533).abs() < 1e-4, "rms was {rms}");
+    }
+
+    #[test]
+    fn script_reads_message_header() {
+        // The whole envelope header is available — name/version/uuid/timestamp/correlation_id —
+        // for provenance, dedup, tracing, or branching on the message type.
+        let src = ScriptSource::Inline(
+            r#"
+            #{
+                "name": header.name,
+                "version": header.version,
+                "corr": header.correlation_id,
+                "hasUuid": header.uuid != "",
+                "hasTs": header.timestamp != ""
+            }
+            "#
+            .into(),
+        );
+        let m = MessageBuilder::new("ProcessedTelemetry", "2.0")
+            .correlation_id("corr-123")
+            .payload(json!({ "samples": [] }))
+            .build();
+        let mut s = ScriptStage::build(&src, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let out = s.process(ProcMsg { topic: "t".into(), msg: m, recv_ms: now_ms() });
+        let b = &out[0].msg.body;
+        assert_eq!(b["name"], json!("ProcessedTelemetry"));
+        assert_eq!(b["version"], json!("2.0"));
+        assert_eq!(b["corr"], json!("corr-123"));
+        assert_eq!(b["hasUuid"], json!(true));
+        assert_eq!(b["hasTs"], json!(true));
+    }
+
+    #[test]
+    fn filter_script_gates_on_message_type() {
+        // A filter that keeps only a specific envelope type — routing by `header.name`.
+        let e = RhaiEval::compile(
+            &engine(),
+            &loader_load(&ScriptSource::Inline(r#"header.name == "SouthboundSignalUpdate""#.into())),
+            &ctx(),
+        )
+        .unwrap();
+        let sig = ProcMsg {
+            topic: "t".into(),
+            msg: MessageBuilder::new("SouthboundSignalUpdate", "1.0").payload(json!({})).build(),
+            recv_ms: now_ms(),
+        };
+        let proc = ProcMsg {
+            topic: "t".into(),
+            msg: MessageBuilder::new("ProcessedTelemetry", "1.0").payload(json!({})).build(),
+            recv_ms: now_ms(),
+        };
+        assert!(e.eval_bool(&sig));
+        assert!(!e.eval_bool(&proc));
     }
 
     // Resolve an inline ScriptSource to text for a direct RhaiEval compile in tests.
