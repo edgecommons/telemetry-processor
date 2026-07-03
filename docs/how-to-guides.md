@@ -162,7 +162,7 @@ line breaks, no diffing). Reference a `.rhai` **file** instead — give `script`
 ```jsonc
 "global": { "defaults": { "scriptsDir": "{ComponentName}/scripts" } },
 "instances": [
-  { "id": "derive", "subscribe": ["southbound/+/+/+/+"],
+  { "id": "derive", "subscribe": ["ecv1/+/+/+/data/#"],
     "pipeline": [
       { "filter": { "script": { "file": "keep_in_range.rhai" } } },
       { "script": { "file": "rules/derive.rhai" } }
@@ -338,15 +338,18 @@ credentials the SDK chain can find (env / profile / instance role).
 
 ```jsonc
 { "id": "alarms-northbound",
-  "subscribe": ["southbound/factory-1/+/+/alarms/#"],
+  "subscribe": ["ecv1/+/+/+/data/#"],
   "pipeline": [ { "filter": { "field": "body.samples[].quality", "op": "ne", "value": "GOOD" } } ],
   "target": "northbound",
-  "publish": { "topic": "telemetry/{ThingName}/alarms", "qos": "atLeastOnce" } }
+  "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/evt/alarms", "qos": "atLeastOnce" } }
 ```
 
 - `target: "northbound"` publishes via IoT Core / the northbound MQTT broker.
 - `publish.topic` is the destination (template vars like `{ThingName}` are resolved at startup);
-  omitting it reuses the source topic.
+  omitting it reuses the source topic. Alarms are events, so this targets the UNS **`evt`** class.
+  Keep route outputs on `data` / `evt` / `app` — a publish to a reserved class
+  (`state`/`metric`/`cfg`/`log`) is rejected by the guard (the processor WARNs at startup if a
+  resolved `publish.topic` lands on one).
 - `publish.qos`: `atLeastOnce` (default) or `atMostOnce`.
 
 ---
@@ -360,10 +363,10 @@ once and fans every message out to every route that registered it, so the routes
 
 ```jsonc
 "instances": [
-  { "id": "downsample-local", "subscribe": ["southbound/factory-1/+/+/+"],
+  { "id": "downsample-local", "subscribe": ["ecv1/+/+/+/data/#"],
     "pipeline": [ { "filter": { "quality": "GOOD" } }, { "sample": { "everyMs": 1000 } } ],
-    "target": "local", "publish": { "topic": "processed/{ThingName}/downsampled" } },
-  { "id": "archive", "subscribe": ["southbound/factory-1/+/+/+"],
+    "target": "local", "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" } },
+  { "id": "archive", "subscribe": ["ecv1/+/+/+/data/#"],
     "pipeline": [ { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max"] } } ],
     "target": "stream:archive" }
 ]
@@ -386,6 +389,54 @@ different dimension (e.g. device or site).
 
 ---
 
+## Route by source device / adapter (the `identity.` path)
+
+**Goal:** key, filter, or partition on *who* published a reading — the UNS replacement for the removed
+`tags.thing`.
+
+The source device/component/instance now travel in the message's top-level `identity` element, read
+via the `identity.` key path (and the `identity` script binding):
+
+```jsonc
+"pipeline": [
+  // keep only readings from OPC UA adapters
+  { "filter": { "field": "identity.component", "op": "eq", "value": "opcua-adapter" } }
+],
+"key": "identity.device",                       // aggregate / partition per source device
+"publish": { "partitionKey": "identity.device" }
+```
+
+Available paths: `identity.device` (the last hierarchy value), `identity.component`,
+`identity.instance`, `identity.path`, and `identity.hier[].level` / `identity.hier[].value`. A script
+reads the same via the `identity` binding, e.g. `identity.device == "gw-01"`. Scope the *subscribe*
+filter to specific adapters instead when you don't need the whole fleet, e.g.
+`ecv1/+/opcua-adapter/+/data/#`.
+
+---
+
+## Operate the processor over UNS commands
+
+**Goal:** inspect and control a running processor from the console / any MQTT client.
+
+The processor answers its command inbox at `ecv1/{device}/telemetry-processor/main/cmd/<verb>`. Send a
+`cmd` envelope (`header.name` = the verb) with `header.reply_to` set to get a structured reply.
+
+| Verb | What it does |
+|------|--------------|
+| `ping` | liveness — `{status:"RUNNING", uptimeSecs}` (library built-in) |
+| `reload-config` | re-fetch + re-apply the config (library built-in) |
+| `get-configuration` | the redacted effective config (library built-in) |
+| `get-stats` | per-route counters `{routes:[{id,in,out,dropped,streamAppends,publishFailures,queueDepth,paused}]}` |
+| `flush` | force-close every route's open **time** windows now → `{flushed:n}` |
+| `pause` / `resume` | stop / restart enqueuing to a route (`{route}`) or all routes (body omitted) |
+
+The processor also publishes, without any request: its `state` keepalive
+(`ecv1/{device}/telemetry-processor/main/state`), a `metric/pipeline` throughput metric (when
+`metricEmission.target: "messaging"`), and `evt/{queue-overflow,route-error,stream-unavailable}` health
+events. Subscribe the fleet with `ecv1/+/+/+/{state,metric,evt}/#`.
+
+---
+
 ## Deploy to a platform
 
 **Goal:** run on Greengrass (IPC), HOST (Docker / binary), or Kubernetes.
@@ -405,7 +456,7 @@ then deploy with the recipe:
 ```bash
 GGCOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
 greengrass-cli deployment create --recipeDir . --artifactDir ./artifacts \
-  --merge "com.mbreissi.greengrass.TelemetryProcessor=1.0.0"
+  --merge "com.mbreissi.telemetry-processor=1.0.0"
 # recipe Run: telemetry-processor --platform GREENGRASS -c GG_CONFIG
 ```
 

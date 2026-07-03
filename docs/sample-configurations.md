@@ -1,7 +1,7 @@
 # Sample Configurations
 
 Complete, ready-to-adapt configurations for the **Telemetry Processor**
-(`com.mbreissi.greengrass.TelemetryProcessor`), one per realistic deployment scenario. Each sample is
+(`com.mbreissi.telemetry-processor`), one per realistic deployment scenario. Each sample is
 a valid config document; the prose after it explains **what every option does and how it changes
 runtime behavior** — which topics a route consumes, how its pipeline filters/samples/aggregates the
 stream, where the result is forwarded (local bus, northbound IoT Core, or a durable stream), and how
@@ -57,8 +57,8 @@ its own subscription, pipeline, and target. A route may omit any field present i
 
 | Field | Meaning |
 |-------|---------|
-| `id` (required) | Route id — used in logs and as the metric dimension. |
-| `subscribe` | `[string]` of MQTT topic filters (`+`/`#` wildcards allowed). Each filter is run through the ggcommons template resolver, so `{ThingName}` / `{ComponentName}` / `{site}` (and any `tags` key) expand against the active config. |
+| `id` (required) | Route id — used in logs and in the `get-stats` command's per-route counters. |
+| `subscribe` | `[string]` of UNS/MQTT topic filters (`+`/`#` wildcards allowed). The fleet consumer for southbound telemetry is `ecv1/+/+/+/data/#` (scope per adapter with `ecv1/+/opcua-adapter/+/data/#`). Each filter is run through the ggcommons template resolver, so `{ThingName}` / `{ComponentName}` / `{site}` (and any `tags` key) expand against the active config. |
 | `pipeline` | `[stage]` — an ordered list of transform stages (below). Order matters: stages run left to right. |
 | `target` | `"local"` \| `"northbound"` \| `"stream:<name>"`. Falls back to `global.defaults.target`; a route with no target at all is skipped with an error. |
 | `publish` | `{ topic, partitionKey, qos }` — the output address. `topic` (for `local`/`northbound`) is template-resolved at startup; `partitionKey` (for `stream:`) and `qos` are described per scenario. |
@@ -87,8 +87,9 @@ to 0 or 1, an `aggregate` accumulates and emits on window close, the rest pass 1
 | `script` | `{ "script": "#{ \"scaled\": value * 0.1 }" }` | A Rhai program that returns a new body map; `()` drops the message (§9). |
 
 The Rhai engine is always compiled in. A `filter`/`script` scope exposes `topic` (string),
-`body`/`tags` (maps), `samples` (array), and the convenience bindings `value`/`quality` (the first
-sample's). The shared engine is bounded (`max_operations = 1_000_000`) to deter runaway scripts.
+`body`/`tags`/`identity` (maps — `identity` is the source publisher's UNS identity, the `tags.thing`
+replacement), `samples` (array), and the convenience bindings `value`/`quality` (the first sample's).
+The shared engine is bounded (`max_operations = 1_000_000`) to deter runaway scripts.
 
 ### Targets and the feature flags they need
 
@@ -109,9 +110,9 @@ only), `streaming`, and the sink features `streaming-kinesis`, `streaming-file-p
 ## 1. Minimal HOST dev: filter, sample, local
 
 The smallest useful pipeline. One route subscribes to the southbound bus, keeps only GOOD-quality
-updates, downsamples each signal to 1 Hz, and republishes the result on the local bus under a `processed/…`
-topic. This is the shape you run against a local broker and a southbound adapter (or a replay) while
-developing.
+updates, downsamples each signal to 1 Hz, and republishes the result on the local bus under a UNS
+`data/…` topic. This is the shape you run against a local broker and a southbound adapter (or a replay)
+while developing.
 
 On HOST the dual-MQTT transport needs broker details. You can supply them inline under `messaging`
 (shown here) or as a separate file passed positionally as `--transport MQTT ./standalone-messaging.json`.
@@ -134,13 +135,13 @@ On HOST the dual-MQTT transport needs broker details. You can supply them inline
     "instances": [
       {
         "id": "downsample-local",
-        "subscribe": [ "southbound/factory-1/+/+/+" ],
+        "subscribe": [ "ecv1/+/+/+/data/#" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
           { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
         ],
         "target": "local",
-        "publish": { "topic": "processed/{ThingName}/downsampled" }
+        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" }
       }
     ]
   }
@@ -161,17 +162,17 @@ cargo run --features standalone -- --platform HOST --transport MQTT ./standalone
 
 | Option | Effect on runtime behavior |
 |--------|----------------------------|
-| `messaging.local` | The local MQTT broker the processor both **subscribes to** (the `southbound/…` source) and **publishes to** (the `processed/…` output). On HOST this is one half of the dual-MQTT transport; `clientId` must be unique per process or the broker drops the older session. Omit it here and pass the same block as the positional `--transport MQTT ./standalone-messaging.json` instead. |
+| `messaging.local` | The local MQTT broker the processor both **subscribes to** (the `ecv1/…/data/#` source) and **publishes to** (the `ecv1/…/data/downsampled` output). On HOST this is one half of the dual-MQTT transport; `clientId` must be unique per process or the broker drops the older session. Omit it here and pass the same block as the positional `--transport MQTT ./standalone-messaging.json` instead. |
 | `metricEmission` | Standard ggcommons metric target (`log` / `messaging` / `cloudwatch` / `prometheus`). Observability only — it does not change processing. |
 | `tags` | Site/asset identity attached to messages and usable as topic template variables (`{site}`, `{appId}`). Pure metadata. |
 | `global.defaults.key` | Default key **path** every route inherits for `sample`/`aggregate`/`partitionKey` when it doesn't set its own. `body.signal.id` is the southbound contract's stable canonical id. |
 | `global.defaults.target` | Default `target` a route inherits when it omits one. |
 | `instances[].id` | Stable route id (**required**); appears in logs. |
-| `subscribe` | The topic filter(s) this route consumes. `southbound/factory-1/+/+/+` matches every `{ComponentName}/{InstanceId}/{signalId}` published by adapters under `factory-1`. `+`/`#` wildcards are honored; the filter is template-resolved first. |
+| `subscribe` | The topic filter(s) this route consumes. `ecv1/+/+/+/data/#` matches the `data` class of every `{device}/{component}/{instance}/{signalPath}` the fleet's adapters publish. `+`/`#` wildcards are honored; the filter is template-resolved first. |
 | `filter.quality: "GOOD"` | Drops any message unless **all** its `samples[].quality` are `GOOD` — the cheap way to shed BAD/UNCERTAIN readings before they cost downstream work. |
 | `sample.everyMs` / `by` | Per-key downsample: at most one message **per signal** (`by: body.signal.id`) per 1000 ms. The first message for a key always passes; later ones within the window are dropped. Turns an adapter's high-rate feed into a steady 1 Hz stream. |
 | `target: "local"` | Republishes each surviving message on the local bus. |
-| `publish.topic` | Output topic template (resolved at startup). Omit it and the processed message is republished on its **source topic** — set it (as here) to land on a distinct `processed/…` topic so consumers don't see both raw and processed copies. |
+| `publish.topic` | Output topic template (resolved at startup). Omit it and the processed message is republished on its **source topic** — set it (as here) to land on a distinct UNS `data/…` topic so consumers don't see both raw and processed copies. On a `local` target the output's `identity` is restamped to the processor, so it can't self-echo through the `ecv1/+/+/+/data/#` filter. Keep the output on a `data`/`evt`/`app` class — a reserved class (`state`/`metric`/`cfg`/`log`) is rejected by the guard. |
 
 ---
 
@@ -219,7 +220,7 @@ file destination is a normal stream sink, so the route forwards to `stream:archi
     "instances": [
       {
         "id": "archive-good",
-        "subscribe": [ "southbound/factory-1/+/+/+" ],
+        "subscribe": [ "ecv1/+/+/+/data/#" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
           { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
@@ -328,7 +329,7 @@ upload.
     "instances": [
       {
         "id": "archive-all-raw",
-        "subscribe": [ "southbound/factory-1/#" ],
+        "subscribe": [ "ecv1/+/+/+/data/#" ],
         "pipeline": [],
         "target": "stream:raw-archive",
         "publish": { "partitionKey": "body.signal.id" },
@@ -342,7 +343,7 @@ upload.
 | Option | Effect on runtime behavior |
 |--------|----------------------------|
 | `pipeline: []` | No transform — every matched message is forwarded verbatim. The route is pure transport from the local bus into the durable archive. |
-| `subscribe: ["southbound/factory-1/#"]` | The multi-level `#` wildcard captures the **entire** southbound subtree under `factory-1` (all components/instances/signals, including nested `…/alarms/#`). |
+| `subscribe: ["ecv1/+/+/+/data/#"]` | The trailing `#` captures the **entire** `data` class across the fleet (all devices/components/instances/signals). Scope it per adapter with `ecv1/+/opcua-adapter/+/data/#`. |
 | `mode: "raw"` | One row per message; payload kept opaque. Accepts non-southbound shapes (this is also the `_unmapped` fallback rows mode uses). Use for replay/forensics where you want bytes, not typed columns. |
 | `maxFileBytes: 8388608` | Small (8 MiB) cap so files rotate frequently by size. Combined with `rollEverySecs: 0`, **size is the only trigger** — at a steady ingest rate you get a predictable cadence of ~8 MiB objects. Remember the soft cap: a file finalizes at the first row-group boundary past 8 MiB, so keep `batch.maxBytes` (512 KiB here) well below it. |
 | `rollEverySecs: 0` | Disables time-based rolling. Without it, a slow period would still roll a half-empty file every N seconds; with it, files only roll when full — uniform sizes, fewer tiny objects. |
@@ -385,7 +386,7 @@ front of Kinesis means a WAN outage parks records on disk and drains them when c
     "instances": [
       {
         "id": "hot-rollup",
-        "subscribe": [ "southbound/factory-1/+/+/+" ],
+        "subscribe": [ "ecv1/+/+/+/data/#" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
           { "aggregate": { "window": "5s", "by": "body.signal.id", "fn": ["avg", "max", "count"] } }
@@ -448,12 +449,12 @@ publishes them to IoT Core at a chosen QoS.
     "instances": [
       {
         "id": "alarms-northbound",
-        "subscribe": [ "southbound/factory-1/+/+/alarms/#" ],
+        "subscribe": [ "ecv1/+/+/+/data/#" ],
         "pipeline": [
           { "filter": { "field": "body.samples[].quality", "op": "ne", "value": "GOOD" } }
         ],
         "target": "northbound",
-        "publish": { "topic": "telemetry/{ThingName}/alarms", "qos": "atLeastOnce" }
+        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/evt/alarms", "qos": "atLeastOnce" }
       }
     ]
   }
@@ -466,7 +467,7 @@ publishes them to IoT Core at a chosen QoS.
 | `subscribe` | Narrowed to `…/+/+/alarms/#`, so only the adapters' alarm topics enter this route — IoT Core is priced per message, so keep northbound sparse. |
 | `filter.field` / `op: "ne"` / `value: "GOOD"` | Keep a message when **any** `body.samples[].quality` is not `GOOD` — i.e. a fault/alarm/uncertain reading. (Equivalently a Rhai predicate like `samples.any(\|s\| s.quality != "GOOD")` — see §9.) |
 | `target: "northbound"` | Publishes via `publish_to_iot_core` instead of the local bus. |
-| `publish.topic` | The IoT Core topic (template-resolved). `telemetry/{ThingName}/alarms` namespaces alarms per device. |
+| `publish.topic` | The IoT Core topic (template-resolved). `ecv1/{ThingName}/telemetry-processor/main/evt/alarms` publishes alarms as the UNS **`evt`** class, namespaced per device (subscribe `ecv1/+/+/+/evt/#`). |
 | `publish.qos` | `atLeastOnce` (default) guarantees delivery with possible duplicates; `atMostOnce` is fire-and-forget (cheaper, may drop). Only these two are accepted; anything else falls back to `atLeastOnce`. |
 
 ---
@@ -533,7 +534,7 @@ ComponentConfiguration:
         instances:
           # Route 1: downsample + window-aggregate GOOD telemetry → durable Parquet archive.
           - id: "archive-good"
-            subscribe: [ "southbound/{site}/+/+/+" ]
+            subscribe: [ "ecv1/+/+/+/data/#" ]
             pipeline:
               - filter: { quality: "GOOD" }
               - aggregate: { window: "10s", by: "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] }
@@ -541,11 +542,11 @@ ComponentConfiguration:
             publish: { partitionKey: "body.signal.id" }
           # Route 2: forward alarm-flagged updates northbound to IoT Core (low rate, control plane).
           - id: "alarms-northbound"
-            subscribe: [ "southbound/{site}/+/+/alarms/#" ]
+            subscribe: [ "ecv1/+/+/+/data/#" ]
             pipeline:
               - filter: { field: "body.samples[].quality", op: "ne", value: "GOOD" }
             target: "northbound"
-            publish: { topic: "telemetry/{ThingName}/alarms", qos: "atLeastOnce" }
+            publish: { topic: "ecv1/{ThingName}/telemetry-processor/main/evt/alarms", qos: "atLeastOnce" }
 ```
 
 The component also needs `ComponentDependencies` and `accessControl` (abbreviated here):
@@ -617,7 +618,7 @@ data:
         "instances": [
           {
             "id": "archive-good",
-            "subscribe": [ "southbound/factory-1/+/+/+" ],
+            "subscribe": [ "ecv1/+/+/+/data/#" ],
             "pipeline": [
               { "filter": { "quality": "GOOD" } },
               { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
@@ -673,17 +674,17 @@ processed independently by each route's pipeline and target.
   "instances": [
     {
       "id": "downsample-local",
-      "subscribe": [ "southbound/factory-1/+/+/+" ],
+      "subscribe": [ "ecv1/+/+/+/data/#" ],
       "pipeline": [
         { "filter": { "quality": "GOOD" } },
         { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
       ],
       "target": "local",
-      "publish": { "topic": "processed/{ThingName}/downsampled" }
+      "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" }
     },
     {
       "id": "archive-good",
-      "subscribe": [ "southbound/factory-1/+/+/+" ],
+      "subscribe": [ "ecv1/+/+/+/data/#" ],
       "pipeline": [
         { "filter": { "quality": "GOOD" } },
         { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
@@ -697,7 +698,7 @@ processed independently by each route's pipeline and target.
 
 | Behavior | Detail |
 |----------|--------|
-| Shared filter → one subscription | Both routes list `southbound/factory-1/+/+/+`. Subscriptions are keyed by filter, so this is a **single** broker subscription; the handler clones each message to both routes' bounded queues. |
+| Shared filter → one subscription | Both routes list `ecv1/+/+/+/data/#`. Subscriptions are keyed by filter, so this is a **single** broker subscription; the handler clones each message to both routes' bounded queues (after the self-echo guard). |
 | Independent pipelines/targets | `downsample-local` republishes a 1 Hz copy on the local bus; `archive-good` lands 10 s rollups in the Parquet archive. The two never interfere — separate worker tasks, separate state. |
 | Independent backpressure | Each route has its own `maxQueue`. If one route's queue fills (slow target), it drops at its own edge without affecting the other. |
 | Distinct outputs | Give each route a distinct `publish.topic` (or a `stream:` target) so consumers can tell the streams apart. |
@@ -720,13 +721,13 @@ When the built-in operators don't fit, drop to Rhai. A `filter` `script` is a bo
   "instances": [
     {
       "id": "good-and-in-range",
-      "subscribe": [ "southbound/factory-1/+/+/+" ],
+      "subscribe": [ "ecv1/+/+/+/data/#" ],
       "pipeline": [
         { "filter": { "script": "samples.all(|s| s.quality == \"GOOD\" && s.value < 100.0)" } },
         { "script": "#{ \"signal\": body.signal, \"scaled\": value * 0.1, \"q\": quality, \"src\": topic }" }
       ],
       "target": "local",
-      "publish": { "topic": "processed/{ThingName}/scaled" }
+      "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/scaled" }
     }
   ]
 }
@@ -736,7 +737,7 @@ When the built-in operators don't fit, drop to Rhai. A `filter` `script` is a bo
 |-------|----------------------------|
 | `filter.script` | An arbitrary Rhai boolean over the message view. Here it keeps a message only when **every** sample is GOOD **and** under 100.0 — a compound condition the `field`/`op`/`value` form can't express in one step. An eval error (or a non-boolean result) drops the message and is logged. |
 | `script` (transform) | Replaces the body with the map the script returns (Rhai object syntax `#{ … }`). This one rescales the first value (`value * 0.1`) and reshapes the body, carrying `signal`, `quality`, and the source `topic` through. Returning `()` instead drops the message. A result that can't convert to JSON drops it (logged). |
-| Scope bindings | `value`/`quality` are the **first** sample's; use `samples` (the full array) for multi-sample logic. `tags` exposes the envelope tags (`tags.site`, `tags.thing`). |
+| Scope bindings | `value`/`quality` are the **first** sample's; use `samples` (the full array) for multi-sample logic. `tags` exposes the envelope business tags (`tags.site`); `identity` exposes the source publisher (`identity.device` / `identity.component` — the `tags.thing` replacement). |
 | Engine bound | The shared engine caps operations per evaluation (`max_operations = 1_000_000`) so a pathological script can't stall the route worker. |
 
 > Built-in stages compile to a fixed closure once at startup (no per-message parsing); a Rhai stage

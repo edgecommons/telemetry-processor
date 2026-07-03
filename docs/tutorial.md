@@ -6,8 +6,9 @@ In this tutorial you bring the `telemetry-processor` up on your laptop, feed it 
 **Parquet** files. No Greengrass, no cloud, no hardware — just Docker, a Rust build, and a few lines
 of Python.
 
-By the end you will have seen a downsampled message land on `processed/my-thing/downsampled`, and a
-rolling `.parquet` file appear under `./out/archive/dt=…/hr=…/`.
+By the end you will have seen a downsampled message land on the Unified-Namespace `data` topic
+`ecv1/my-thing/telemetry-processor/main/data/downsampled`, and a rolling `.parquet` file appear under
+`./out/archive/dt=…/hr=…/`.
 
 > This is a guided first run — it makes the choices for you and keeps the explanation short. For the
 > *why*, read the [explanation](explanation.md); for variations, the [how-to guides](how-to-guides.md);
@@ -27,7 +28,7 @@ Run everything from the repository root.
 The HOST platform talks to a plain MQTT broker instead of Greengrass IPC. Start the bundled EMQX:
 
 ```bash
-docker compose -f ../ggcommons-monorepo/test-infra/compose.yaml up -d
+docker compose -f ../ggcommons/test-infra/compose.yaml up -d
 ```
 
 This gives you a broker on `localhost:1883` (plaintext) — exactly the address in
@@ -49,11 +50,13 @@ The flags are the standard ggcommons CLI contract: `--platform HOST` (laptop, no
 and `-t my-thing` (the Thing name, which fills the `{ThingName}` template).
 
 `test-configs/config.json` defines two **routes** (each a `component.instances[]` entry), both
-subscribed to `southbound/factory-1/+/+/+`:
+subscribed to the fleet's UNS `data` class `ecv1/+/+/+/data/#`:
 
 - **`downsample-local`** — drops any update that isn't all-`GOOD` quality, then keeps **at most one
   message per signal per second** (`sample everyMs:1000`), and republishes the survivors on
-  `processed/my-thing/downsampled`. Target `local` (straight back onto the bus).
+  `ecv1/my-thing/telemetry-processor/main/data/downsampled`. Target `local` (straight back onto the
+  bus; the output's `identity` is restamped to the processor so it can't self-echo through the fleet
+  filter).
 - **`archive`** — also drops non-`GOOD`, then rolls each signal's values into **5-second tumbling
   windows** computing `avg/max/min/count/last`, and appends each window result to the durable
   `archive` stream. Target `stream:archive` — whose **file sink** writes rolling **Parquet** under
@@ -69,7 +72,9 @@ In a second terminal, subscribe to everything the processor republishes:
 python - <<'PY'
 import paho.mqtt.client as mqtt, json
 c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-c.on_connect = lambda c,u,f,rc,p=None: c.subscribe("processed/#")
+# Only the processor's own data output (component = telemetry-processor), so we don't also
+# print the raw input we publish in Step 4.
+c.on_connect = lambda c,u,f,rc,p=None: c.subscribe("ecv1/+/telemetry-processor/+/data/#")
 def on_msg(c,u,m):
     b = json.loads(m.payload)["body"]; s = b["samples"][0]
     print(f'{m.topic}  {b["signal"]["id"]:12} = {s["value"]:>8}  [{s["quality"]}]')
@@ -78,8 +83,8 @@ c.connect("localhost", 1883); c.loop_forever()
 PY
 ```
 
-(MQTTX subscribed to `processed/#` works just as well.) Leave it running — MQTT messages aren't
-retained, so the subscriber must be up before you publish.
+(MQTTX subscribed to `ecv1/+/telemetry-processor/+/data/#` works just as well.) Leave it running —
+MQTT messages aren't retained, so the subscriber must be up before you publish.
 
 ## 4. Feed it synthetic telemetry
 
@@ -98,7 +103,11 @@ def update(signal_id, signal_name, value, quality="GOOD"):
     now = datetime.now(timezone.utc).isoformat()
     env = {
         "header": {"name": "SouthboundSignalUpdate", "version": "1.0"},
-        "tags":   {"thing": "my-thing", "site": "factory-1"},
+        # The UNS identity element: the SOURCE publisher (a simulated adapter on device gw-01).
+        # The device now lives here, not in tags.thing.
+        "identity": {"hier": [{"level": "device", "value": "gw-01"}],
+                     "path": "gw-01", "component": "sim-adapter", "instance": "inst1"},
+        "tags":   {"site": "factory-1"},
         "body": {
             "device":  {"adapter": "sim", "instance": "inst1"},
             "signal":     {"id": signal_id, "name": signal_name},
@@ -106,7 +115,8 @@ def update(signal_id, signal_name, value, quality="GOOD"):
                          "sourceTs": now, "serverTs": now}],
         },
     }
-    c.publish(f"southbound/factory-1/Sim/inst1/{signal_name}", json.dumps(env))
+    # An adapter's UNS data topic: ecv1/{device}/{component}/{instance}/data/{signalPath}
+    c.publish(f"ecv1/gw-01/sim-adapter/inst1/data/{signal_name}", json.dumps(env))
 
 for i in range(32):
     update("ns=3;i=1001", "Temp",     round(20 + i * 0.1, 2))
@@ -126,10 +136,10 @@ appears**: the `filter { quality: GOOD }` stage dropped it before sampling. You'
 (exact values and cadence depend on arrival timing):
 
 ```
-processed/my-thing/downsampled  ns=3;i=1001  =    20.0  [GOOD]
-processed/my-thing/downsampled  ns=3;i=1002  =     1.0  [GOOD]
-processed/my-thing/downsampled  ns=3;i=1001  =    20.8  [GOOD]
-processed/my-thing/downsampled  ns=3;i=1002  =    1.08  [GOOD]
+ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1001  =    20.0  [GOOD]
+ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1002  =     1.0  [GOOD]
+ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1001  =    20.8  [GOOD]
+ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1002  =    1.08  [GOOD]
 ```
 
 ## 5. Find the Parquet archive
@@ -154,15 +164,17 @@ directly — **one row per aggregated sample**, with typed columns:
 python - <<'PY'
 import pyarrow.parquet as pq, glob
 f = sorted(glob.glob("./out/archive/dt=*/hr=*/*.parquet"))[-1]
-print(pq.read_table(f).to_pandas()[["signalId", "valueDouble", "valueType", "quality", "site"]])
+print(pq.read_table(f).to_pandas()[["signalId", "valueDouble", "valueType", "quality", "tags"]])
 PY
 ```
 
 You'll see `signalId` (e.g. `ns=3;i=1001`), the window **average** in `valueDouble` with
-`valueType="double"`, `quality="GOOD"`, and `site="factory-1"` — alongside `signalName`, `sourceTs`,
-`serverTs`, and the other envelope dimensions (`thing`, `shop`, `line`, `adapter`, `instance`). The
-value is written as a sparse typed column (`valueDouble`/`valueLong`/`valueBool`/`valueString`) chosen
-by `valueType`, which is what lets a lakehouse crawl and column-prune it cleanly.
+`valueType="double"`, `quality="GOOD"`, and the whole envelope `tags` as one JSON column
+(`{"site":"factory-1"}`) — alongside `signalName`, `sourceTs`, `serverTs`, `adapter`, and `instance`.
+(The source **device** is in the message's `identity` element, not in the archive columns; the default
+file projection lands the business `tags` as JSON.) The value is written as a sparse typed column
+(`valueDouble`/`valueLong`/`valueBool`/`valueString`) chosen by `valueType`, which is what lets a
+lakehouse crawl and column-prune it cleanly.
 
 ## What you just saw
 
@@ -177,6 +189,13 @@ One processor, one telemetry source, two routes — each a `filter → … → t
 The two routes never touched each other; they just subscribed to the same topic and forwarded their
 results to different channels. That is the whole idea of the processor.
 
+While it ran, the processor was also a full **Unified-Namespace citizen**: subscribe
+`ecv1/+/+/+/state` to see its automatic keepalive, `ecv1/+/+/+/metric/#` for its `pipeline` throughput
+metric, and `ecv1/+/+/+/evt/#` for health events — and you can address its command inbox at
+`ecv1/my-thing/telemetry-processor/main/cmd/get-stats` (or `flush` / `pause` / `resume`, plus the
+library built-ins `ping` / `reload-config` / `get-configuration`) to read the per-route counters. See
+the [messaging-interface reference](reference/messaging-interface.md#command-verbs).
+
 ## Next steps
 
 - Shape your own routes: [how-to guides](how-to-guides.md).
@@ -184,4 +203,4 @@ results to different channels. That is the whole idea of the processor.
 - Understand the pipeline and durability model: [explanation](explanation.md).
 - Every field, every default: [configuration reference](reference/configuration.md).
 
-To tear down the broker when you're done: `docker compose -f ../ggcommons-monorepo/test-infra/compose.yaml down`.
+To tear down the broker when you're done: `docker compose -f ../ggcommons/test-infra/compose.yaml down`.

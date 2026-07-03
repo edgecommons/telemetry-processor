@@ -157,7 +157,7 @@ mod tests {
         let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
             .payload(json!({ "signal": { "id": "t1" }, "samples": samples }))
             .build();
-        ProcMsg { topic: "southbound/x".into(), msg: m, recv_ms: now_ms() }
+        ProcMsg { topic: "ecv1/gw-01/opcua-adapter/kep1/data/x".into(), msg: m, recv_ms: now_ms() }
     }
 
     fn ctx() -> Arc<ScriptContext> {

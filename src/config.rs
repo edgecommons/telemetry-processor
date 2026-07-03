@@ -228,7 +228,7 @@ mod tests {
     fn parses_route_with_pipeline() {
         let v = json!({
             "id": "r1",
-            "subscribe": ["southbound/+/+/+/+"],
+            "subscribe": ["ecv1/+/+/+/data/#"],
             "pipeline": [
                 { "filter": { "quality": "GOOD" } },
                 { "sample": { "everyMs": 1000.0 } },

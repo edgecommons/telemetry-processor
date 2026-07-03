@@ -24,7 +24,7 @@ The columns, **in file order**:
 
 | Column | Type (Parquet) | Source |
 |--------|----------------|--------|
-| `tags` | string (nullable) | the **whole envelope `tags` object** as compact JSON (null when the message has no `tags` object) |
+| `tags` | string (nullable) | the **whole envelope `tags` object** as compact JSON (null when the message has no `tags` object) — business metadata; the source **device** lives in the top-level `identity` element, not here |
 | `signalId` | string (nullable) | `body.signal.id` |
 | `signalName` | string (nullable) | `body.signal.name` |
 | `adapter` | string (nullable) | `body.device.adapter` |
@@ -42,8 +42,9 @@ The columns, **in file order**:
 | `offset` | int64 (**non-null**) | the durable-buffer record offset |
 
 > **The envelope `tags` are one JSON column, not fixed columns.** The ggcommons message-envelope
-> `tags` is an *open* metadata map — a deployment may carry `thing`/`site`/`shop`/`line`, or an
-> entirely different set. Rather than freezing those into named columns, the default projection lands
+> `tags` is an *open* metadata map — a deployment may carry `site`/`shop`/`line`, or an entirely
+> different set (the source device is **not** here — it travels in the top-level `identity` element,
+> the `tags.thing` replacement). Rather than freezing those into named columns, the default projection lands
 > the entire object in one `tags` column as compact JSON, so a lake query reads any key
 > (`json_extract(tags, '$.site')` in Athena, `tags:site` in Snowflake, `JSON_VALUE` in BigQuery).
 > If you want a specific tag as its own typed column, declare a [user projection](#rows-user-projection).

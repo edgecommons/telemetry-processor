@@ -15,7 +15,11 @@ ARG FEATURES=standalone,streaming,streaming-file-parquet
 RUN apt-get update \
  && apt-get install -y --no-install-recommends openssh-client git \
  && rm -rf /var/lib/apt/lists/*
-# Trust github.com for the SSH fetch (the .cargo/config.toml in the repo sets git-fetch-with-cli).
+# Trust github.com for the SSH fetch. The local-dev `.cargo/config.toml` (which carried the
+# git-fetch-with-cli setting AND the sibling `[patch]`) is gitignored + dockerignored, so the
+# in-container build resolves the pinned ggcommons git rev — force the git CLI transport here so it
+# uses the forwarded SSH agent (libgit2 cannot).
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 WORKDIR /src
 COPY . .

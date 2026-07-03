@@ -1,5 +1,0 @@
-# Fetch git dependencies with the git CLI so the private `edgecommons/ggcommons` dependency
-# authenticates with your SSH key (local) or a deploy key / token-backed credential helper (CI),
-# instead of libgit2's built-in transport.
-[net]
-git-fetch-with-cli = true

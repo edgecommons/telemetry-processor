@@ -9,7 +9,7 @@ data:
   config.json: |
     {
       "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
-      "metricEmission": { "target": "log", "namespace": "ggcommons" },
+      "metricEmission": { "target": "messaging", "namespace": "ggcommons" },
       "messaging": { "local": { "host": "mqtt-broker", "port": 1883, "clientId": "telemetry-processor" } },
       "streaming": {
         "streams": [
@@ -33,7 +33,7 @@ data:
         "instances": [
           {
             "id": "archive-good",
-            "subscribe": [ "southbound/factory-1/+/+/+" ],
+            "subscribe": [ "ecv1/+/+/+/data/#" ],
             "pipeline": [
               { "filter": { "quality": "GOOD" } },
               { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }

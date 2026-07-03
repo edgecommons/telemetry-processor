@@ -12,7 +12,7 @@
 # GGCOMMONS_TARGET to a Linux triple you have a toolchain for. The `greengrass` feature is Linux-only.
 set -euo pipefail
 
-COMPONENT_NAME="com.mbreissi.greengrass.TelemetryProcessor"
+COMPONENT_NAME="com.mbreissi.telemetry-processor"
 COMPONENT_VERSION="1.0.0"
 BIN_NAME="telemetry-processor"
 

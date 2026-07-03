@@ -19,12 +19,16 @@
 mod app;
 mod config;
 mod json_path;
+mod observe;
 mod proc;
 
 use ggcommons::prelude::*;
 
-/// The component's full name (matches `recipe.yaml` / `gdk-config.json`).
-const COMPONENT_NAME: &str = "com.mbreissi.greengrass.TelemetryProcessor";
+/// The component's full name (matches `recipe.yaml` / `gdk-config.json`). Its sanitized UNS
+/// component token is the segment after the last `.` — `telemetry-processor` (D-U18) — so the
+/// processor appears on the bus as `ecv1/{device}/telemetry-processor/{instance}/{class}[/channel]`,
+/// matching the repo/registry/console name (the `uns-bridge` naming precedent: `com.mbreissi.uns-bridge`).
+const COMPONENT_NAME: &str = "com.mbreissi.telemetry-processor";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -28,6 +28,15 @@ pub struct ProcMsg {
     pub recv_ms: u64,
 }
 
+/// An out-of-band control message to a route worker (delivered on a side channel, distinct from the
+/// data channel), driven by the processor's custom command verbs.
+pub enum Control {
+    /// Force-close all of this route's open **time-windowed** aggregates now, dispatch the emitted
+    /// messages, and reply with the count emitted (the `flush` command verb). Count windows keep
+    /// their count-driven semantics and are not force-closed.
+    Flush(tokio::sync::oneshot::Sender<u64>),
+}
+
 /// Stage output — usually 0 or 1 messages; an aggregate flush emits several (spills to the heap).
 pub type Out = SmallVec<[ProcMsg; 1]>;
 
@@ -159,6 +168,34 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].msg.body["agg"]["count"], json!(2));
         assert_eq!(out[0].msg.body["agg"]["avg"], json!(25.0));
+    }
+
+    #[test]
+    fn flush_via_max_tick_closes_open_time_window() {
+        // The `flush` command verb force-closes open TIME windows by running a `u64::MAX` tick
+        // (every window's `window_end <= u64::MAX`), even before the window's own deadline.
+        let stages = vec![StageConfig::Aggregate(AggregateSpec {
+            window: "10s".into(),
+            by: None,
+            fns: vec!["count".into()],
+            value: None,
+        })];
+        let mut p = Pipeline::build(
+            &stages,
+            "body.signal.id",
+            ScriptEngineKind::Rhai,
+            &engine(),
+            &script::ScriptLoader::default(),
+            &Arc::new(script::ScriptContext::default()),
+        )
+        .unwrap();
+        // A message lands in the [0,10s) window; a normal tick well before the end flushes nothing.
+        p.run(one("a", 1.0, "GOOD", 100), None);
+        assert!(p.run(SmallVec::new(), Some(200)).is_empty(), "not yet due");
+        // A `u64::MAX` tick (what `flush` sends) force-closes it now.
+        let out = p.run(SmallVec::new(), Some(u64::MAX));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].msg.body["agg"]["count"], json!(1));
     }
 
     #[test]

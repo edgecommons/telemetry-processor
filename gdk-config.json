@@ -1,6 +1,6 @@
 {
   "component": {
-    "com.mbreissi.greengrass.TelemetryProcessor": {
+    "com.mbreissi.telemetry-processor": {
       "author": "Marc Breissinger",
       "version": "NEXT_PATCH",
       "build": {

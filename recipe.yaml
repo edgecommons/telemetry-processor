@@ -1,6 +1,6 @@
 ---
 RecipeFormatVersion: "2020-01-25"
-ComponentName: "com.mbreissi.greengrass.TelemetryProcessor"
+ComponentName: "com.mbreissi.telemetry-processor"
 ComponentVersion: "1.0.0"
 ComponentDescription: "Reference Rust processing component: subscribes to local telemetry topics, runs a per-route filter/sample/aggregate/project/Rhai pipeline, and forwards to local / northbound MQTT / a durable stream (Kinesis / Kafka / rolling Parquet-AVRO files)."
 ComponentPublisher: "Marc Breissinger"
@@ -18,16 +18,14 @@ ComponentConfiguration:
         rust_format: "{timestamp} [{level}] {target} - {message}"
       heartbeat:
         intervalSecs: 5
-        targets:
-          - type: "metric"
         measures:
           cpu: true
           memory: true
+      # Emit the processor's `pipeline` metric on the UNS `metric` class (the console reads
+      # `ecv1/+/+/+/metric/#`). Switch to `log` + a `targetConfig.logFileName` for a local file.
       metricEmission:
-        target: "log"
+        target: "messaging"
         namespace: "ggcommons"
-        targetConfig:
-          logFileName: "/greengrass/v2/work/{ComponentFullName}/metric.log"
       # Durable streams the routes forward to. The `archive` stream lands rolling Parquet files for
       # later bulk upload; `hot` exports aggregates to Kinesis. Inert unless the matching sink
       # feature is built in (streaming-file-parquet / streaming-kinesis).
@@ -80,29 +78,32 @@ ComponentConfiguration:
             key: "body.signal.id"
         # Each instances[] entry is one route.
         instances:
-          # Route 1: downsample + window-aggregate GOOD process telemetry → durable Parquet archive.
+          # Route 1: window-aggregate GOOD process telemetry from the fleet's adapters (the UNS
+          # `data` class) → durable Parquet archive. The archive preserves each reading's SOURCE
+          # identity (no restamp on stream targets), so provenance survives into the files.
           - id: "archive-good"
             subscribe:
-              - "southbound/{site}/+/+/+"
+              - "ecv1/+/+/+/data/#"
             pipeline:
               - filter: { quality: "GOOD" }
               - aggregate: { window: "10s", by: "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] }
             target: "stream:archive"
             publish:
               partitionKey: "body.signal.id"
-          # Route 2: forward alarm-flagged updates northbound to IoT Core (low rate, control plane).
+          # Route 2: forward alarm-flagged (non-GOOD) readings northbound to IoT Core as the UNS
+          # `evt` class (events), low rate / control plane.
           - id: "alarms-northbound"
             subscribe:
-              - "southbound/{site}/+/+/alarms/#"
+              - "ecv1/+/+/+/data/#"
             pipeline:
               - filter: { field: "body.samples[].quality", op: "ne", value: "GOOD" }
             target: "northbound"
             publish:
-              topic: "telemetry/{ThingName}/alarms"
+              topic: "ecv1/{ThingName}/telemetry-processor/main/evt/alarms"
               qos: "atLeastOnce"
     accessControl:
       aws.greengrass.ipc.pubsub:
-        "com.mbreissi.greengrass.TelemetryProcessor:pubsub:1":
+        "com.mbreissi.telemetry-processor:pubsub:1":
           policyDescription: Allows publish/subscribe on all local topics.
           operations:
             - "aws.greengrass#PublishToTopic"
@@ -110,7 +111,7 @@ ComponentConfiguration:
           resources:
             - "*"
       aws.greengrass.ipc.mqttproxy:
-        "com.mbreissi.greengrass.TelemetryProcessor:iotcore:1":
+        "com.mbreissi.telemetry-processor:iotcore:1":
           policyDescription: Allows publish/subscribe to IoT Core (northbound target).
           operations:
             - "aws.greengrass#PublishToIoTCore"

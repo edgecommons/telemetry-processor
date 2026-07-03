@@ -4,9 +4,9 @@
 //! message). The same [`RhaiEval`] backs the Rhai `filter` option (evaluating to a boolean). The
 //! engine is shared across all routes; each stage compiles its source to an `AST` once at build.
 //!
-//! Scope exposed to a script: the message view (`topic`, the `header` / `body` / `tags` maps,
-//! `samples` array, and the convenience bindings `value` / `quality` — the first sample's), plus the
-//! **runtime context**
+//! Scope exposed to a script: the message view (`topic`, the `header` / `body` / `tags` /
+//! `identity` maps, `samples` array, and the convenience bindings `value` / `quality` — the first
+//! sample's), plus the **runtime context**
 //! (`thingName`, `componentName`, `componentFullName`, `routeId`, `recvMs`) so a generic script can
 //! branch on which component/route/thing it runs in. A `filter` script returns a boolean; a `script`
 //! stage returns the new body map (or `()` to drop). Array-valued fields arrive as Rhai arrays, so a
@@ -151,6 +151,10 @@ impl RhaiEval {
         if let Ok(tags) = serde_json::to_value(&m.msg.tags) {
             scope.push_dynamic("tags", to_dyn(&tags));
         }
+        // The source publisher's UNS identity (the `tags.thing` replacement): `identity.device`,
+        // `identity.component`, `identity.instance`, `identity.path`, `identity.hier`. `()` when the
+        // inbound message carries no identity.
+        scope.push_dynamic("identity", to_dyn(&crate::json_path::identity_view(&m.msg)));
         let samples = m.msg.body.get("samples").cloned().unwrap_or(Value::Array(vec![]));
         scope.push_dynamic("samples", to_dyn(&samples));
         // Convenience bindings: the first sample's value + quality.
@@ -318,6 +322,10 @@ mod lua {
                     let _ = g.set("tags", v);
                 }
             }
+            // The source publisher's UNS identity (the `tags.thing` replacement).
+            if let Ok(v) = self.lua.to_value(&crate::json_path::identity_view(&m.msg)) {
+                let _ = g.set("identity", v);
+            }
             let samples = m.msg.body.get("samples").cloned().unwrap_or(Value::Array(vec![]));
             if let Ok(v) = self.lua.to_value(&samples) {
                 let _ = g.set("samples", v);
@@ -375,7 +383,15 @@ mod tests {
     use serde_json::json;
 
     fn pm(body: Value) -> ProcMsg {
-        let m = MessageBuilder::new("X", "1.0").thing_name("thing-1").payload(body).build();
+        use ggcommons::messaging::message::{HierEntry, MessageIdentity};
+        // Source identity: device `thing-1` (the `tags.thing` replacement, exposed as `identity`).
+        let identity = MessageIdentity::new(
+            vec![HierEntry { level: "device".into(), value: "thing-1".into() }],
+            "opcua-adapter",
+            Some("kep1".into()),
+        )
+        .unwrap();
+        let m = MessageBuilder::new("X", "1.0").identity(identity).payload(body).build();
         ProcMsg { topic: "t".into(), msg: m, recv_ms: now_ms() }
     }
 
@@ -403,9 +419,12 @@ mod tests {
     }
 
     #[test]
-    fn script_can_read_topic_and_tags() {
+    fn script_can_read_topic_and_identity() {
+        // A script branches on the source publisher's UNS identity (the `tags.thing` replacement).
         let mut s = ScriptStage::build(
-            &ScriptSource::Inline(r#"#{ "thing": tags.thing, "q": quality }"#.into()),
+            &ScriptSource::Inline(
+                r#"#{ "device": identity.device, "src": identity.component, "q": quality }"#.into(),
+            ),
             ScriptEngineKind::Rhai,
             &engine(),
             &ScriptLoader::default(),
@@ -413,7 +432,8 @@ mod tests {
         )
         .unwrap();
         let out = s.process(pm(json!({ "samples": [{ "value": 1, "quality": "GOOD" }] })));
-        assert_eq!(out[0].msg.body["thing"], json!("thing-1"));
+        assert_eq!(out[0].msg.body["device"], json!("thing-1"));
+        assert_eq!(out[0].msg.body["src"], json!("opcua-adapter"));
         assert_eq!(out[0].msg.body["q"], json!("GOOD"));
     }
 

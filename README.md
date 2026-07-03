@@ -4,9 +4,9 @@ The **reference Rust processing component** for the ggcommons / edgecommons ecos
 high-throughput northbound seam between southbound protocol adapters (which publish high-rate
 `SouthboundSignalUpdate` telemetry on the local bus) and the cloud.
 
-It **subscribes** to configured local topics (MQTT wildcards + `{ThingName}`/`{site}` template
-substitution), runs a declarative per-route **pipeline** — `filter` / `sample` / `aggregate` /
-`project` / `script` (Rhai) — and **forwards** the result to a configured target:
+It **subscribes** to configured local topics (MQTT wildcards + `{ThingName}` template substitution),
+runs a declarative per-route **pipeline** — `filter` / `sample` / `aggregate` / `project` / `script`
+(Rhai / Lua) — and **forwards** the result to a configured target:
 
 - `local` — republish on the local bus,
 - `northbound` — publish to IoT Core / a northbound MQTT broker,
@@ -17,10 +17,35 @@ Each **route is one `component.instances[]` entry** (`{ id, subscribe[], pipelin
 publish }`); cross-route defaults live in `component.global`. See `docs/TELEMETRY_PROCESSOR.md` in the
 ggcommons monorepo for the full design.
 
+## Unified Namespace (UNS)
+
+The processor speaks the ggcommons **Unified Namespace** — all topics are
+`ecv1/{device}/{component}/{instance}/{class}[/channel]` and it appears on the bus as
+`ecv1/{device}/telemetry-processor/main/…` (its component token is the short name after the last
+`.`). What this means for the processor:
+
+- **Ingest** the fleet's southbound telemetry (the `data` class) with a single wildcard:
+  `ecv1/+/+/+/data/#` (or scope it, e.g. `ecv1/+/opcua-adapter/+/data/#`).
+- **Output** processed telemetry on the `data` class and events on `evt`; `state`/`metric`/`cfg`/`log`
+  are **reserved** (library-owned) — a direct publish to them is rejected, so route outputs must
+  target `data` / `evt` / `app`.
+- **Source identity** travels in the message's top-level `identity` element (`hier`/`path`/`component`/
+  `instance`), **not** in `tags.thing` (removed). Pipelines key/filter on it via the `identity.` JSON
+  path (`identity.device`, `identity.component`, `identity.instance`) and scripts read the `identity`
+  binding.
+- **Self-echo safe:** a `local` republish onto the consumed `data` class is loop-guarded — the
+  dispatcher restamps `local` output with the processor's own identity and the fan-out drops any
+  re-consumed message carrying the processor's own device+component.
+- **First-class console citizen for free** (from the library): the automatic `state` keepalive, the
+  `cfg` effective-config publisher, and the `cmd` inbox with built-in `ping` / `reload-config` /
+  `get-configuration`. The processor adds custom verbs `flush` / `get-stats` / `pause` / `resume`
+  and emits its own `evt` health events + a `metric/pipeline` throughput metric. See
+  `docs/reference/messaging-interface.md`.
+
 ## Run locally (HOST platform, MQTT transport)
 
 ```bash
-docker compose -f ../ggcommons-monorepo/test-infra/compose.yaml up -d   # local EMQX broker
+docker compose -f ../ggcommons/test-infra/compose.yaml up -d   # local EMQX broker
 
 cargo run -- \
   --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
@@ -31,9 +56,11 @@ cargo run -- \
 The default build is **batteries-included** — standalone + streaming + Kinesis + the Parquet/AVRO
 file sinks + CloudWatch are all on by default, so the command above needs no `--features`.
 
-Publish synthetic `SouthboundSignalUpdate` messages to `southbound/factory-1/<comp>/<inst>/<signal>` and
-watch: downsampled messages on `processed/my-thing/downsampled` (MQTTX), and rolling Parquet files
-under `./out/archive/dt=…/`.
+Publish synthetic `SouthboundSignalUpdate` messages (envelopes with a top-level `identity`) to an
+adapter's UNS data topic, e.g. `ecv1/gw-01/opcua-adapter/kep1/data/<signal>`, and watch: downsampled
+messages on `ecv1/my-thing/telemetry-processor/main/data/downsampled` (MQTTX), and rolling Parquet
+files under `./out/archive/dt=…/`. Subscribe `ecv1/+/+/+/state` to see the processor's automatic
+keepalive, and address `ecv1/my-thing/telemetry-processor/main/cmd/get-stats` to read its counters.
 
 ## Build the device artifact (Greengrass, Linux)
 

@@ -59,7 +59,7 @@ Each entry is one independent route: subscribe → pipeline → target.
 | `target` | string | `global.defaults.target` | `local` \| `northbound` \| `stream:<name>`. Required if no global default. |
 | `publish` | object | — | Output topic / partition key / QoS (below). |
 | `key` | string | `global.defaults.key` ▸ `body.signal.id` | Route default key path for `sample`/`aggregate`/stream partitioning. |
-| `maxQueue` | number | `256` | Per-route internal queue depth. **Drop-on-full**: when the route's worker can't keep up, new messages are dropped (logged at debug). |
+| `maxQueue` | number | `256` | Per-route internal queue depth. **Drop-on-full**: when the route's worker can't keep up, new messages are dropped (logged at debug, tallied in `get-stats` `dropped`, and surfaced as a rate-limited `evt/queue-overflow`). |
 | `scriptEngine` | enum | `global.defaults.scriptEngine` ▸ `rhai` | Engine for this route's `filter`/`script` stages (`rhai` \| `lua`). The script *dialect* follows the engine. |
 
 > Numeric fields accept an integer **or** an integer-valued float (Greengrass delivers config numbers
@@ -155,6 +155,7 @@ the per-message **message view** plus the constant **runtime context**:
 | `header` | map | the envelope header — `name`, `version`, `timestamp`, `uuid`, `correlation_id`, `reply_to` |
 | `body` | map | the message body |
 | `tags` | map | the envelope `tags{}` (message metadata — *not* the signal) |
+| `identity` | map | the **source publisher's** UNS identity — `identity.device` / `identity.component` / `identity.instance` / `identity.path` (the `tags.thing` replacement); `()` when the message carries none |
 | `samples` | array | `body.samples` (or `[]`) |
 | `value` | any | the first sample's `value` (scalar **or array**) |
 | `quality` | string | the first sample's `quality` |
@@ -166,8 +167,11 @@ the per-message **message view** plus the constant **runtime context**:
 
 <a id="key-paths"></a>
 > **Key paths** are dotted paths over the message: roots `body.` (the default when no known root
-> prefix is present), `tags.`, `header.`; a `[]` suffix on a segment spreads across an array. Examples:
-> `body.signal.id`, `body.samples[].quality`, `tags.site`.
+> prefix is present), `identity.`, `tags.`, `header.`; a `[]` suffix on a segment spreads across an
+> array. Examples: `body.signal.id`, `body.samples[].quality`, `identity.device`, `tags.site`.
+> The `identity.` root (`identity.device` / `identity.component` / `identity.instance` /
+> `identity.path`) exposes the **source publisher's** UNS identity — the `tags.thing` replacement — so
+> a route can key/filter on which device or adapter produced a reading.
 
 ## Template variables
 
@@ -261,22 +265,26 @@ The `stream:<name>` target needs the `streaming` feature; each sink needs its ow
 `streaming` alone is buffer-only (records accumulate but never export). A `stream:` route built
 without `streaming` logs a warning and drops its output.
 
+## UNS observability & control
+
+The processor is a first-class UNS/console citizen. Beyond the library-automatic `state` keepalive,
+`cfg` publisher, and `cmd` inbox, it exposes (see
+[messaging-interface.md](messaging-interface.md#command-verbs)):
+
+- **`metric/pipeline`** — with `metricEmission.target: "messaging"`, a throughput metric
+  (`messagesIn`/`messagesOut`/`messagesDropped`/`streamAppends`/`publishFailures`) every 30 s on the
+  UNS `metric` class. (System CPU/memory come from the heartbeat's `sys` metric.)
+- **`evt/*`** — rate-limited `queue-overflow` / `route-error` / `stream-unavailable` health events.
+- **Command verbs** — built-in `ping` / `reload-config` / `get-configuration`, plus the processor's
+  custom `get-stats` / `flush` / `pause` / `resume`.
+
 ## Lifecycle
 
-> Routes are read **once at startup**. There is **no live route hot-reload** yet — changing
-> `component.instances[]` requires a component restart.
+> Routes are read **once at startup**. Changing the route topology (`component.instances[]`) requires
+> a component restart. The built-in `reload-config` verb hot-swaps the config snapshot, but the routes
+> are wired at startup, so a **dynamic route rebuild** (`reload-routes`) is a documented follow-up. Use
+> `pause` / `resume` / `flush` to control the already-wired routes at runtime.
 
-> The component handles **SIGTERM** (and the platform shutdown signal): it unsubscribes every filter,
-> closes the route channels, and waits for each worker to drain — including a **final aggregate
-> flush**, so in-flight windows are emitted before exit.
-
-## Accepted but not implemented
-
-The current build parses but does not act on these (documented to prevent misplaced trust):
-
-- **No route hot-reload.** Routes are read once at startup; changing `component.instances[]` takes
-  effect only on a restart (a Greengrass deployment or a pod rollout). The ggcommons config source
-  watches the file/ConfigMap, but the processor does not register a change listener, so it does not
-  re-subscribe or rebuild route workers on a live change.
-- **No `processor_health` metric.** The processor does not emit a per-route health metric. Heartbeat
-  and `metricEmission` are the standard ggcommons sections only.
+> The component handles **SIGTERM** (and the platform shutdown signal): it aborts the metric emitter,
+> unsubscribes every filter, closes the route channels, and waits for each worker to drain — including
+> a **final aggregate flush**, so in-flight windows are emitted before exit.

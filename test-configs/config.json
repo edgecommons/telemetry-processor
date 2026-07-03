@@ -2,10 +2,9 @@
   "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
   "heartbeat": {
     "intervalSecs": 10,
-    "measures": { "cpu": true, "memory": true },
-    "targets": [ { "type": "metric" } ]
+    "measures": { "cpu": true, "memory": true }
   },
-  "metricEmission": { "target": "log", "namespace": "ggcommons" },
+  "metricEmission": { "target": "messaging", "namespace": "ggcommons" },
   "streaming": {
     "streams": [
       {
@@ -34,17 +33,17 @@
     "instances": [
       {
         "id": "downsample-local",
-        "subscribe": [ "southbound/factory-1/+/+/+" ],
+        "subscribe": [ "ecv1/+/+/+/data/#" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
           { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
         ],
         "target": "local",
-        "publish": { "topic": "processed/{ThingName}/downsampled" }
+        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" }
       },
       {
         "id": "archive",
-        "subscribe": [ "southbound/factory-1/+/+/+" ],
+        "subscribe": [ "ecv1/+/+/+/data/#" ],
         "pipeline": [
           { "filter": { "quality": "GOOD" } },
           { "aggregate": { "window": "5s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }

@@ -7,8 +7,8 @@ shapes make sense as a whole. If you only need a specific key or a step-by-step 
 ## What the component is for
 
 Southbound protocol adapters (OPC UA, Modbus, …) publish every signal update to the **local bus** as a
-`SouthboundSignalUpdate` envelope on config-driven topics
-(`southbound/{site}/{ComponentName}/{InstanceId}/{signalId}` — see the
+`SouthboundSignalUpdate` envelope on the Unified-Namespace **`data`** class
+(`ecv1/{device}/{component}/{instance}/data/{signalPath}` — see the
 [southbound contract](#what-it-consumes-and-emits)). That telemetry is high-rate and edge-local, and
 a raw firehose to the cloud is the wrong shape: integrators want to **filter** (drop BAD quality or
 uninteresting signals), **downsample** (1 kHz → 1 Hz), and **aggregate** (per-signal windowed
@@ -21,13 +21,15 @@ min/max/avg) *before* the data leaves the device — and then route each result 
 > note](reference/messaging-interface.md#envelope-tags-vs-the-signal).
 
 The Telemetry Processor is that stage: the high-throughput northbound seam between the adapters and
-the cloud. It is the reference **Rust processing component**
-(`com.mbreissi.greengrass.TelemetryProcessor`), built on the `ggcommons` Rust library. Like the
-adapters, it is deliberately thin — configuration, the messaging transport, the durable streaming
-buffer, metrics, and lifecycle all come from `ggcommons`, so the component contains only the
-processing engine and the target dispatch. It subscribes to local telemetry topics, runs a
-declarative per-route pipeline, and forwards the result onward. It is **one-way** transform-and-
-forward; the request/reply command surface stays with the adapters.
+the cloud. It is the reference **Rust processing component** (`com.mbreissi.telemetry-processor`),
+built on the `ggcommons` Rust library. Like the adapters, it is deliberately thin — configuration, the
+messaging transport, the durable streaming buffer, metrics, and lifecycle all come from `ggcommons`,
+so the component contains only the processing engine and the target dispatch. It subscribes to the
+fleet's `data`-class telemetry, runs a declarative per-route pipeline, and forwards the result onward.
+Its **data path** is one-way transform-and-forward — but it is a full UNS/console citizen: the library
+gives it the automatic `state` keepalive, `cfg` publisher, and a `cmd` inbox, and it adds its own
+control verbs (`get-stats` / `flush` / `pause` / `resume`), `evt` health events, and a `metric/pipeline`
+throughput metric.
 
 ## One route, one worker
 
@@ -53,7 +55,11 @@ subscription a handler that fans each arriving message out to *every* route chan
 it. Multiple routes can therefore share a topic — one does a 1 Hz downsample to the bus while another
 windows the same stream into a durable archive — without colliding. Filters are MQTT filters: `+`/`#`
 wildcards are allowed, and each is run through `ggcommons`' template resolver so `{ThingName}`,
-`{ComponentName}`, and `{site}` expand against the active config before subscribing.
+`{ComponentName}`, and `tags` keys expand against the active config before subscribing. The fleet
+consumer is the single UNS wildcard `ecv1/+/+/+/data/#` (scope it per adapter with
+`ecv1/+/opcua-adapter/+/data/#`). Because the processor also republishes onto the `data` class it
+consumes, a **self-echo guard** (identity restamp on `local` output + a drop of any re-consumed
+own-identity message) keeps a `local` route from looping.
 
 ## Inside a route: the pipeline stages
 
@@ -69,7 +75,7 @@ the later stages' `process`.
 | `sample` | Per-key downsampling: keep one message per `everyMs` time window, or one in every `everyN`. The key path is `by`, falling back to the route key (`body.signal.id`). | yes (per key) |
 | `aggregate` | Tumbling-window reduction. The window is time (`"10s"`, `"500ms"`) or a bare count (`"100"`); state is keyed by `by`/route key; the folded value is `value` (default `body.samples[].value`); reducers are `avg` `max` `min` `sum` `count` `first` `last`. Emits one `ProcessedTelemetry` message per `(key, window)` when the window closes. | yes (per key) |
 | `project` | Reshape the body: `keep` a whitelist of **top-level** body keys (the first segment of each dotted path — so `keep: ["signal.id"]` retains the whole `signal` object), and/or `set` literal fields onto the body. | no |
-| `script` | A Rhai or Lua program (inline or from a file) that returns a new body map, or a "nothing" value to drop the message. Its scope exposes `topic`, `header`, `body`, `tags`, `samples`, and the conveniences `value`/`quality`. See [Scripting](#scripting). | no |
+| `script` | A Rhai or Lua program (inline or from a file) that returns a new body map, or a "nothing" value to drop the message. Its scope exposes `topic`, `header`, `body`, `tags`, `identity` (the source publisher's UNS identity), `samples`, and the conveniences `value`/`quality`. See [Scripting](#scripting). | no |
 
 Rhai is **always compiled in** — there is no feature gate, and the runtime cost is negligible when no
 route uses a script. One engine is shared by every `filter`/`script` stage, bounded to a million
@@ -94,10 +100,12 @@ Scripting appears in **two roles**, both backed by the same scope:
 - a **`script` stage** — a transform that returns the **new body**, or a "nothing" value (`()` in
   Rhai, `nil` in Lua) to **drop** the message.
 
-A script sees the **message view** (`topic`, the `header`/`body`/`tags` maps, `samples`, and the
-first-sample conveniences `value`/`quality`) plus the **runtime context** (`thingName`, `componentName`,
-`componentFullName`, `routeId`, `recvMs`) so a generic, reusable script can branch on which
-component/route/thing it runs in. Scripts are **stateless** — each evaluation sees only the current
+A script sees the **message view** (`topic`, the `header`/`body`/`tags` maps, the source publisher's
+`identity`, `samples`, and the first-sample conveniences `value`/`quality`) plus the **runtime
+context** (`thingName`, `componentName`, `componentFullName`, `routeId`, `recvMs`) so a generic,
+reusable script can branch on which component/route/thing it runs in, or on the source device/adapter
+(`identity.device` / `identity.component` — the `tags.thing` replacement). Scripts are **stateless** —
+each evaluation sees only the current
 message; cross-message state belongs in `sample`/`aggregate`. Array-valued fields arrive as native
 arrays, so a script can iterate/reduce over them like any collection.
 
@@ -112,7 +120,7 @@ arrays, so a script can iterate/reduce over them like any collection.
 ```mermaid
 flowchart LR
     ADP["southbound adapters<br/>OPC UA · Modbus · …"]
-    BUS["local bus<br/>southbound/{site}/…/{signalId}"]
+    BUS["local bus (UNS)<br/>ecv1/{device}/{adapter}/{inst}/data/{signalPath}"]
     PROC["<b>Telemetry Processor</b><br/>one route per instances[] entry"]
     DISP["target dispatch"]
     LOC["<b>local</b><br/>republish on the bus"]
@@ -197,8 +205,9 @@ are emitted before exit, so a graceful stop loses no in-flight aggregate.
 ## What it consumes and emits
 
 The processor **consumes** the cross-language southbound envelope, header `name =
-"SouthboundSignalUpdate"` (§2 of the southbound contract). The envelope is `header` + `tags` (`thing`,
-`appId`, `site`, `shop`, `line`) + `body`, where the body is
+"SouthboundSignalUpdate"` (§7 of the southbound contract). The envelope is `header` + `identity` (the
+source publisher's UNS identity — device/component/instance; the old `tags.thing` is removed) +
+`tags` (`appId`, `site`, `shop`, `line`) + `body`, where the body is
 `{ device:{ adapter, instance, endpoint }, signal:{ id, name, address }, samples:[ { value, quality,
 qualityRaw, sourceTs, serverTs } ] }`. `quality` is normalized to `GOOD`/`BAD`/`UNCERTAIN` with the
 native code preserved in `qualityRaw`; `signal.id` is the stable canonical key the cloud routes on.
@@ -236,7 +245,7 @@ API — the net-new code is only the dispatch glue.
 
 | `target` | What happens | QoS / key |
 |---|---|---|
-| `local` | Republish the processed message on the local bus, on `publish.topic` (resolved at startup) or the source topic. | — |
+| `local` | Republish the processed message on the local bus, on `publish.topic` (resolved at startup) or the source topic. Its `identity` is **restamped** to the processor (loop-safety + provenance). | — |
 | `northbound` | Publish to AWS IoT Core / a northbound MQTT broker. | `publish.qos`: `atLeastOnce` (default) or `atMostOnce` |
 | `stream:<name>` | Append to the named durable `ggcommons` stream, which exports to its configured sink — Kinesis, Kafka, or **file**. | partition key from `publish.partitionKey`, default the route key (`body.signal.id`) |
 

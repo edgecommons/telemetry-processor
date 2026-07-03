@@ -1,36 +1,75 @@
 //! # Processor application — wiring routes to the runtime
 //!
 //! Reads the routes from `component.instances[]` (overlaid with `component.global.defaults`), and
-//! for each route: builds the pipeline, resolves topic templates, opens a bounded channel, and
-//! spawns the route worker. Subscriptions are then established **once per unique topic filter**,
-//! with the handler fanning each message out to every route that subscribed that filter (so
-//! multiple routes can share a topic — ggcommons keys subscriptions by filter). On shutdown it
-//! unsubscribes, closes the channels, and waits for the workers to drain (final aggregate flush).
+//! for each route: builds the pipeline, resolves topic templates, opens a bounded channel + a side
+//! control channel, and spawns the route worker. Subscriptions are then established **once per
+//! unique topic filter**, with the handler applying the UNS **self-echo guard** and fanning each
+//! message out to every route that subscribed that filter (so multiple routes can share a topic —
+//! ggcommons keys subscriptions by filter). On shutdown it aborts the metric emitter, unsubscribes,
+//! closes the channels, and waits for the workers to drain (final aggregate flush).
+//!
+//! ## UNS observability + control (net-new)
+//! Beyond the library-automatic `state` keepalive / `cfg` publisher / `cmd` inbox, the app wires:
+//! - per-route [`RouteStats`] counters, surfaced by the `get-stats` command and emitted as the
+//!   `metric` class (see [`crate::observe`]);
+//! - an [`EvtEmitter`] for the processor's own `evt` health events;
+//! - the custom command verbs `flush` / `get-stats` / `pause` / `resume` (registered on
+//!   `gg.commands()`), which the built-in `ping` / `reload-config` / `get-configuration` complement.
+//!
+//! ## Self-echo guard (loop safety)
+//! Under a fleet `ecv1/+/+/+/data/#` input a `local` republish onto the processor's own `data`
+//! class would be re-consumed → an amplifying loop. The dispatcher restamps `local` output with the
+//! processor's identity (see [`crate::proc::route`]) and this fan-out handler drops any inbound
+//! message whose `identity` device+component equal the processor's own — so a re-consumed copy is
+//! discarded. Cross-device processor chaining still works (a different device does not match).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ggcommons::config::model::Config;
 use ggcommons::config::template::resolve;
+use ggcommons::messaging::message::{Message, MessageIdentity};
 use ggcommons::messaging::MessagingService;
 use ggcommons::prelude::*;
+use ggcommons::uns::reserved_class_of;
 use rhai::Engine;
-use tokio::sync::mpsc;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{GlobalDefaults, RouteConfig, ScriptEngineKind, Target};
+use crate::observe::{spawn_metric_emitter, EvtEmitter, RouteStats};
 use crate::proc::route::{run_worker, Dispatcher};
-use crate::proc::{now_ms, Pipeline, ProcMsg};
+use crate::proc::{now_ms, Control, Pipeline, ProcMsg};
 
 /// Default aggregation/partition key when neither the route nor the global defaults set one.
 const DEFAULT_KEY: &str = "body.signal.id";
 /// Default route channel capacity (also the broker-side subscribe queue depth).
 const DEFAULT_QUEUE: usize = 256;
+/// Depth of a route's out-of-band control channel (the `flush` command verb).
+const CONTROL_QUEUE: usize = 4;
 
-/// One wired route: its resolved subscribe filters and the channel into its worker.
-struct RouteWire {
+/// The routes registered on one subscribe filter: each a `(worker data sender, route counters)`
+/// pair the fan-out handler forwards to.
+type FilterRoutes = Vec<(mpsc::Sender<ProcMsg>, Arc<RouteStats>)>;
+
+/// One fully wired route (produced by [`ProcessorApp::build_route`]).
+struct BuiltRoute {
+    id: String,
     filters: Vec<String>,
     tx: mpsc::Sender<ProcMsg>,
+    control: mpsc::Sender<Control>,
+    stats: Arc<RouteStats>,
+}
+
+/// A command-facing route handle. Deliberately holds **no** data sender, so the app remains the
+/// sole owner of the data channels — dropping [`ProcessorApp::senders`] on shutdown then closes
+/// every worker (the control sender kept here does not gate worker shutdown).
+struct RouteHandle {
+    id: String,
+    control: mpsc::Sender<Control>,
+    stats: Arc<RouteStats>,
 }
 
 /// Per-route-invariant build context: the shared Rhai engine, the script-file loader, the
@@ -51,12 +90,13 @@ struct RouteBuildCtx<'a> {
     default_script_engine: ScriptEngineKind,
 }
 
-/// The running processor: its subscriptions, channel senders, and worker tasks.
+/// The running processor: its subscriptions, channel senders, worker tasks, and metric emitter.
 pub struct ProcessorApp {
     messaging: Arc<dyn MessagingService>,
     subscriptions: Vec<String>,
     senders: Vec<mpsc::Sender<ProcMsg>>,
     workers: Vec<JoinHandle<()>>,
+    metric_task: Option<JoinHandle<()>>,
 }
 
 impl ProcessorApp {
@@ -101,15 +141,22 @@ impl ProcessorApp {
             default_script_engine: defaults.script_engine.unwrap_or_default(),
         };
 
+        // The processor's own UNS identity — the self-echo guard's match, and the restamp source.
+        let own_device = config.identity().device().to_string();
+        let own_component = config.identity().component().to_string();
+        // The `evt` health-event publisher (topics built through gg.uns(), instance `main`).
+        let evt = EvtEmitter::new(messaging.clone(), gg.uns(), config.clone());
+
         let mut app = Self {
             messaging: messaging.clone(),
             subscriptions: Vec::new(),
             senders: Vec::new(),
             workers: Vec::new(),
+            metric_task: None,
         };
 
-        // 1. Build each route's worker + channel, collecting its resolved filters.
-        let mut wires: Vec<RouteWire> = Vec::new();
+        // 1. Build each route's worker + channels, collecting the wired routes.
+        let mut built: Vec<BuiltRoute> = Vec::new();
         let ids = config.instance_ids();
         if ids.is_empty() {
             tracing::warn!("no routes configured (component.instances[] is empty)");
@@ -123,38 +170,72 @@ impl ProcessorApp {
                     continue;
                 }
             };
-            match app.build_route(gg, &config, &ctx, route) {
-                Ok(wire) => wires.push(wire),
+            match app.build_route(gg, &config, &ctx, &evt, route) {
+                Ok(wire) => built.push(wire),
                 Err(e) => tracing::error!(error = %e, "failed to build route; skipping"),
             }
         }
         anyhow::ensure!(!app.workers.is_empty(), "no routes started; nothing to do");
 
+        // The app owns the data senders (dropped on shutdown to close the workers).
+        app.senders = built.iter().map(|b| b.tx.clone()).collect();
+
         // 2. Subscribe each UNIQUE filter once, fanning each message out to every route that wants
         //    it (ggcommons keys subscriptions by filter, so a shared filter must be one subscription).
-        let mut by_filter: BTreeMap<String, Vec<mpsc::Sender<ProcMsg>>> = BTreeMap::new();
-        for wire in &wires {
-            for f in &wire.filters {
-                by_filter.entry(f.clone()).or_default().push(wire.tx.clone());
+        let mut by_filter: BTreeMap<String, FilterRoutes> = BTreeMap::new();
+        for b in &built {
+            for f in &b.filters {
+                by_filter.entry(f.clone()).or_default().push((b.tx.clone(), b.stats.clone()));
             }
         }
-        for (filter, senders) in by_filter {
-            self_subscribe(&app.messaging, &filter, senders).await?;
+        for (filter, routes) in by_filter {
+            self_subscribe(
+                &app.messaging,
+                &filter,
+                routes,
+                own_device.clone(),
+                own_component.clone(),
+                evt.clone(),
+            )
+            .await?;
             app.subscriptions.push(filter);
         }
 
-        tracing::info!(routes = app.workers.len(), filters = app.subscriptions.len(), "telemetry-processor started");
+        // 3. The periodic `metric`-class emitter (summed per-route counter deltas via gg.metrics()).
+        let stats_vec: Vec<Arc<RouteStats>> = built.iter().map(|b| b.stats.clone()).collect();
+        app.metric_task = Some(spawn_metric_emitter(gg.metrics(), config.clone(), stats_vec));
+
+        // 4. Register the custom command verbs (flush / get-stats / pause / resume). The built-in
+        //    ping / reload-config / get-configuration are already wired by the library.
+        let handles: Arc<Vec<RouteHandle>> = Arc::new(
+            built
+                .iter()
+                .map(|b| RouteHandle {
+                    id: b.id.clone(),
+                    control: b.control.clone(),
+                    stats: b.stats.clone(),
+                })
+                .collect(),
+        );
+        register_commands(gg, handles);
+
+        tracing::info!(
+            routes = app.workers.len(),
+            filters = app.subscriptions.len(),
+            "telemetry-processor started"
+        );
         Ok(app)
     }
 
-    /// Build one route's worker + channel; return its resolved filters (no subscription yet).
+    /// Build one route's worker + channels; return the wired route (no subscription yet).
     fn build_route(
         &mut self,
         gg: &GgCommons,
         config: &Config,
         ctx: &RouteBuildCtx<'_>,
+        evt: &Arc<EvtEmitter>,
         route: RouteConfig,
-    ) -> anyhow::Result<RouteWire> {
+    ) -> anyhow::Result<BuiltRoute> {
         let _ = gg; // used only under the `streaming` feature (stream targets)
         let route_key = route.key.clone().unwrap_or_else(|| ctx.default_key.to_string());
         let target_str = route
@@ -168,8 +249,32 @@ impl ProcessorApp {
 
         let mut publish = route.publish.clone().unwrap_or_default();
         if let Some(t) = &publish.topic {
-            publish.topic = Some(resolve(config, t));
+            let resolved = resolve(config, t);
+            // Defensive: a publish topic that resolves to a reserved UNS class (state|metric|cfg|log)
+            // is rejected at publish time by the reserved-class guard (silent drop). Warn at startup.
+            if let Some(cls) = reserved_class_of(&resolved, config.effective_include_root()) {
+                tracing::warn!(
+                    route = %route.id,
+                    topic = %resolved,
+                    class = cls.token(),
+                    "publish.topic targets a RESERVED UNS class; the reserved-class guard will drop \
+                     these publishes — target a data/evt/app class instead"
+                );
+            }
+            publish.topic = Some(resolved);
         }
+
+        // Restamp policy: `local` output carries the processor's own identity (instance = route id)
+        // — loop-safety for the self-echo guard + correct provenance for the processor's product.
+        let restamp: Option<MessageIdentity> = match &target {
+            Target::Local => Some(
+                config
+                    .identity()
+                    .with_instance(&route.id)
+                    .map_err(|e| anyhow::anyhow!("route '{}' identity restamp: {e}", route.id))?,
+            ),
+            _ => None,
+        };
 
         #[cfg(feature = "streaming")]
         let stream = match &target {
@@ -196,32 +301,42 @@ impl ProcessorApp {
             ctx.loader,
             &script_ctx,
         )?;
+
+        let stats = RouteStats::new(&route.id);
         let dispatcher = Dispatcher::new(
             self.messaging.clone(),
             target,
             &publish,
             &route_key,
+            route.id.clone(),
+            stats.clone(),
+            evt.clone(),
+            restamp,
             #[cfg(feature = "streaming")]
             stream,
         );
 
         let cap = route.max_queue.map(|n| n as usize).unwrap_or(DEFAULT_QUEUE).max(1);
         let (tx, rx) = mpsc::channel::<ProcMsg>(cap);
-        self.workers.push(tokio::spawn(run_worker(pipeline, rx, dispatcher)));
-        self.senders.push(tx.clone());
+        let (control_tx, control_rx) = mpsc::channel::<Control>(CONTROL_QUEUE);
+        self.workers.push(tokio::spawn(run_worker(pipeline, rx, control_rx, dispatcher)));
 
         let filters: Vec<String> = route.subscribe.iter().map(|f| resolve(config, f)).collect();
         for f in &filters {
             tracing::info!(route = %route.id, filter = %f, "route wired");
         }
-        Ok(RouteWire { filters, tx })
+        Ok(BuiltRoute { id: route.id, filters, tx, control: control_tx, stats })
     }
 
-    /// Run until a shutdown signal, then unsubscribe, close channels, and drain the workers.
-    pub async fn run(self, gg: &GgCommons) -> anyhow::Result<()> {
+    /// Run until a shutdown signal, then abort the metric emitter, unsubscribe, close channels, and
+    /// drain the workers.
+    pub async fn run(mut self, gg: &GgCommons) -> anyhow::Result<()> {
         gg.shutdown_signal().await;
         tracing::info!("shutdown signal received; stopping routes");
 
+        if let Some(task) = self.metric_task.take() {
+            task.abort();
+        }
         for filt in &self.subscriptions {
             if let Err(e) = self.messaging.unsubscribe(filt).await {
                 tracing::warn!(error = %e, filter = %filt, "unsubscribe failed");
@@ -236,26 +351,60 @@ impl ProcessorApp {
     }
 }
 
-/// Subscribe one filter with a fan-out handler that forwards each message to every route channel
-/// that registered for it. Concurrency is 1 so the ordered consumers get messages in order.
+/// Subscribe one filter with a fan-out handler: apply the UNS self-echo guard, then forward each
+/// message to every route channel that registered for it (tallying `messages_in`/`messages_dropped`
+/// and the queue-depth gauge, honoring the per-route `paused` flag, and emitting a rate-limited
+/// `evt/queue-overflow` on backpressure drops). Concurrency is 1 so ordered consumers get messages
+/// in order.
 async fn self_subscribe(
     messaging: &Arc<dyn MessagingService>,
     filter: &str,
-    senders: Vec<mpsc::Sender<ProcMsg>>,
+    routes: FilterRoutes,
+    own_device: String,
+    own_component: String,
+    evt: Arc<EvtEmitter>,
 ) -> anyhow::Result<()> {
     let filter_owned = filter.to_string();
     messaging
         .subscribe(
             filter,
             message_handler(move |topic, msg| {
-                let senders = senders.clone();
+                let routes = routes.clone();
                 let filter_owned = filter_owned.clone();
+                let own_device = own_device.clone();
+                let own_component = own_component.clone();
+                let evt = evt.clone();
                 async move {
-                    let pm = ProcMsg { topic, msg, recv_ms: now_ms() };
-                    for s in &senders {
-                        if s.try_send(pm.clone()).is_err() {
-                            tracing::debug!(filter = %filter_owned, "route queue full; dropping message");
+                    // Self-echo guard: drop our own re-consumed output (identity device+component
+                    // match ours) so a `local` republish onto the consumed `data` class can't loop.
+                    if let Some(id) = &msg.identity {
+                        if id.device() == own_device && id.component() == own_component {
+                            tracing::trace!(topic = %topic, "self-echo dropped (own identity)");
+                            return;
                         }
+                    }
+                    let pm = ProcMsg { topic, msg, recv_ms: now_ms() };
+                    for (tx, stats) in &routes {
+                        if stats.is_paused() {
+                            continue;
+                        }
+                        match tx.try_send(pm.clone()) {
+                            Ok(()) => {
+                                stats.messages_in.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    filter = %filter_owned,
+                                    route = %stats.id,
+                                    "route queue full; dropping message"
+                                );
+                                evt.queue_overflow(&stats.id).await;
+                            }
+                        }
+                        // Update the queue-depth gauge (max_capacity - remaining permits).
+                        let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+                        stats.queue_depth.store(depth, Ordering::Relaxed);
                     }
                 }
             }),
@@ -264,4 +413,104 @@ async fn self_subscribe(
         )
         .await?;
     Ok(())
+}
+
+/// Register the processor's custom command verbs on the library command inbox (a no-op when no
+/// messaging transport wired an inbox). The built-in `ping`/`reload-config`/`get-configuration`
+/// verbs are registered by the library and complement these.
+fn register_commands(gg: &GgCommons, handles: Arc<Vec<RouteHandle>>) {
+    let Some(cmds) = gg.commands() else {
+        tracing::debug!("no command inbox (no messaging transport); custom verbs not registered");
+        return;
+    };
+
+    // get-stats — per-route counters snapshot.
+    {
+        let handles = handles.clone();
+        try_register(&cmds, "get-stats", command_handler(move |_req| {
+            let handles = handles.clone();
+            async move { Ok(Some(stats_json(&handles))) }
+        }));
+    }
+
+    // flush — force-close every route's open time windows now; report the total emitted.
+    {
+        let handles = handles.clone();
+        try_register(&cmds, "flush", command_handler(move |_req| {
+            let handles = handles.clone();
+            async move {
+                let mut flushed = 0u64;
+                for route in handles.iter() {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if route.control.send(Control::Flush(reply_tx)).await.is_ok() {
+                        if let Ok(n) = reply_rx.await {
+                            flushed += n;
+                        }
+                    }
+                }
+                Ok(Some(json!({ "flushed": flushed })))
+            }
+        }));
+    }
+
+    // pause — stop enqueuing to a route (body `{route}`), or all routes when omitted.
+    {
+        let handles = handles.clone();
+        try_register(&cmds, "pause", command_handler(move |req| {
+            let handles = handles.clone();
+            async move { Ok(Some(set_paused(&handles, &req, true))) }
+        }));
+    }
+
+    // resume — the inverse of pause.
+    {
+        let handles = handles.clone();
+        try_register(&cmds, "resume", command_handler(move |req| {
+            let handles = handles.clone();
+            async move { Ok(Some(set_paused(&handles, &req, false))) }
+        }));
+    }
+}
+
+/// Register a verb, logging (not failing) if the inbox rejects it.
+fn try_register(cmds: &Arc<CommandInbox>, verb: &str, handler: Arc<dyn CommandHandler>) {
+    if let Err(e) = cmds.register(verb, handler) {
+        tracing::warn!(verb, error = %e, "failed to register command verb");
+    }
+}
+
+/// The `get-stats` reply body: `{routes: [{id, in, out, dropped, streamAppends, publishFailures,
+/// queueDepth, paused}]}`.
+fn stats_json(handles: &[RouteHandle]) -> Value {
+    let routes: Vec<Value> = handles
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "in": r.stats.messages_in.load(Ordering::Relaxed),
+                "out": r.stats.messages_out.load(Ordering::Relaxed),
+                "dropped": r.stats.messages_dropped.load(Ordering::Relaxed),
+                "streamAppends": r.stats.stream_appends.load(Ordering::Relaxed),
+                "publishFailures": r.stats.publish_failures.load(Ordering::Relaxed),
+                "queueDepth": r.stats.queue_depth.load(Ordering::Relaxed),
+                "paused": r.stats.paused.load(Ordering::Relaxed),
+            })
+        })
+        .collect();
+    json!({ "routes": routes })
+}
+
+/// Apply `paused` to the route named in `request.body.route` (or all routes when absent). Returns
+/// `{paused|resumed: [ids...]}`.
+fn set_paused(handles: &[RouteHandle], request: &Message, paused: bool) -> Value {
+    let route = request.body.get("route").and_then(Value::as_str);
+    let mut affected = Vec::new();
+    for r in handles {
+        if route.is_none() || route == Some(r.id.as_str()) {
+            r.stats.paused.store(paused, Ordering::Relaxed);
+            affected.push(r.id.clone());
+        }
+    }
+    let key = if paused { "paused" } else { "resumed" };
+    json!({ key: affected })
 }

@@ -1,11 +1,14 @@
 # Telemetry Processor — Documentation
 
-`com.mbreissi.greengrass.TelemetryProcessor` subscribes to local telemetry topics, runs a declarative
-per-route pipeline — **filter, sample, aggregate, project, Rhai script** — and forwards the result to a
-target: republish on the local bus, send northbound to MQTT / AWS IoT Core, or append to a durable
-stream that lands in **Kinesis, Kafka, or rolling Parquet/AVRO files**. Built on the `ggcommons`
-library, it is the high-throughput seam between southbound protocol adapters and the cloud, and runs
-wherever you deploy it — as a Greengrass v2 component, a standalone process, or a Kubernetes pod.
+`com.mbreissi.telemetry-processor` subscribes to the fleet's telemetry on the **Unified Namespace**
+(the `ecv1/.../data/#` class), runs a declarative per-route pipeline — **filter, sample, aggregate,
+project, Rhai/Lua script** — and forwards the result to a target: republish on the local bus, send
+northbound to MQTT / AWS IoT Core, or append to a durable stream that lands in **Kinesis, Kafka, or
+rolling Parquet/AVRO files**. Built on the `ggcommons` library, it is the high-throughput seam between
+southbound protocol adapters and the cloud, and runs wherever you deploy it — as a Greengrass v2
+component, a standalone process, or a Kubernetes pod. It appears on the bus as
+`ecv1/{device}/telemetry-processor/main/…` and answers UNS commands (`get-stats` / `flush` / `pause` /
+`resume` + the library built-ins).
 
 | Doc | Start here when you want to… |
 |-----|------------------------------|
