@@ -160,6 +160,24 @@ The output target is per route (`target`). Route outputs must land on a non-rese
   `stream-unavailable` `evt` fires), never propagated — use a durable `stream:` target for no-loss
   output.
 
+> **Why this dispatch stays on `messaging()`/`streams()` instead of the `data()` facade.** The
+> `ggcommons` library's `data()` publish facade (`gg.instance(id).data()`) is the right tool for a
+> southbound adapter minting a **fresh** `SouthboundSignalUpdate` from a protocol read — it owns
+> topic minting (always under *its own* bound identity), the `SouthboundSignalUpdate` header, and
+> quality/timestamp defaulting. This dispatcher instead **republishes an already-built message**
+> that may not be southbound-shaped at all (the processor is payload-agnostic, above) and — for
+> `local`/`northbound` — defaults to the exact **source topic** (a deliberate bridging behavior the
+> `alarms-northbound` sample relies on). Routing that through `data()` would silently change the
+> published topic and force a header/body shape the processor does not require. So the dispatcher
+> keeps this lower-level path — exactly what
+> [`DESIGN-class-facades.md`](https://github.com/edgecommons/ggcommons/blob/main/docs/platform/DESIGN-class-facades.md)
+> §7.2 anticipated ("the facade must not fight the restamp; likely the processor keeps a lower-level
+> path here"). The route `target` itself **is** the library's own `ggcommons::facades::Channel`
+> (`local` | `northbound` | `stream:<name>`) rather than a bespoke processor type, so the routing
+> *vocabulary* is shared even though the dispatch mechanics are not. `evt` health events (above) DID
+> migrate onto the matching facade (`events()`), since there the facade's identity/topic/body
+> ownership matches exactly what the processor needs.
+
 ## Aggregate output (`ProcessedTelemetry`)
 
 An `aggregate` stage emits one message per `(key, window)` with `header.name = "ProcessedTelemetry"`
@@ -217,18 +235,24 @@ automatically by the library). A `cmd` request whose `header.reply_to` is set ge
 
 ## Events (`evt`)
 
-The processor publishes rate-limited health events on `ecv1/{device}/telemetry-processor/main/evt/<channel>`
-(a non-reserved class; subscribe the fleet with `ecv1/+/+/+/evt/#`):
+The processor publishes rate-limited health events through the `ggcommons` `events()` publish facade
+(`gg.events()`, bound to the `main` instance) on
+`ecv1/{device}/telemetry-processor/main/evt/{severity}/{type}` (a non-reserved class; subscribe the
+fleet with `ecv1/+/+/+/evt/#`). The facade derives the channel from the body's own `severity`/`type`
+(so topic and body can never disagree) and stamps `timestamp`; every one of the processor's own health
+events currently uses `severity: "warning"`:
 
-| Channel | When | Body |
-|---------|------|------|
-| `queue-overflow` | a route's worker queue was full and a message was dropped (backpressure) | `{ "route" }` |
-| `route-error` | a `local`/`northbound` forward failed | `{ "route", "topic", "error" }` |
-| `stream-unavailable` | a `stream:<name>` target is down / its append failed | `{ "route", "stream", "error" }` |
+| `type` | When | Body |
+|--------|------|------|
+| `queue-overflow` | a route's worker queue was full and a message was dropped (backpressure) | `{ "severity": "warning", "type": "queue-overflow", "timestamp", "context": { "route" } }` |
+| `route-error` | a `local`/`northbound` forward failed | `{ "severity": "warning", "type": "route-error", "message": "<error>", "timestamp", "context": { "route", "topic" } }` |
+| `stream-unavailable` | a `stream:<name>` target is down / its append failed | `{ "severity": "warning", "type": "stream-unavailable", "message": "<error>", "timestamp", "context": { "route", "stream" } }` |
 
-Each channel is coalesced (at most one event per channel per cooldown window) so a sustained fault
-can't storm the bus. Routes 2 (`alarms-northbound` in the recipe) can also forward alarm-flagged
-readings northbound as `evt/alarms`.
+Each `type` is coalesced (at most one event per type per cooldown window) so a sustained fault can't
+storm the bus. Routes 2 (`alarms-northbound` in the recipe) can also forward alarm-flagged readings
+northbound as `evt/alarms` — that path is a plain `publish.topic` override on the route's raw
+local/northbound dispatch (see [Publishes](#publishes) above), not the `events()` facade, since it is
+forwarding an already-shaped signal reading, not minting a processor health event.
 
 ## Metrics (`metric`)
 

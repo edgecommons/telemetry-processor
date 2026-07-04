@@ -168,33 +168,17 @@ pub struct PublishConfig {
     pub qos: Option<String>,
 }
 
-/// Where a route forwards its output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    /// Republish on the local bus.
-    Local,
-    /// Publish to IoT Core / a northbound MQTT broker.
-    Northbound,
-    /// Append to a durable stream (exports to Kinesis/Kafka/file).
-    Stream(String),
-}
+/// Where a route forwards its output — the `ggcommons` publish-facade [`Channel`] (`local` |
+/// `northbound` | `stream:<name>`, DESIGN-class-facades §4), reused here instead of a bespoke
+/// processor-local enum so the route `target` and the library's `data()`/`events()` channel
+/// routing share one vocabulary.
+pub use ggcommons::facades::Channel;
 
-impl Target {
-    /// Parse a `target` string: `local` | `northbound` | `stream:<name>`.
-    pub fn parse(s: &str) -> anyhow::Result<Target> {
-        let s = s.trim();
-        if let Some(name) = s.strip_prefix("stream:") {
-            let name = name.trim();
-            anyhow::ensure!(!name.is_empty(), "target 'stream:' requires a stream name");
-            Ok(Target::Stream(name.to_string()))
-        } else if s.eq_ignore_ascii_case("local") {
-            Ok(Target::Local)
-        } else if s.eq_ignore_ascii_case("northbound") {
-            Ok(Target::Northbound)
-        } else {
-            anyhow::bail!("unknown target '{s}' (expected local | northbound | stream:<name>)")
-        }
-    }
+/// Parse a `target` string into the shared [`Channel`]: `local` | `northbound` | `stream:<name>`
+/// (delegates to [`Channel::from_config`]).
+pub fn parse_target(s: &str) -> anyhow::Result<Channel> {
+    Channel::from_config(s)
+        .ok_or_else(|| anyhow::anyhow!("unknown target '{s}' (expected local | northbound | stream:<name>)"))
 }
 
 /// A window spec parsed from `aggregate.window`: a duration in ms, or a record count.
@@ -243,7 +227,7 @@ mod tests {
         assert_eq!(r.pipeline.len(), 5);
         assert!(matches!(r.pipeline[0], StageConfig::Filter(_)));
         assert!(matches!(r.pipeline[4], StageConfig::Script(_)));
-        assert_eq!(Target::parse(r.target.as_deref().unwrap()).unwrap(), Target::Stream("archive".into()));
+        assert_eq!(parse_target(r.target.as_deref().unwrap()).unwrap(), Channel::Stream("archive".into()));
     }
 
     #[test]
@@ -294,7 +278,7 @@ mod tests {
 
     #[test]
     fn target_parsing_errors() {
-        assert!(Target::parse("bogus").is_err());
-        assert!(Target::parse("stream:").is_err());
+        assert!(parse_target("bogus").is_err());
+        assert!(parse_target("stream:").is_err());
     }
 }

@@ -59,7 +59,7 @@ Each entry is one independent route: subscribe → pipeline → target.
 | `target` | string | `global.defaults.target` | `local` \| `northbound` \| `stream:<name>`. Required if no global default. |
 | `publish` | object | — | Output topic / partition key / QoS (below). |
 | `key` | string | `global.defaults.key` ▸ `body.signal.id` | Route default key path for `sample`/`aggregate`/stream partitioning. |
-| `maxQueue` | number | `256` | Per-route internal queue depth. **Drop-on-full**: when the route's worker can't keep up, new messages are dropped (logged at debug, tallied in `get-stats` `dropped`, and surfaced as a rate-limited `evt/queue-overflow`). |
+| `maxQueue` | number | `256` | Per-route internal queue depth. **Drop-on-full**: when the route's worker can't keep up, new messages are dropped (logged at debug, tallied in `get-stats` `dropped`, and surfaced as a rate-limited `evt/warning/queue-overflow`). |
 | `scriptEngine` | enum | `global.defaults.scriptEngine` ▸ `rhai` | Engine for this route's `filter`/`script` stages (`rhai` \| `lua`). The script *dialect* follows the engine. |
 
 > Numeric fields accept an integer **or** an integer-valued float (Greengrass delivers config numbers
@@ -274,7 +274,8 @@ The processor is a first-class UNS/console citizen. Beyond the library-automatic
 - **`metric/pipeline`** — with `metricEmission.target: "messaging"`, a throughput metric
   (`messagesIn`/`messagesOut`/`messagesDropped`/`streamAppends`/`publishFailures`) every 30 s on the
   UNS `metric` class. (System CPU/memory come from the heartbeat's `sys` metric.)
-- **`evt/*`** — rate-limited `queue-overflow` / `route-error` / `stream-unavailable` health events.
+- **`evt/warning/*`** — rate-limited `queue-overflow` / `route-error` / `stream-unavailable` health
+  events, published through the library's `events()` facade.
 - **Command verbs** — built-in `ping` / `reload-config` / `get-configuration`, plus the processor's
   custom `get-stats` / `flush` / `pause` / `resume`.
 

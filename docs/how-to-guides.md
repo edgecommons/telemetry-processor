@@ -432,8 +432,9 @@ The processor answers its command inbox at `ecv1/{device}/telemetry-processor/ma
 
 The processor also publishes, without any request: its `state` keepalive
 (`ecv1/{device}/telemetry-processor/main/state`), a `metric/pipeline` throughput metric (when
-`metricEmission.target: "messaging"`), and `evt/{queue-overflow,route-error,stream-unavailable}` health
-events. Subscribe the fleet with `ecv1/+/+/+/{state,metric,evt}/#`.
+`metricEmission.target: "messaging"`), and `evt/warning/{queue-overflow,route-error,stream-unavailable}`
+health events (via the library's `events()` facade). Subscribe the fleet with
+`ecv1/+/+/+/{state,metric,evt}/#`.
 
 ---
 

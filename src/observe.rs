@@ -8,10 +8,16 @@
 //!   `messages_dropped` / `stream_appends` / `publish_failures`) plus a `paused` flag, incremented
 //!   by the fan-out handler and the route [`crate::proc::route::Dispatcher`], read by the
 //!   `get-stats` command and the metric emitter.
-//! - [`EvtEmitter`] — a rate-limited publisher of the processor's own **`evt`** events
-//!   (`ecv1/{device}/telemetry-processor/main/evt/<channel>`), built via `gg.uns()` and stamped
-//!   with `.from_config()`; used to surface pipeline health (`queue-overflow`, `route-error`,
-//!   `stream-unavailable`) to the console.
+//! - [`EvtEmitter`] — a rate-limited publisher of the processor's own **`evt`** events, now a thin
+//!   wrapper over the library's [`ggcommons::facades::EventsFacade`] (`gg.events()`, bound to the
+//!   `main` instance): the facade owns the `evt/{severity}/{type}` channel derivation, the body
+//!   contract (`severity`/`type`/`message`/`timestamp`/`context`), and the envelope/identity
+//!   stamping — this migration is exactly what `docs/platform/DESIGN-class-facades.md` §1.2 calls
+//!   out as the drift the facade fixes (the old hand-rolled emitter had **no severity segment** at
+//!   all: `evt/queue-overflow`, not `evt/warning/queue-overflow`). `EvtEmitter` keeps only the
+//!   processor-specific per-channel **cooldown** gate (not a library concern) and maps its three
+//!   health signals onto `Severity::Warning` events with `{route[, topic|stream]}` as `context` and
+//!   the failure string as `message`.
 //! - [`spawn_metric_emitter`] — the periodic task that emits the summed counters as the **`metric`**
 //!   class through `gg.metrics()` (interval deltas), mirroring the `uns-bridge` `RelayCounters →
 //!   gg.metrics()` pattern. With `metricEmission.target: "messaging"` the messaging metric target
@@ -23,10 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ggcommons::config::model::Config;
-use ggcommons::messaging::message::MessageBuilder;
-use ggcommons::messaging::MessagingService;
+use ggcommons::facades::{EventsFacade, Severity};
 use ggcommons::metrics::{MetricBuilder, MetricService};
-use ggcommons::uns::{Uns, UnsClass};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
@@ -83,69 +87,69 @@ impl RouteStats {
     }
 }
 
-/// The processor's rate-limited `evt` publisher. Topics are built through the component-bound
-/// [`Uns`] (instance `main`), envelopes are `.from_config()`-stamped, and each event carries the
-/// channel as its `header.name`. Publishing is best-effort: `evt` is a non-reserved class, so the
-/// reserved-class guard passes; a failed publish is logged at DEBUG and swallowed.
+/// The processor's rate-limited `evt` publisher — a thin wrapper over the library's
+/// [`EventsFacade`] (`gg.events()`, bound to the `main` instance, matching the pre-migration
+/// `gg.uns()` topic instance). The facade owns the `evt/{severity}/{type}` channel, the body
+/// contract, and the envelope/identity stamping; this type owns only the processor-specific
+/// per-channel **cooldown** gate. Publishing is best-effort: `evt` is a non-reserved class, so the
+/// reserved-class guard passes; a failed publish is logged at DEBUG and swallowed (the facade
+/// itself never propagates a transport error here — see [`EventsFacade::emit`]).
 pub struct EvtEmitter {
-    messaging: Arc<dyn MessagingService>,
-    uns: Uns,
-    config: Arc<Config>,
+    events: EventsFacade,
     cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl EvtEmitter {
-    /// Build an emitter over the component's messaging service, UNS topic builder, and config
-    /// snapshot (the last two obtained from `gg.uns()` / `gg.config()`).
-    pub fn new(messaging: Arc<dyn MessagingService>, uns: Uns, config: Arc<Config>) -> Arc<EvtEmitter> {
-        Arc::new(EvtEmitter { messaging, uns, config, cooldowns: Mutex::new(HashMap::new()) })
+    /// Build an emitter over the component's `events()` facade (`gg.events()`).
+    pub fn new(events: EventsFacade) -> Arc<EvtEmitter> {
+        Arc::new(EvtEmitter { events, cooldowns: Mutex::new(HashMap::new()) })
     }
 
-    /// Returns `true` if `channel` is outside its cooldown (and records the emit time).
-    fn allow(&self, channel: &str) -> bool {
+    /// Returns `true` if `event_type` is outside its cooldown (and records the emit time).
+    fn allow(&self, event_type: &str) -> bool {
         let mut cds = self.cooldowns.lock().unwrap();
         let now = Instant::now();
-        if let Some(last) = cds.get(channel) {
+        if let Some(last) = cds.get(event_type) {
             if now.duration_since(*last) < EVT_COOLDOWN {
                 return false;
             }
         }
-        cds.insert(channel.to_string(), now);
+        cds.insert(event_type.to_string(), now);
         true
     }
 
-    /// Publish one event on `evt/<channel>` (rate-limited per channel). No-op while in cooldown.
-    async fn emit(&self, channel: &str, body: Value) {
-        if !self.allow(channel) {
+    /// Emits one `evt/warning/{event_type}` event through the `events()` facade (rate-limited per
+    /// type). No-op while in cooldown. `message` carries the failure string (when there is one);
+    /// `context` carries the structured detail (`route`, plus `topic` or `stream`).
+    async fn emit(&self, event_type: &str, message: Option<String>, context: Value) {
+        if !self.allow(event_type) {
             return;
         }
-        let topic = match self.uns.topic_with_channel(UnsClass::Evt, channel) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, channel, "could not build evt topic; skipping event");
-                return;
-            }
-        };
-        let msg = MessageBuilder::new(channel, "1.0").from_config(&self.config).payload(body).build();
-        if let Err(e) = self.messaging.publish(&topic, &msg).await {
-            tracing::debug!(error = %e, topic = %topic, "evt publish failed");
+        if let Err(e) = self.events.emit(Severity::Warning, event_type, message, Some(context)).await
+        {
+            tracing::debug!(error = %e, event_type, "evt publish failed");
         }
     }
 
-    /// `evt/queue-overflow` — sustained backpressure dropped a message on `route`.
+    /// `evt/warning/queue-overflow` — sustained backpressure dropped a message on `route`.
     pub async fn queue_overflow(&self, route: &str) {
-        self.emit("queue-overflow", json!({ "route": route })).await;
+        self.emit("queue-overflow", None, json!({ "route": route })).await;
     }
 
-    /// `evt/route-error` — a `local`/`northbound` forward failed on `route`.
+    /// `evt/warning/route-error` — a `local`/`northbound` forward failed on `route`.
     pub async fn route_error(&self, route: &str, topic: &str, error: &str) {
-        self.emit("route-error", json!({ "route": route, "topic": topic, "error": error })).await;
+        self.emit("route-error", Some(error.to_string()), json!({ "route": route, "topic": topic }))
+            .await;
     }
 
-    /// `evt/stream-unavailable` — a `stream:<name>` target is down / its append failed.
+    /// `evt/warning/stream-unavailable` — a `stream:<name>` target is down / its append failed.
     pub async fn stream_unavailable(&self, route: &str, stream: &str, error: &str) {
-        self.emit("stream-unavailable", json!({ "route": route, "stream": stream, "error": error }))
-            .await;
+        self.emit(
+            "stream-unavailable",
+            Some(error.to_string()),
+            json!({ "route": route, "stream": stream }),
+        )
+        .await;
     }
 }
 

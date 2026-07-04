@@ -4,8 +4,28 @@
 //! messages (filled by the subscribe handler), and a side **control** channel (the `flush` command
 //! verb). A `tokio::select!` drains the data channel, fires the aggregate flush timer, and services
 //! control, so per-key window state is single-threaded and lock-free. Pipeline output is dispatched
-//! to the route's [`Target`], tallied into the route's [`RouteStats`], and — on failure — surfaced
-//! as an [`EvtEmitter`] `evt`.
+//! to the route's [`Channel`] target, tallied into the route's [`RouteStats`], and — on failure —
+//! surfaced as an [`EvtEmitter`] `evt` (via the library's `events()` facade).
+//!
+//! ## Why this dispatcher does not route through `data()`
+//! `ggcommons::facades::DataFacade` (the `data()` facade) is a great fit for a southbound adapter
+//! that mints a **fresh** `SouthboundSignalUpdate` from a protocol read (DESIGN-class-facades §2.1).
+//! It is a poor fit for *this* dispatcher, which republishes an **already-built, possibly
+//! non-southbound-shaped** [`Message`] (the processor is deliberately payload-agnostic — see
+//! `docs/reference/messaging-interface.md`): `data()` always (a) mints the topic from *its own bound
+//! instance* identity, never an arbitrary caller topic (breaking the documented `local`/`northbound`
+//! "default = the source topic" bridge — see the sample `alarms-northbound` route, which forwards
+//! northbound with no `publish.topic` override, and `docs/explanation.md`'s two-flow diagram),
+//! (b) forces the `SouthboundSignalUpdate` header + a `signal.id`/`samples[]` body shape, which would
+//! break `ProcessedTelemetry` (aggregate output) and any `project`/`script`-reshaped body, and (c)
+//! always stamps *its own* identity — correct for `local` (see below) but wrong for `northbound`/
+//! `stream`, which deliberately preserve the **source** identity for provenance. So the dispatcher
+//! keeps this lower-level `messaging()`/`streams()` path, exactly as `DESIGN-class-facades.md` §7.2
+//! anticipated ("the facade must not fight the restamp; likely the processor keeps a lower-level
+//! path here"). What *did* migrate onto a facade is `evt` health events (see
+//! [`crate::observe::EvtEmitter`], now a thin wrapper over `gg.events()`) and the routing
+//! **vocabulary**: the route `target` is the library's own [`Channel`] (`local` | `northbound` |
+//! `stream:<name>`, DESIGN-class-facades §4) instead of a bespoke processor enum.
 //!
 //! ## UNS provenance (identity restamping)
 //! For a `local` republish the dispatcher **restamps the output envelope's `identity` with the
@@ -19,12 +39,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ggcommons::facades::Channel;
 use ggcommons::messaging::message::{Message, MessageIdentity};
 use ggcommons::messaging::{MessagingService, Qos};
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
-use crate::config::{PublishConfig, Target};
+use crate::config::PublishConfig;
 #[cfg(feature = "streaming")]
 use crate::json_path::resolve_first_string;
 use crate::observe::{EvtEmitter, RouteStats};
@@ -33,7 +54,7 @@ use crate::proc::{now_ms, Control, Out, Pipeline, ProcMsg};
 /// Forwards processed messages to a route's target.
 pub struct Dispatcher {
     messaging: Arc<dyn MessagingService>,
-    target: Target,
+    target: Channel,
     /// Pre-resolved output topic (templates expanded at startup); `None` → reuse the source topic.
     topic: Option<String>,
     qos: Qos,
@@ -56,7 +77,7 @@ impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         messaging: Arc<dyn MessagingService>,
-        target: Target,
+        target: Channel,
         publish: &PublishConfig,
         route_key: &str,
         route_id: String,
@@ -94,7 +115,7 @@ impl Dispatcher {
     /// propagated.
     pub async fn dispatch(&self, m: ProcMsg) {
         match &self.target {
-            Target::Local => {
+            Channel::Local => {
                 let topic = self.out_topic(&m);
                 // Restamp the local output with the processor's identity (loop-safety + provenance).
                 let published = if let Some(id) = &self.restamp {
@@ -115,7 +136,7 @@ impl Dispatcher {
                     }
                 }
             }
-            Target::Northbound => {
+            Channel::Northbound => {
                 let topic = self.out_topic(&m);
                 match self.messaging.publish_to_iot_core(&topic, &m.msg, self.qos).await {
                     Ok(()) => {
@@ -128,7 +149,7 @@ impl Dispatcher {
                     }
                 }
             }
-            Target::Stream(name) => self.dispatch_stream(name, &m.msg, m.recv_ms).await,
+            Channel::Stream(name) => self.dispatch_stream(name, &m.msg, m.recv_ms).await,
         }
     }
 

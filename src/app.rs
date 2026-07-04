@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::config::{GlobalDefaults, RouteConfig, ScriptEngineKind, Target};
+use crate::config::{parse_target, GlobalDefaults, RouteConfig, ScriptEngineKind};
 use crate::observe::{spawn_metric_emitter, EvtEmitter, RouteStats};
 use crate::proc::route::{run_worker, Dispatcher};
 use crate::proc::{now_ms, Control, Pipeline, ProcMsg};
@@ -144,8 +144,9 @@ impl ProcessorApp {
         // The processor's own UNS identity — the self-echo guard's match, and the restamp source.
         let own_device = config.identity().device().to_string();
         let own_component = config.identity().component().to_string();
-        // The `evt` health-event publisher (topics built through gg.uns(), instance `main`).
-        let evt = EvtEmitter::new(messaging.clone(), gg.uns(), config.clone());
+        // The `evt` health-event publisher — a thin wrapper over the library's `events()` facade,
+        // bound to the `main` instance (matches the pre-migration `gg.uns()` topic instance).
+        let evt = EvtEmitter::new(gg.events());
 
         let mut app = Self {
             messaging: messaging.clone(),
@@ -243,7 +244,7 @@ impl ProcessorApp {
             .clone()
             .or_else(|| ctx.default_target.map(String::from))
             .ok_or_else(|| anyhow::anyhow!("route '{}' has no target", route.id))?;
-        let target = Target::parse(&target_str)?;
+        let target = parse_target(&target_str)?;
 
         anyhow::ensure!(!route.subscribe.is_empty(), "route '{}' has no subscribe topics", route.id);
 
@@ -267,7 +268,7 @@ impl ProcessorApp {
         // Restamp policy: `local` output carries the processor's own identity (instance = route id)
         // — loop-safety for the self-echo guard + correct provenance for the processor's product.
         let restamp: Option<MessageIdentity> = match &target {
-            Target::Local => Some(
+            Channel::Local => Some(
                 config
                     .identity()
                     .with_instance(&route.id)
@@ -278,7 +279,7 @@ impl ProcessorApp {
 
         #[cfg(feature = "streaming")]
         let stream = match &target {
-            Target::Stream(name) => Some(
+            Channel::Stream(name) => Some(
                 gg.streams()
                     .stream(name)
                     .map_err(|e| anyhow::anyhow!("stream '{name}' not configured: {e}"))?,
@@ -354,8 +355,8 @@ impl ProcessorApp {
 /// Subscribe one filter with a fan-out handler: apply the UNS self-echo guard, then forward each
 /// message to every route channel that registered for it (tallying `messages_in`/`messages_dropped`
 /// and the queue-depth gauge, honoring the per-route `paused` flag, and emitting a rate-limited
-/// `evt/queue-overflow` on backpressure drops). Concurrency is 1 so ordered consumers get messages
-/// in order.
+/// `evt/warning/queue-overflow` on backpressure drops). Concurrency is 1 so ordered consumers get
+/// messages in order.
 async fn self_subscribe(
     messaging: &Arc<dyn MessagingService>,
     filter: &str,
