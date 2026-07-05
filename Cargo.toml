@@ -47,7 +47,7 @@ scripting-lua = ["dep:mlua"]
 # .cargo/config.toml); locally it uses your gh/git credential helper, and in CI the reusable workflow
 # rewrites this https URL with the EDGECOMMONS_READ_TOKEN PAT. For local development against an
 # unpushed change, temporarily swap this for `path = "../ggcommons-monorepo/libs/rust"`.
-ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "cc037a92c1780c3d88cc98885cfdefec0403a898", default-features = false }
+ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "b1d8d85bed1e989928d083323ef8be98132d77d5", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
