@@ -86,10 +86,12 @@ to 0 or 1, an `aggregate` accumulates and emits on window close, the rest pass 1
 | `project` | `{ "project": { "keep": ["signal","samples"], "set": { "origin": "processor" } } }` | `keep` whitelists **top-level body keys** (the first segment of each listed path); `set` overlays literal fields onto the body. With neither, the body passes through. |
 | `script` | `{ "script": "#{ \"scaled\": value * 0.1 }" }` | A Rhai program that returns a new body map; `()` drops the message (§9). |
 
-The Rhai engine is always compiled in. A `filter`/`script` scope exposes `topic` (string),
-`body`/`tags`/`identity` (maps — `identity` is the source publisher's UNS identity, the `tags.thing`
-replacement), `samples` (array), and the convenience bindings `value`/`quality` (the first sample's).
-The shared engine is bounded (`max_operations = 1_000_000`) to deter runaway scripts.
+Scripts run in the route's `scriptEngine` — `rhai` (default, always compiled in) or `lua` (needs the
+`scripting-lua` build); the scope and return contract are **identical** in both engines. A
+`filter`/`script` scope exposes `topic` (string), `body`/`tags`/`identity` (maps — `identity` is the
+source publisher's UNS identity, the `tags.thing` replacement), `samples` (array), and the convenience
+bindings `value`/`quality` (the first sample's). The engine is bounded (Rhai `max_operations =
+1_000_000` / the equivalent Lua instruction budget) to deter runaway scripts.
 
 ### Targets and the feature flags they need
 
@@ -294,8 +296,9 @@ value), the full reducer set under `agg`, and a `window` block (`{ startMs, endM
 
 When you want a **forensic firehose** — every message archived verbatim, rolled purely by size — use
 `mode: "raw"` with `rollEverySecs: 0` (time-roll off) and a small `maxFileBytes`. Raw mode writes one
-row per message (minimal envelope columns `topic` / `recvTs` / `name` / `version` plus the opaque
-payload), so it accepts **any** message shape, not just southbound envelopes. With time-rolling
+row per message (columns `offset`, `partitionKey` — the resolved `publish.partitionKey` — `tsMs` the
+stream record time, and `payload` the lossy-UTF-8 message bytes), so it accepts **any** message shape,
+not just southbound envelopes. With time-rolling
 disabled, files rotate only when they fill, giving uniform, size-bounded objects ideal for steady bulk
 upload.
 
@@ -464,7 +467,7 @@ publishes them to IoT Core at a chosen QoS.
 | Option | Effect on runtime behavior |
 |--------|----------------------------|
 | `messaging.iotCore` | The cloud half of the HOST dual-MQTT transport — the mTLS session `northbound` publishes through. Required on `HOST`/`KUBERNETES` for a `northbound` target; on `GREENGRASS` it is **not** needed (the publish routes through the Nucleus' IoT Core connection — see §6 `accessControl`). |
-| `subscribe` | Narrowed to `…/+/+/alarms/#`, so only the adapters' alarm topics enter this route — IoT Core is priced per message, so keep northbound sparse. |
+| `subscribe` | Subscribes the **full `data` class** (`ecv1/+/+/+/data/#`) — there is no `alarms` topic class (the eight are `data`/`evt`/`cmd`/`app`/`state`/`metric`/`cfg`/`log`). It is the `quality != GOOD` filter below (not the subscription) that selects the alarm/fault readings, so only those reach IoT Core — priced per message — keeping northbound sparse. |
 | `filter.field` / `op: "ne"` / `value: "GOOD"` | Keep a message when **any** `body.samples[].quality` is not `GOOD` — i.e. a fault/alarm/uncertain reading. (Equivalently a Rhai predicate like `samples.any(\|s\| s.quality != "GOOD")` — see §9.) |
 | `target: "northbound"` | Publishes via `publish_to_iot_core` instead of the local bus. |
 | `publish.topic` | The IoT Core topic (template-resolved). `ecv1/{ThingName}/telemetry-processor/main/evt/alarms` publishes alarms as the UNS **`evt`** class, namespaced per device (subscribe `ecv1/+/+/+/evt/#`). |
@@ -708,11 +711,15 @@ processed independently by each route's pipeline and target.
 
 ---
 
-## 9. Rhai filter and Rhai transform
+<a id="9-rhai-filter-and-rhai-transform"></a>
+## 9. Script filter and transform (Rhai or Lua)
 
-When the built-in operators don't fit, drop to Rhai. A `filter` `script` is a boolean predicate; a
-`script` stage returns a new body (or `()` to drop). Both see the same scope: `topic`, `body`, `tags`,
-`samples`, and the convenience bindings `value`/`quality` (the first sample's).
+When the built-in operators don't fit, drop to a script. A `filter` `script` is a boolean predicate; a
+`script` stage returns a new body (or `()`/`nil` to drop). Both run in the route's `scriptEngine` —
+`rhai` (default) or `lua` (the `scripting-lua` build) — and see the same scope: `topic`, `body`,
+`tags`, `identity` (the source publisher's UNS identity, the `tags.thing` replacement), `samples`, and
+the convenience bindings `value`/`quality` (the first sample's). The example below is Rhai; see the
+[Scripting guide](scripting.mdx) for the Lua equivalents.
 
 ```jsonc
 // config.json — component section

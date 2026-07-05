@@ -153,7 +153,7 @@ The `agg` map in a `ProcessedTelemetry` body carries one entry per configured re
 | `avg` | number (double) | numeric samples only; `null` if the window had no numeric sample |
 | `sum` | number (double) | numeric samples only; `null` if none numeric |
 | `min` / `max` | number (double) | numeric samples only; `null` if none numeric |
-| `count` | integer | count of **all** messages folded into the window (numeric or not) |
+| `count` | integer | count of **all** sample values folded into the window (each `body.samples[].value`, numeric or not; an array value is folded element-wise, so it exceeds the message count for array-valued signals) |
 | `first` / `last` | the sample value's JSON type | the raw first / last sample value (any JSON type), or `null` if the window was empty |
 
 > `samples[0].value` repeats the **primary** reducer (the first-listed `fn`), so file archiving and

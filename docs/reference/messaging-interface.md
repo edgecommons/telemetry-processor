@@ -199,7 +199,7 @@ except on a `local` target where it is restamped):
 | `samples[0].quality` | always `"GOOD"`. |
 | `agg.<fn>` | the full reducer set (one entry per configured `fn`). See [data-types.md](data-types.md#aggregate-agg-types) for value types. |
 | `window.startMs` / `window.endMs` | window bounds (Unix ms). For a count window both equal the close time. |
-| `window.count` | number of messages folded into the window. |
+| `window.count` | number of **folded sample values** in the window (each `body.samples[].value`; an array value is folded element-wise, so this equals the message count only when each message carries a single scalar sample). |
 
 > Numeric reducers (`avg`/`max`/`min`/`sum`) are emitted only when ≥1 sample in the window was
 > numeric; otherwise that reducer is `null`.

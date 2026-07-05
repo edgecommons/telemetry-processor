@@ -85,7 +85,7 @@ Exactly one form applies, checked in this order: `script` → `quality` → `fie
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `script` | string \| `{file}` | — | Rhai boolean predicate over the [message view](#rhai-scope); keep when it returns `true`. Inline source, or `{"file": "rules/keep.rhai"}` — see [`script`](#script-stage). |
+| `script` | string \| `{file}` | — | Rhai/Lua boolean predicate (per the route's `scriptEngine`) over the [message view](#rhai-scope); keep when it returns `true`. Inline source, or `{"file": "rules/keep.rhai"}` — see [`script`](#script-stage). |
 | `quality` | string | — | Shorthand: keep only when **every** `body.samples[].quality` equals this (and ≥1 sample exists). |
 | `field` | string (path) | — | Built-in predicate path (supports `[]` array spread → any-element match). |
 | `op` | string | `eq` | `eq` \| `ne` \| `gt` \| `lt` \| `ge` \| `le` \| `exists` \| `contains` (symbolic aliases `==`/`!=`/`>`/…/`>=` also parse). |
@@ -146,7 +146,7 @@ message flows), sandboxed, and bounded (1,000,000 ops/eval) so a runaway script 
 For the full scripting model — engine selection, scope, state, return values, both languages, and a
 cookbook of worked examples in **both engines** — see the dedicated **[Scripting guide](../scripting.mdx)**.
 
-<a id="rhai-scope"></a>**Rhai scope** (available to both `filter` `script` and the `script` stage) —
+<a id="rhai-scope"></a>**Script scope (Rhai or Lua)** (available to both `filter` `script` and the `script` stage; identical in both engines) —
 the per-message **message view** plus the constant **runtime context**:
 
 | Binding | Type | Value |

@@ -71,7 +71,7 @@ the later stages' `process`.
 
 | Stage | What it does | Stateful? |
 |---|---|---|
-| `filter` | Keep or drop the whole message. Three forms, checked in order: a Rhai boolean `script`; a `quality` shorthand (keep only when **every** `samples[].quality` equals the value and at least one sample exists); or a built-in `field` + `op` + `value` predicate over a dotted path. `[]` in a path spreads an array → an **any-element** match. Ops: `eq` `ne` `gt` `lt` `ge` `le` `exists` `contains`. Built-ins compile to a fixed closure at startup — no per-message parsing. | no |
+| `filter` | Keep or drop the whole message. Three forms, checked in order: a Rhai/Lua boolean `script` (per the route's `scriptEngine`); a `quality` shorthand (keep only when **every** `samples[].quality` equals the value and at least one sample exists); or a built-in `field` + `op` + `value` predicate over a dotted path. `[]` in a path spreads an array → an **any-element** match. Ops: `eq` `ne` `gt` `lt` `ge` `le` `exists` `contains`. Built-ins compile to a fixed closure at startup — no per-message parsing. | no |
 | `sample` | Per-key downsampling: keep one message per `everyMs` time window, or one in every `everyN`. The key path is `by`, falling back to the route key (`body.signal.id`). | yes (per key) |
 | `aggregate` | Tumbling-window reduction. The window is time (`"10s"`, `"500ms"`) or a bare count (`"100"`); state is keyed by `by`/route key; the folded value is `value` (default `body.samples[].value`); reducers are `avg` `max` `min` `sum` `count` `first` `last`. Emits one `ProcessedTelemetry` message per `(key, window)` when the window closes. | yes (per key) |
 | `project` | Reshape the body: `keep` a whitelist of **top-level** body keys (the first segment of each dotted path — so `keep: ["signal.id"]` retains the whole `signal` object), and/or `set` literal fields onto the body. | no |
@@ -179,7 +179,9 @@ a 1 kHz signal into a 1 Hz one before anything downstream has to carry the volum
 **Windowing decides granularity (②).** The `aggregate` stage buckets each key's samples into
 **tumbling** windows and folds their `value`s with the configured reducers. A **time** window is
 computed from each message's *receive* time — `[ floor(recv/W)·W , +W )` — so a 10 s window groups all
-samples that landed in the same wall-clock 10 s slot. A **count** window simply collects N messages.
+samples that landed in the same wall-clock 10 s slot. A **count** window simply collects N folded
+sample values (each `body.samples[].value`, arrays folded element-wise — so N messages only when each
+message carries a single scalar sample).
 Note that windowing keys off the broker-receive time, not the sample's `sourceTs`.
 
 **The flush tick decides when a time window actually emits (③).** The worker's timer is what closes a
@@ -194,7 +196,8 @@ Two details follow from this and are worth internalizing. First, a time window c
 **eagerly**, without waiting for the tick: when a message for a *newer* window arrives for a key, the
 prior window for that key is emitted immediately. So a steady stream self-flushes; the timer exists to
 close windows for keys that have gone quiet. Second, **count windows need no timer at all** — they
-close synchronously inside `process` the moment the Nth message arrives.
+close synchronously inside `process` the moment the Nth folded value arrives (= the Nth message only
+when each message carries a single scalar sample).
 
 The running worker derives its flush tick from the aggregate window as described above — there is no
 separate flush-cadence knob. For lossless aggregation, size `maxQueue`

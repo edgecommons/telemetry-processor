@@ -28,7 +28,7 @@ A `filter` stage takes exactly one form, checked in this order:
 - `field` / `op` / `value` — a predicate over a dotted path; `[]` spreads an array, matching when **any**
   element satisfies it. Ops: `eq`, `ne`, `gt`, `lt`, `ge`, `le`, `exists` (value omitted), `contains`
   (substring). Numeric strings compare as numbers.
-- `script` — a Rhai boolean predicate (see [Rhai filter](#use-a-rhai-filter-and-a-rhai-transform)).
+- `script` — a Rhai/Lua boolean predicate (see [script filter](#use-a-rhai-filter-and-a-rhai-transform)).
 
 ---
 
@@ -126,9 +126,16 @@ Array values are first-class across the stages; pick the tool for the job:
 
 ---
 
-## Use a Rhai filter and a Rhai transform
+<a id="use-a-rhai-filter-and-a-rhai-transform"></a>
+## Use a filter and transform (Rhai or Lua)
 
 **Goal:** express logic the built-ins don't cover.
+
+> Both the `filter` `script` and the `script` stage run in the route's
+> [`scriptEngine`](reference/configuration.md#componentglobaldefaults) — **Rhai** (default) or **Lua**
+> (the `scripting-lua` build). The script *dialect* follows the engine; the scope and return contract
+> are identical in both. The examples below are Rhai — see the [Scripting guide](scripting.mdx) for the
+> same recipes in both engines.
 
 ```jsonc
 "pipeline": [
@@ -140,9 +147,11 @@ Array values are first-class across the stages; pick the tool for the job:
 - A **`filter` `script`** returns a boolean — `true` keeps the message.
 - A **`script`** stage returns the **new body** map, or `()` to **drop** the message.
 - Scope exposed to both: the message view — `topic`, the `header` / `body` / `tags` maps (`tags` is
-  envelope metadata, not the signal), `samples`, and the conveniences `value` / `quality` (the first
-  sample's) — **plus the runtime context** `thingName` / `componentName` / `componentFullName` /
-  `routeId` / `recvMs`. An eval error or a non-JSON result drops the message (logged at WARN).
+  envelope metadata, not the signal), `identity` (the source publisher's UNS identity — the `tags.thing`
+  replacement: `identity.device` / `identity.component` / `identity.instance` / `identity.path`),
+  `samples`, and the conveniences `value` / `quality` (the first sample's) — **plus the runtime context**
+  `thingName` / `componentName` / `componentFullName` / `routeId` / `recvMs`. An eval error or a non-JSON
+  result drops the message (logged at WARN).
 
 For the full scripting model — every scope binding (incl. the runtime context `thingName` /
 `componentName` / `routeId` / `recvMs`), return/error semantics, a Rhai language primer, array
@@ -309,7 +318,8 @@ Three independent rotation levers:
   + `valueType`); aggregated `ProcessedTelemetry` keeps that shape, so it lands as rows too; a payload
   that **isn't** `SouthboundSignalUpdate`-shaped is never dropped — it spills to a sibling `_unmapped`
   raw file. Add a [`rows` block](#project-custom-file-columns) to declare your own columns instead.
-  `mode: "raw"` writes one opaque row per message (`topic`, `recvTs`, `name`, `version`, `payload`).
+  `mode: "raw"` writes one opaque row per message (`offset`, `partitionKey` — the resolved
+  `publish.partitionKey` — `tsMs` the stream record time, and `payload` the lossy-UTF-8 message bytes).
 
 ---
 
