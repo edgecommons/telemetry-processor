@@ -147,8 +147,8 @@ Array values are first-class across the stages; pick the tool for the job:
 - A **`filter` `script`** returns a boolean — `true` keeps the message.
 - A **`script`** stage returns the **new body** map, or `()` to **drop** the message.
 - Scope exposed to both: the message view — `topic`, the `header` / `body` / `tags` maps (`tags` is
-  envelope metadata, not the signal), `identity` (the source publisher's UNS identity — the `tags.thing`
-  replacement: `identity.device` / `identity.component` / `identity.instance` / `identity.path`),
+  envelope metadata, not the signal), `identity` (the source publisher's UNS identity:
+  `identity.device` / `identity.component` / `identity.instance` / `identity.path`),
   `samples`, and the conveniences `value` / `quality` (the first sample's) — **plus the runtime context**
   `thingName` / `componentName` / `componentFullName` / `routeId` / `recvMs`. An eval error or a non-JSON
   result drops the message (logged at WARN).
@@ -401,10 +401,9 @@ different dimension (e.g. device or site).
 
 ## Route by source device / adapter (the `identity.` path)
 
-**Goal:** key, filter, or partition on *who* published a reading — the UNS replacement for the removed
-`tags.thing`.
+**Goal:** key, filter, or partition on *who* published a reading.
 
-The source device/component/instance now travel in the message's top-level `identity` element, read
+The source device/component/instance travel in the message's top-level `identity` element, read
 via the `identity.` key path (and the `identity` script binding):
 
 ```jsonc

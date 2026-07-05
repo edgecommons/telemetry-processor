@@ -43,8 +43,8 @@ The columns, **in file order**:
 
 > **The envelope `tags` are one JSON column, not fixed columns.** The ggcommons message-envelope
 > `tags` is an *open* metadata map — a deployment may carry `site`/`shop`/`line`, or an entirely
-> different set (the source device is **not** here — it travels in the top-level `identity` element,
-> the `tags.thing` replacement). Rather than freezing those into named columns, the default projection lands
+> different set (the source device is **not** here — it travels in the top-level `identity`
+> element). Rather than freezing those into named columns, the default projection lands
 > the entire object in one `tags` column as compact JSON, so a lake query reads any key
 > (`json_extract(tags, '$.site')` in Athena, `tags:site` in Snowflake, `JSON_VALUE` in BigQuery).
 > If you want a specific tag as its own typed column, declare a [user projection](#rows-user-projection).

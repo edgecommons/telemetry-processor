@@ -104,7 +104,7 @@ A script sees the **message view** (`topic`, the `header`/`body`/`tags` maps, th
 `identity`, `samples`, and the first-sample conveniences `value`/`quality`) plus the **runtime
 context** (`thingName`, `componentName`, `componentFullName`, `routeId`, `recvMs`) so a generic,
 reusable script can branch on which component/route/thing it runs in, or on the source device/adapter
-(`identity.device` / `identity.component` — the `tags.thing` replacement). Scripts are **stateless** —
+(`identity.device` / `identity.component`). Scripts are **stateless** —
 each evaluation sees only the current
 message; cross-message state belongs in `sample`/`aggregate`. Array-valued fields arrive as native
 arrays, so a script can iterate/reduce over them like any collection.
@@ -209,7 +209,7 @@ are emitted before exit, so a graceful stop loses no in-flight aggregate.
 
 The processor **consumes** the cross-language southbound envelope, header `name =
 "SouthboundSignalUpdate"` (§7 of the southbound contract). The envelope is `header` + `identity` (the
-source publisher's UNS identity — device/component/instance; the old `tags.thing` is removed) +
+source publisher's UNS identity — device/component/instance) +
 `tags` (`appId`, `site`, `shop`, `line`) + `body`, where the body is
 `{ device:{ adapter, instance, endpoint }, signal:{ id, name, address }, samples:[ { value, quality,
 qualityRaw, sourceTs, serverTs } ] }`. `quality` is normalized to `GOOD`/`BAD`/`UNCERTAIN` with the
@@ -282,5 +282,5 @@ The processor reads its config **once at startup**, wires every route, and subsc
 Ctrl-C it unsubscribes each filter, closes the route channels (so each worker drains and does its
 final aggregate flush), waits for the workers to finish, and tears down by RAII. There is **no live
 route hot-reload** — a config change needs a restart — and the component does **not** emit a
-`processor_health` metric today, despite the design doc anticipating one. Those are the two things the
+`processor_health` metric. Those are the two things the
 mental model should *not* assume exist.

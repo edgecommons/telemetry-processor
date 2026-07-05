@@ -155,7 +155,7 @@ the per-message **message view** plus the constant **runtime context**:
 | `header` | map | the envelope header — `name`, `version`, `timestamp`, `uuid`, `correlation_id`, `reply_to` |
 | `body` | map | the message body |
 | `tags` | map | the envelope `tags{}` (message metadata — *not* the signal) |
-| `identity` | map | the **source publisher's** UNS identity — `identity.device` / `identity.component` / `identity.instance` / `identity.path` (the `tags.thing` replacement); `()` when the message carries none |
+| `identity` | map | the **source publisher's** UNS identity — `identity.device` / `identity.component` / `identity.instance` / `identity.path`; `()` when the message carries none |
 | `samples` | array | `body.samples` (or `[]`) |
 | `value` | any | the first sample's `value` (scalar **or array**) |
 | `quality` | string | the first sample's `quality` |
@@ -170,7 +170,7 @@ the per-message **message view** plus the constant **runtime context**:
 > prefix is present), `identity.`, `tags.`, `header.`; a `[]` suffix on a segment spreads across an
 > array. Examples: `body.signal.id`, `body.samples[].quality`, `identity.device`, `tags.site`.
 > The `identity.` root (`identity.device` / `identity.component` / `identity.instance` /
-> `identity.path`) exposes the **source publisher's** UNS identity — the `tags.thing` replacement — so
+> `identity.path`) exposes the **source publisher's** UNS identity, so
 > a route can key/filter on which device or adapter produced a reading.
 
 ## Template variables
@@ -282,8 +282,8 @@ The processor is a first-class UNS/console citizen. Beyond the library-automatic
 ## Lifecycle
 
 > Routes are read **once at startup**. Changing the route topology (`component.instances[]`) requires
-> a component restart. The built-in `reload-config` verb hot-swaps the config snapshot, but the routes
-> are wired at startup, so a **dynamic route rebuild** (`reload-routes`) is a documented follow-up. Use
+> a component restart. The built-in `reload-config` verb hot-swaps the config snapshot but does not
+> rebuild the already-wired routes; there is no dynamic route rebuild. Use
 > `pause` / `resume` / `flush` to control the already-wired routes at runtime.
 
 > The component handles **SIGTERM** (and the platform shutdown signal): it aborts the metric emitter,

@@ -104,7 +104,7 @@ def update(signal_id, signal_name, value, quality="GOOD"):
     env = {
         "header": {"name": "SouthboundSignalUpdate", "version": "1.0"},
         # The UNS identity element: the SOURCE publisher (a simulated adapter on device gw-01).
-        # The device now lives here, not in tags.thing.
+        # The device lives in this identity element.
         "identity": {"hier": [{"level": "device", "value": "gw-01"}],
                      "path": "gw-01", "component": "sim-adapter", "instance": "inst1"},
         "tags":   {"site": "factory-1"},

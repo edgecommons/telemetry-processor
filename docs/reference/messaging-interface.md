@@ -69,29 +69,29 @@ The processor does not require a specific `header.name`: any JSON message that m
 
 - **The `identity` element** — the top-level UNS identity of the **publisher**: `hier` (the hierarchy
   levels, the last of which is the *device*), the precomputed `path`, the `component` token, and the
-  per-message `instance`. **This is where the source device lives** — the old `tags.thing` is
-  **removed**. Pipelines read it via the [`identity.` JSON path](#identity-json-path)
+  per-message `instance`. **This is where the source device lives.** Pipelines read it via the
+  [`identity.` JSON path](#identity-json-path)
   (`identity.device` / `identity.component` / `identity.instance` / `identity.path`) and scripts read
   the `identity` binding. This is the correct key for "which device/adapter produced this reading".
 - **Envelope `tags`** — the ggcommons message-envelope metadata map: an *open* set of key/values that
   ride on every message (`appId`, `site`, `shop`, `line`, or any custom key). Opaque business
   metadata: exposed to scripts as the `tags` binding, usable in topic templates, and landed by the
-  file sink's default projection in one JSON column. (A stray inbound `thing` key is now just an
-  ordinary tag — it is no longer special.)
+  file sink's default projection in one JSON column. (A `thing` key in `tags` is just an ordinary tag
+  with no special meaning.)
 - **The *signal*** — one southbound **data point** (an OPC UA node, a Modbus register, …) carried in
   `body.signal` (`{ id, name, address }`) with its readings in `body.samples[]`. Historically called
   a "tag" in the OPC UA / historian world; the ggcommons contract calls it a **signal**.
 
 <a id="identity-json-path"></a>
-### The `identity.` JSON path (the `tags.thing` replacement)
+### The `identity.` JSON path
 
 Filter `field`, aggregate/sample `by`, the route `key`, and stream `partitionKey` all take a dotted
-[key path](configuration.md#key-paths). Alongside `body.` / `tags.` / `header.` there is now an
+[key path](configuration.md#key-paths). Alongside `body.` / `tags.` / `header.` there is also an
 `identity.` root exposing the source publisher's UNS identity:
 
 | Path | Value |
 |------|-------|
-| `identity.device` | the source device (last hierarchy value) — the `tags.thing` replacement |
+| `identity.device` | the source device (last hierarchy value) |
 | `identity.component` | the source component token (e.g. `opcua-adapter`) |
 | `identity.instance` | the source per-message instance token |
 | `identity.path` | the `/`-joined hierarchy values |
@@ -160,23 +160,20 @@ The output target is per route (`target`). Route outputs must land on a non-rese
   `stream-unavailable` `evt` fires), never propagated — use a durable `stream:` target for no-loss
   output.
 
-> **Why this dispatch stays on `messaging()`/`streams()` instead of the `data()` facade.** The
+> **Why this dispatch uses `messaging()`/`streams()` rather than the `data()` facade.** The
 > `ggcommons` library's `data()` publish facade (`gg.instance(id).data()`) is the right tool for a
 > southbound adapter minting a **fresh** `SouthboundSignalUpdate` from a protocol read — it owns
 > topic minting (always under *its own* bound identity), the `SouthboundSignalUpdate` header, and
 > quality/timestamp defaulting. This dispatcher instead **republishes an already-built message**
 > that may not be southbound-shaped at all (the processor is payload-agnostic, above) and — for
 > `local`/`northbound` — defaults to the exact **source topic** (a deliberate bridging behavior the
-> `alarms-northbound` sample relies on). Routing that through `data()` would silently change the
-> published topic and force a header/body shape the processor does not require. So the dispatcher
-> keeps this lower-level path — exactly what
-> [`DESIGN-class-facades.md`](https://github.com/edgecommons/ggcommons/blob/main/docs/platform/DESIGN-class-facades.md)
-> §7.2 anticipated ("the facade must not fight the restamp; likely the processor keeps a lower-level
-> path here"). The route `target` itself **is** the library's own `ggcommons::facades::Channel`
-> (`local` | `northbound` | `stream:<name>`) rather than a bespoke processor type, so the routing
-> *vocabulary* is shared even though the dispatch mechanics are not. `evt` health events (above) DID
-> migrate onto the matching facade (`events()`), since there the facade's identity/topic/body
-> ownership matches exactly what the processor needs.
+> `alarms-northbound` sample relies on). Routing that through `data()` would change the
+> published topic and force a header/body shape the processor does not require, so the dispatcher
+> uses the lower-level path. The route `target` itself **is** the library's own
+> `ggcommons::facades::Channel` (`local` | `northbound` | `stream:<name>`) rather than a bespoke
+> processor type, so the routing *vocabulary* is shared even though the dispatch mechanics are not.
+> `evt` health events (above) use the matching `events()` facade, where the facade's
+> identity/topic/body ownership matches exactly what the processor needs.
 
 ## Aggregate output (`ProcessedTelemetry`)
 
@@ -229,9 +226,8 @@ automatically by the library). A `cmd` request whose `header.reply_to` is set ge
 | `resume` | `{ "route"? }` | the inverse of `pause` → `{ "resumed": [ids] }` |
 
 > **Known limitation.** The built-in `reload-config` hot-swaps the config snapshot but the routes are
-> wired once at startup, so a route topology change needs a component restart (a dynamic
-> `reload-routes` rebuild is a documented follow-up). `pause`/`resume` and `flush` operate on the
-> already-wired routes.
+> wired once at startup, so a route topology change needs a component restart; there is no dynamic
+> route rebuild. `pause`/`resume` and `flush` operate on the already-wired routes.
 
 ## Events (`evt`)
 

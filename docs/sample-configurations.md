@@ -89,7 +89,7 @@ to 0 or 1, an `aggregate` accumulates and emits on window close, the rest pass 1
 Scripts run in the route's `scriptEngine` — `rhai` (default, always compiled in) or `lua` (needs the
 `scripting-lua` build); the scope and return contract are **identical** in both engines. A
 `filter`/`script` scope exposes `topic` (string), `body`/`tags`/`identity` (maps — `identity` is the
-source publisher's UNS identity, the `tags.thing` replacement), `samples` (array), and the convenience
+source publisher's UNS identity), `samples` (array), and the convenience
 bindings `value`/`quality` (the first sample's). The engine is bounded (Rhai `max_operations =
 1_000_000` / the equivalent Lua instruction budget) to deter runaway scripts.
 
@@ -265,7 +265,7 @@ value), the full reducer set under `agg`, and a `window` block (`{ startMs, endM
 | `sink.format: "parquet"` | Output encoding — `parquet` (default, columnar, query-ready, best compression + column pruning) or `avro` (§10). |
 | `sink.mode: "rows"` | `rows` flattens each `SouthboundSignalUpdate` / `ProcessedTelemetry` sample into one **typed** row (sparse `valueDouble`/`valueLong`/`valueBool`/`valueString` columns + a `valueType` discriminator, plus `site`/`shop`/`line`/`adapter`/`signalId`/`signalName`/`quality`/`sourceTs`/`serverTs`). A payload that is **not** a southbound-shaped envelope is **never dropped** — it lands in a sibling `_unmapped` **raw** file. |
 | `sink.dir` | Output directory root (template vars like `{ThingName}` resolved by the library). Finalized files are written under `<dir>/<partitionBy>/`. |
-| `sink.partitionBy` | Hive-style partition sub-path appended to `dir`. UTC time tokens `{yyyy}` / `{MM}` / `{dd}` / `{HH}` and the compound `{yyyy-MM-dd}` are resolved **per file at roll time** → `dt=2026-06-30/hr=14/`. (Per-message-field partition directories are a deferral; `site`/`adapter` ride as columns today.) |
+| `sink.partitionBy` | Hive-style partition sub-path appended to `dir`. UTC time tokens `{yyyy}` / `{MM}` / `{dd}` / `{HH}` and the compound `{yyyy-MM-dd}` are resolved **per file at roll time** → `dt=2026-06-30/hr=14/`. (Per-message-field partition directories are not supported; `site`/`adapter` ride as columns.) |
 | `sink.maxFileBytes` | Roll a new file once the current one **would exceed** this many bytes (default `134217728` = 128 MiB — large enough to avoid the analytics "small files" problem). **Soft cap:** it is checked at row-group granularity, so a finalized Parquet file can exceed `maxFileBytes` by up to one row group plus the footer. For tight files, keep `batch.maxBytes` well **below** `maxFileBytes` so each appended batch is small relative to the roll threshold. |
 | `sink.maxFiles` | Ring cap on finalized files under `dir` (`0` = unbounded). When exceeded, `onFull` applies. `64` here bounds the archive footprint to ~64 files. |
 | `sink.rollEverySecs` | Force a roll after this many seconds (evaluated on the next send, not a wall-clock interrupt). `300` caps the open-file window at 5 min — which also bounds Parquet hard-crash loss (§ durability). `0` disables time-based rolling (size-only, see §3). |
@@ -717,7 +717,7 @@ processed independently by each route's pipeline and target.
 When the built-in operators don't fit, drop to a script. A `filter` `script` is a boolean predicate; a
 `script` stage returns a new body (or `()`/`nil` to drop). Both run in the route's `scriptEngine` —
 `rhai` (default) or `lua` (the `scripting-lua` build) — and see the same scope: `topic`, `body`,
-`tags`, `identity` (the source publisher's UNS identity, the `tags.thing` replacement), `samples`, and
+`tags`, `identity` (the source publisher's UNS identity), `samples`, and
 the convenience bindings `value`/`quality` (the first sample's). The example below is Rhai; see the
 [Scripting guide](scripting.mdx) for the Lua equivalents.
 
@@ -744,7 +744,7 @@ the convenience bindings `value`/`quality` (the first sample's). The example bel
 |-------|----------------------------|
 | `filter.script` | An arbitrary Rhai boolean over the message view. Here it keeps a message only when **every** sample is GOOD **and** under 100.0 — a compound condition the `field`/`op`/`value` form can't express in one step. An eval error (or a non-boolean result) drops the message and is logged. |
 | `script` (transform) | Replaces the body with the map the script returns (Rhai object syntax `#{ … }`). This one rescales the first value (`value * 0.1`) and reshapes the body, carrying `signal`, `quality`, and the source `topic` through. Returning `()` instead drops the message. A result that can't convert to JSON drops it (logged). |
-| Scope bindings | `value`/`quality` are the **first** sample's; use `samples` (the full array) for multi-sample logic. `tags` exposes the envelope business tags (`tags.site`); `identity` exposes the source publisher (`identity.device` / `identity.component` — the `tags.thing` replacement). |
+| Scope bindings | `value`/`quality` are the **first** sample's; use `samples` (the full array) for multi-sample logic. `tags` exposes the envelope business tags (`tags.site`); `identity` exposes the source publisher (`identity.device` / `identity.component`). |
 | Engine bound | The shared engine caps operations per evaluation (`max_operations = 1_000_000`) so a pathological script can't stall the route worker. |
 
 > Built-in stages compile to a fixed closure once at startup (no per-message parsing); a Rhai stage
@@ -803,8 +803,8 @@ cargo run --features standalone,streaming,streaming-file-avro -- --platform HOST
 Nothing about the processor requires the `SouthboundSignalUpdate` shape. This example ingests a
 **non-southbound** sensor body, normalizes it with an **external `.rhai` script file**, aggregates a
 custom `value` path, and archives the rollup through a **declared file projection** — so neither the
-script nor the file schema assumes a signal shape. It exercises every "v2" lever at once: on-by-default
-features, a payload-agnostic pipeline, scripts that live in version-controlled files, and a
+script nor the file schema assumes a signal shape. It exercises the payload-agnostic levers at once:
+on-by-default features, a payload-agnostic pipeline, scripts that live in version-controlled files, and a
 caller-declared Parquet schema.
 
 Incoming bus message (no `body.signal`, no `body.samples`):

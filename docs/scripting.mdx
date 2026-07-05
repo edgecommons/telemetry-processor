@@ -88,7 +88,7 @@ script runs).
 | `header` | map | the envelope header — `header.name` (message type), `header.version`, `header.timestamp` (RFC3339, publisher time), `header.uuid`, `header.correlation_id`, `header.reply_to` |
 | `body` | map | the full message body — `body.signal`, `body.samples`, or *any* JSON your payload carries |
 | `tags` | map | the message-**envelope** business metadata (`tags.site`, `tags.appId`, …) — **not** the signal, and **not** the device (see `identity`) |
-| `identity` | map | the **source publisher's** UNS identity — `identity.device`, `identity.component`, `identity.instance`, `identity.path` (the `tags.thing` replacement); `()` when the message carries none |
+| `identity` | map | the **source publisher's** UNS identity — `identity.device`, `identity.component`, `identity.instance`, `identity.path`; `()` when the message carries none |
 | `samples` | array | `body.samples` (or empty); each element has `value`, `quality`, `sourceTs`, … |
 | `value` | any | the **first** sample's `value` (number, string, bool, **or array**) |
 | `quality` | string | the **first** sample's `quality` |
@@ -99,8 +99,8 @@ script runs).
 | `recvMs` | integer | this message's broker receive time (Unix ms) |
 
 The *whole* message (`header`, `body`, `tags`, `identity`) is in scope, so you can branch on the
-message type, on the **source** device/adapter (`identity.device` / `identity.component` — the
-`tags.thing` replacement), carry a source id for dedup/tracing, or compare the publisher timestamp
+message type, on the **source** device/adapter (`identity.device` / `identity.component`), carry a
+source id for dedup/tracing, or compare the publisher timestamp
 against `recvMs`. `body` always holds whatever arrived, so **a script is payload-agnostic** — read your
 own paths off `body`. (Note: `thingName`/`componentName` in the runtime context are the **processor's
 own** identity; `identity.*` is the **source publisher's**.)
