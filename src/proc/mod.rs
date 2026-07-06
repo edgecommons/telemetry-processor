@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use ggcommons::messaging::message::Message;
+use edgecommons::messaging::message::Message;
 use rhai::Engine;
 use smallvec::SmallVec;
 
@@ -131,7 +131,7 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::config::{AggregateSpec, FilterSpec, SampleSpec, StageConfig};
-    use ggcommons::messaging::message::MessageBuilder;
+    use edgecommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     fn engine() -> Arc<Engine> {

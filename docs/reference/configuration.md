@@ -7,7 +7,7 @@ configs, see [sample-configurations.md](../sample-configurations.md). The topic/
 
 ## Config source & CLI
 
-The component reads one JSON document from the `-c/--config` source and parses the standard ggcommons
+The component reads one JSON document from the `-c/--config` source and parses the standard edgecommons
 CLI contract; the source and transport default by platform.
 
 | Flag | Values | Notes |
@@ -24,7 +24,7 @@ CLI contract; the source and transport default by platform.
 | `KUBERNETES` | `CONFIGMAP` | `MQTT` |
 
 Route settings live under `component`; the sibling sections (`tags`, `messaging`, `streaming`,
-`logging`, `heartbeat`, `metricEmission`) are standard ggcommons sections.
+`logging`, `heartbeat`, `metricEmission`) are standard edgecommons sections.
 
 ## Top-level sections
 
@@ -34,7 +34,7 @@ Route settings live under `component`; the sibling sections (`tags`, `messaging`
 | `tags` | recommended | Site/asset identity (`appId`/`site`/`shop`/`line`); attached to messages and usable as topic template variables. |
 | `messaging` | HOST/KUBERNETES | MQTT broker connection (or supply via `--transport MQTT <file>`). On GREENGRASS the transport is IPC. |
 | `streaming` | only for `stream:` targets | Named durable streams + their sinks (kinesis/kafka/**file**), below. |
-| `logging`, `heartbeat`, `metricEmission` | optional | Standard ggcommons sections. |
+| `logging`, `heartbeat`, `metricEmission` | optional | Standard edgecommons sections. |
 
 ## `component.global.defaults`
 
@@ -188,7 +188,7 @@ config):
 
 Required when any route targets `stream:<name>`. Each stream pairs a **sink** with a durable
 **buffer** and **batch**/**delivery** tuning; the route appends records, the export engine drains them
-to the sink. `buffer`, `batch`, and `delivery` are the standard ggcommons streaming options (see the
+to the sink. `buffer`, `batch`, and `delivery` are the standard edgecommons streaming options (see the
 [telemetry-streaming](../explanation.md) design) — summarized here:
 
 | Block | Key fields (defaults) | Meaning |

@@ -28,7 +28,7 @@ Run everything from the repository root.
 The HOST platform talks to a plain MQTT broker instead of Greengrass IPC. Start the bundled EMQX:
 
 ```bash
-docker compose -f ../ggcommons/test-infra/compose.yaml up -d
+docker compose -f ../core/test-infra/compose.yaml up -d
 ```
 
 This gives you a broker on `localhost:1883` (plaintext) — exactly the address in
@@ -45,7 +45,7 @@ cargo run --features standalone,streaming,streaming-file-parquet -- \
   -t my-thing
 ```
 
-The flags are the standard ggcommons CLI contract: `--platform HOST` (laptop, not Greengrass),
+The flags are the standard edgecommons CLI contract: `--platform HOST` (laptop, not Greengrass),
 `--transport MQTT <messaging>` (the broker connection), `-c FILE <config>` (the component config),
 and `-t my-thing` (the Thing name, which fills the `{ThingName}` template).
 
@@ -203,4 +203,4 @@ the [messaging-interface reference](reference/messaging-interface.md#command-ver
 - Understand the pipeline and durability model: [explanation](explanation.md).
 - Every field, every default: [configuration reference](reference/configuration.md).
 
-To tear down the broker when you're done: `docker compose -f ../ggcommons/test-infra/compose.yaml down`.
+To tear down the broker when you're done: `docker compose -f ../core/test-infra/compose.yaml down`.

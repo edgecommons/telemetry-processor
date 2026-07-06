@@ -8,7 +8,7 @@
 //! surfaced as an [`EvtEmitter`] `evt` (via the library's `events()` facade).
 //!
 //! ## Why this dispatcher does not route through `data()`
-//! `ggcommons::facades::DataFacade` (the `data()` facade) is a great fit for a southbound adapter
+//! `edgecommons::facades::DataFacade` (the `data()` facade) is a great fit for a southbound adapter
 //! that mints a **fresh** `SouthboundSignalUpdate` from a protocol read (DESIGN-class-facades §2.1).
 //! It is a poor fit for *this* dispatcher, which republishes an **already-built, possibly
 //! non-southbound-shaped** [`Message`] (the processor is deliberately payload-agnostic — see
@@ -39,9 +39,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ggcommons::facades::Channel;
-use ggcommons::messaging::message::{Message, MessageIdentity};
-use ggcommons::messaging::{MessagingService, Qos};
+use edgecommons::facades::Channel;
+use edgecommons::messaging::message::{Message, MessageIdentity};
+use edgecommons::messaging::{MessagingService, Qos};
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
@@ -70,7 +70,7 @@ pub struct Dispatcher {
     /// identity, instance = route id) — see the module docs. Always `None` for non-`local` targets.
     restamp: Option<MessageIdentity>,
     #[cfg(feature = "streaming")]
-    stream: Option<ggcommons::streaming::StreamHandle>,
+    stream: Option<edgecommons::streaming::StreamHandle>,
 }
 
 impl Dispatcher {
@@ -84,7 +84,7 @@ impl Dispatcher {
         stats: Arc<RouteStats>,
         evt: Arc<EvtEmitter>,
         restamp: Option<MessageIdentity>,
-        #[cfg(feature = "streaming")] stream: Option<ggcommons::streaming::StreamHandle>,
+        #[cfg(feature = "streaming")] stream: Option<edgecommons::streaming::StreamHandle>,
     ) -> Self {
         let qos = match publish.qos.as_deref() {
             Some(q) if q.eq_ignore_ascii_case("atMostOnce") => Qos::AtMostOnce,
@@ -169,7 +169,7 @@ impl Dispatcher {
                 return;
             }
         };
-        match handle.append(ggcommons::streaming::StreamRecord::new(pk, recv_ms, payload)) {
+        match handle.append(edgecommons::streaming::StreamRecord::new(pk, recv_ms, payload)) {
             Ok(()) => {
                 self.stats.stream_appends.fetch_add(1, Ordering::Relaxed);
             }

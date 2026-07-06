@@ -4,9 +4,9 @@ The topic/message contract: what the processor subscribes to, what it publishes,
 configuration of routes and targets see [configuration.md](configuration.md); for value typing see
 [data-types.md](data-types.md); for the design rationale see [explanation.md](../explanation.md).
 
-The processor is a **transform-and-forward** stage on the ggcommons **Unified Namespace (UNS)**: it
+The processor is a **transform-and-forward** stage on the edgecommons **Unified Namespace (UNS)**: it
 subscribes to the fleet's telemetry (the `data` class), runs a per-route pipeline, and forwards each
-result to one target. It is also — for free from the ggcommons library — a first-class **command**
+result to one target. It is also — for free from the edgecommons library — a first-class **command**
 citizen: it answers the built-in `cmd` verbs and its own custom verbs (see [Command
 verbs](#command-verbs)), publishes `evt` health events, and emits a `metric` throughput metric.
 
@@ -15,7 +15,7 @@ verbs](#command-verbs)), publishes `evt` health events, and emits a `metric` thr
 Every UNS topic is `ecv1/{device}/{component}/{instance}/{class}[/channel]` (rootless; a `site`
 position appears between `ecv1` and `{device}` only under a multi-level `hierarchy` with
 `topic.includeRoot`). The processor's own token is `telemetry-processor` (the sanitized short name
-after the last `.` of `com.mbreissi.telemetry-processor`), so it lives at
+after the last `.` of `com.mbreissi.edgecommons.TelemetryProcessor`), so it lives at
 `ecv1/{device}/telemetry-processor/{instance}/{class}[/channel]`.
 
 The **eight classes**, and how the processor uses each:
@@ -40,7 +40,7 @@ The **eight classes**, and how the processor uses each:
 
 ## Envelope
 
-All messages use the ggcommons UNS JSON envelope — `{ header, identity, tags, body }` — the same
+All messages use the edgecommons UNS JSON envelope — `{ header, identity, tags, body }` — the same
 envelope the adapters publish:
 
 ```jsonc
@@ -73,14 +73,14 @@ The processor does not require a specific `header.name`: any JSON message that m
   [`identity.` JSON path](#identity-json-path)
   (`identity.device` / `identity.component` / `identity.instance` / `identity.path`) and scripts read
   the `identity` binding. This is the correct key for "which device/adapter produced this reading".
-- **Envelope `tags`** — the ggcommons message-envelope metadata map: an *open* set of key/values that
+- **Envelope `tags`** — the edgecommons message-envelope metadata map: an *open* set of key/values that
   ride on every message (`appId`, `site`, `shop`, `line`, or any custom key). Opaque business
   metadata: exposed to scripts as the `tags` binding, usable in topic templates, and landed by the
   file sink's default projection in one JSON column. (A `thing` key in `tags` is just an ordinary tag
   with no special meaning.)
 - **The *signal*** — one southbound **data point** (an OPC UA node, a Modbus register, …) carried in
   `body.signal` (`{ id, name, address }`) with its readings in `body.samples[]`. Historically called
-  a "tag" in the OPC UA / historian world; the ggcommons contract calls it a **signal**.
+  a "tag" in the OPC UA / historian world; the edgecommons contract calls it a **signal**.
 
 <a id="identity-json-path"></a>
 ### The `identity.` JSON path
@@ -148,7 +148,7 @@ The output target is per route (`target`). Route outputs must land on a non-rese
 |----------|-------------|-------------|----------------|
 | `local` | local bus | `publish.topic` (default = the source topic); identity restamped to the processor | `publish(topic, msg)` |
 | `northbound` | AWS IoT Core / northbound MQTT | `publish.topic` (default = the source topic), QoS from `publish.qos` | `publish_to_iot_core(topic, msg, qos)` |
-| `stream:<name>` | a ggcommons durable stream | partition key from `publish.partitionKey` (default = the route `key`, i.e. `body.signal.id`) | `streams().stream(name).append(record)` |
+| `stream:<name>` | a edgecommons durable stream | partition key from `publish.partitionKey` (default = the route `key`, i.e. `body.signal.id`) | `streams().stream(name).append(record)` |
 
 - Set an explicit `publish.topic` to a UNS `data`/`evt`/`app` topic template, e.g.
   `ecv1/{ThingName}/telemetry-processor/main/data/downsampled` or
@@ -161,7 +161,7 @@ The output target is per route (`target`). Route outputs must land on a non-rese
   output.
 
 > **Why this dispatch uses `messaging()`/`streams()` rather than the `data()` facade.** The
-> `ggcommons` library's `data()` publish facade (`gg.instance(id).data()`) is the right tool for a
+> `edgecommons` library's `data()` publish facade (`gg.instance(id).data()`) is the right tool for a
 > southbound adapter minting a **fresh** `SouthboundSignalUpdate` from a protocol read — it owns
 > topic minting (always under *its own* bound identity), the `SouthboundSignalUpdate` header, and
 > quality/timestamp defaulting. This dispatcher instead **republishes an already-built message**
@@ -170,7 +170,7 @@ The output target is per route (`target`). Route outputs must land on a non-rese
 > `alarms-northbound` sample relies on). Routing that through `data()` would change the
 > published topic and force a header/body shape the processor does not require, so the dispatcher
 > uses the lower-level path. The route `target` itself **is** the library's own
-> `ggcommons::facades::Channel` (`local` | `northbound` | `stream:<name>`) rather than a bespoke
+> `edgecommons::facades::Channel` (`local` | `northbound` | `stream:<name>`) rather than a bespoke
 > processor type, so the routing *vocabulary* is shared even though the dispatch mechanics are not.
 > `evt` health events (above) use the matching `events()` facade, where the facade's
 > identity/topic/body ownership matches exactly what the processor needs.
@@ -231,7 +231,7 @@ automatically by the library). A `cmd` request whose `header.reply_to` is set ge
 
 ## Events (`evt`)
 
-The processor publishes rate-limited health events through the `ggcommons` `events()` publish facade
+The processor publishes rate-limited health events through the `edgecommons` `events()` publish facade
 (`gg.events()`, bound to the `main` instance) on
 `ecv1/{device}/telemetry-processor/main/evt/{severity}/{type}` (a non-reserved class; subscribe the
 fleet with `ecv1/+/+/+/evt/#`). The facade derives the channel from the body's own `severity`/`type`

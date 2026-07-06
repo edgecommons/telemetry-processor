@@ -1,7 +1,7 @@
 # Reference — Data Types
 
 How telemetry values are represented once a route forwards them to a **file** sink (`stream:<name>`
-whose stream has a `file` sink). The file sink lives in the shared `ggstreamlog` core; it writes one
+whose stream has a `file` sink). The file sink lives in the shared `edgestreamlog` core; it writes one
 of two schemas per [`mode`](configuration.md#file-sink-sinktype-file), and `rows` mode has two
 **projections** — a built-in default and a config-declared one. For the on-wire envelope see
 [messaging-interface.md](messaging-interface.md); for config see [configuration.md](configuration.md).
@@ -41,7 +41,7 @@ The columns, **in file order**:
 | `tsMs` | int64 (**non-null**) | stream record timestamp (Unix ms) — the processor's receive time |
 | `offset` | int64 (**non-null**) | the durable-buffer record offset |
 
-> **The envelope `tags` are one JSON column, not fixed columns.** The ggcommons message-envelope
+> **The envelope `tags` are one JSON column, not fixed columns.** The edgecommons message-envelope
 > `tags` is an *open* metadata map — a deployment may carry `site`/`shop`/`line`, or an entirely
 > different set (the source device is **not** here — it travels in the top-level `identity`
 > element). Rather than freezing those into named columns, the default projection lands

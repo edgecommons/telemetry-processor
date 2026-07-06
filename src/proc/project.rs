@@ -57,7 +57,7 @@ impl Processor for ProjectStage {
 mod tests {
     use super::*;
     use crate::proc::now_ms;
-    use ggcommons::messaging::message::MessageBuilder;
+    use edgecommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     fn msg() -> ProcMsg {

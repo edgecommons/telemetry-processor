@@ -1,6 +1,6 @@
 # The Docker image is built from THIS repo only (no sibling checkout): cargo fetches the pinned
-# ggcommons git rev over SSH. Exclude the LOCAL-DEV sibling override (`.cargo/config.toml` `[patch]`
-# → ../ggcommons/libs/rust) and the local lock so they never enter the build context — otherwise the
+# edgecommons git rev over SSH. Exclude the LOCAL-DEV sibling override (`.cargo/config.toml` `[patch]`
+# → ../core/libs/rust) and the local lock so they never enter the build context — otherwise the
 # in-container build would try to resolve a sibling path that does not exist.
 .cargo/
 Cargo.lock

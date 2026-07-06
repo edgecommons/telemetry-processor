@@ -1,4 +1,4 @@
-//! # Minimal JSON-path resolver over a ggcommons [`Message`]
+//! # Minimal JSON-path resolver over a edgecommons [`Message`]
 //!
 //! Used by the filter / aggregate / project stages and the stream partition-key extractor to pull
 //! values out of a message by a dotted path. Path roots: `body.` (the default when no known root
@@ -13,10 +13,10 @@
 //! `identity.path`, and `identity.hier[].level` / `identity.hier[].value` — for keying, filtering,
 //! or provenance on who produced the message. (A stray inbound `tags.thing` is now an ordinary tag.)
 
-use ggcommons::messaging::message::Message;
+use edgecommons::messaging::message::Message;
 use serde_json::{json, Value};
 
-/// Build the JSON view of a message's [`ggcommons::messaging::message::MessageIdentity`] used by
+/// Build the JSON view of a message's [`edgecommons::messaging::message::MessageIdentity`] used by
 /// both the `identity.` json-path root and the script `identity` binding: the wire fields
 /// (`hier`/`path`/`component`/`instance`) plus the computed `device` (the last hierarchy value,
 /// which is not a serialized wire field). `Value::Null` when the message carries no identity.
@@ -114,7 +114,7 @@ fn walk(v: &Value, path: &str, acc: &mut Vec<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggcommons::messaging::message::{HierEntry, MessageBuilder, MessageIdentity};
+    use edgecommons::messaging::message::{HierEntry, MessageBuilder, MessageIdentity};
     use serde_json::json;
 
     fn sample_msg() -> Message {

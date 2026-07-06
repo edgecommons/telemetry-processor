@@ -72,7 +72,7 @@ impl Processor for SampleStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggcommons::messaging::message::MessageBuilder;
+    use edgecommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     fn msg(signal: &str, recv_ms: u64) -> ProcMsg {

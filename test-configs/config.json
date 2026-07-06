@@ -1,10 +1,19 @@
 {
-  "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+  "logging": {
+    "level": "INFO",
+    "rust_format": "{timestamp} [{level}] {target} - {message}"
+  },
   "heartbeat": {
     "intervalSecs": 10,
-    "measures": { "cpu": true, "memory": true }
+    "measures": {
+      "cpu": true,
+      "memory": true
+    }
   },
-  "metricEmission": { "target": "messaging", "namespace": "ggcommons" },
+  "metricEmission": {
+    "target": "messaging",
+    "namespace": "edgecommons"
+  },
   "streaming": {
     "streams": [
       {
@@ -21,36 +30,90 @@
           "onFull": "dropOldest",
           "compression": "snappy"
         },
-        "buffer": { "path": "./out/stream-archive", "segmentBytes": 1048576, "maxDiskBytes": 67108864, "onFull": "dropOldest" },
-        "batch": { "maxRecords": 500, "maxBytes": 1048576, "maxLatencyMs": 2000 },
-        "delivery": { "pollIntervalMs": 500 }
+        "buffer": {
+          "path": "./out/stream-archive",
+          "segmentBytes": 1048576,
+          "maxDiskBytes": 67108864,
+          "onFull": "dropOldest"
+        },
+        "batch": {
+          "maxRecords": 500,
+          "maxBytes": 1048576,
+          "maxLatencyMs": 2000
+        },
+        "delivery": {
+          "pollIntervalMs": 500
+        }
       }
     ]
   },
-  "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
+  "tags": {
+    "appId": "Demo",
+    "site": "factory-1",
+    "shop": "shopA",
+    "line": "line1"
+  },
   "component": {
-    "global": { "defaults": { "key": "body.signal.id" } },
+    "global": {
+      "defaults": {
+        "key": "body.signal.id"
+      }
+    },
     "instances": [
       {
         "id": "downsample-local",
-        "subscribe": [ "ecv1/+/+/+/data/#" ],
+        "subscribe": [
+          "ecv1/+/+/+/data/#"
+        ],
         "pipeline": [
-          { "filter": { "quality": "GOOD" } },
-          { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
+          {
+            "filter": {
+              "quality": "GOOD"
+            }
+          },
+          {
+            "sample": {
+              "everyMs": 1000,
+              "by": "body.signal.id"
+            }
+          }
         ],
         "target": "local",
-        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" }
+        "publish": {
+          "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled"
+        }
       },
       {
         "id": "archive",
-        "subscribe": [ "ecv1/+/+/+/data/#" ],
+        "subscribe": [
+          "ecv1/+/+/+/data/#"
+        ],
         "pipeline": [
-          { "filter": { "quality": "GOOD" } },
-          { "aggregate": { "window": "5s", "by": "body.signal.id", "fn": ["avg", "max", "min", "count", "last"] } }
+          {
+            "filter": {
+              "quality": "GOOD"
+            }
+          },
+          {
+            "aggregate": {
+              "window": "5s",
+              "by": "body.signal.id",
+              "fn": [
+                "avg",
+                "max",
+                "min",
+                "count",
+                "last"
+              ]
+            }
+          }
         ],
         "target": "stream:archive",
-        "publish": { "partitionKey": "body.signal.id" }
+        "publish": {
+          "partitionKey": "body.signal.id"
+        }
       }
-    ]
+    ],
+    "token": "telemetry-processor"
   }
 }

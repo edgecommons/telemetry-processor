@@ -150,7 +150,7 @@ mod tests {
     use super::*;
     use crate::config::ScriptSource;
     use crate::proc::now_ms;
-    use ggcommons::messaging::message::MessageBuilder;
+    use edgecommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     fn msg(samples: Value) -> ProcMsg {

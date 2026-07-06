@@ -9,7 +9,7 @@
 //!   by the fan-out handler and the route [`crate::proc::route::Dispatcher`], read by the
 //!   `get-stats` command and the metric emitter.
 //! - [`EvtEmitter`] — a rate-limited publisher of the processor's own **`evt`** events, now a thin
-//!   wrapper over the library's [`ggcommons::facades::EventsFacade`] (`gg.events()`, bound to the
+//!   wrapper over the library's [`edgecommons::facades::EventsFacade`] (`gg.events()`, bound to the
 //!   `main` instance): the facade owns the `evt/{severity}/{type}` channel derivation, the body
 //!   contract (`severity`/`type`/`message`/`timestamp`/`context`), and the envelope/identity
 //!   stamping — this migration is exactly what `docs/platform/DESIGN-class-facades.md` §1.2 calls
@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ggcommons::config::model::Config;
-use ggcommons::facades::{EventsFacade, Severity};
-use ggcommons::metrics::{MetricBuilder, MetricService};
+use edgecommons::config::model::Config;
+use edgecommons::facades::{EventsFacade, Severity};
+use edgecommons::metrics::{MetricBuilder, MetricService};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 

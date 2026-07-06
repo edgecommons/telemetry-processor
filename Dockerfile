@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1
 #
-# Build the telemetry-processor from source. Its `ggcommons` dependency is a git dependency on the
-# private edgecommons/ggcommons repo, so the build needs SSH access to GitHub. Build with BuildKit and
+# Build the telemetry-processor from source. Its `edgecommons` dependency is a git dependency on the
+# private edgecommons/edgecommons repo, so the build needs SSH access to GitHub. Build with BuildKit and
 # forward your SSH agent (or a CI deploy key):
 #
 #   DOCKER_BUILDKIT=1 docker build --ssh default \
 #     --build-arg FEATURES=standalone,streaming,streaming-file-parquet \
 #     -t telemetry-processor:dev .
 #
-# This builds from THIS repo only — no sibling checkout required (cargo fetches ggcommons over SSH).
+# This builds from THIS repo only — no sibling checkout required (cargo fetches edgecommons over SSH).
 ARG RUST_VERSION=1.85
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG FEATURES=standalone,streaming,streaming-file-parquet
@@ -17,7 +17,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 # Trust github.com for the SSH fetch. The local-dev `.cargo/config.toml` (which carried the
 # git-fetch-with-cli setting AND the sibling `[patch]`) is gitignored + dockerignored, so the
-# in-container build resolves the pinned ggcommons git rev — force the git CLI transport here so it
+# in-container build resolves the pinned edgecommons git rev — force the git CLI transport here so it
 # uses the forwarded SSH agent (libgit2 cannot).
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null

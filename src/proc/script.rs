@@ -379,11 +379,11 @@ mod lua {
 mod tests {
     use super::*;
     use crate::proc::now_ms;
-    use ggcommons::messaging::message::MessageBuilder;
+    use edgecommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     fn pm(body: Value) -> ProcMsg {
-        use ggcommons::messaging::message::{HierEntry, MessageIdentity};
+        use edgecommons::messaging::message::{HierEntry, MessageIdentity};
         // Source identity: device `thing-1` (the `tags.thing` replacement, exposed as `identity`).
         let identity = MessageIdentity::new(
             vec![HierEntry { level: "device".into(), value: "thing-1".into() }],

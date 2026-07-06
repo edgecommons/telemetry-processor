@@ -1,6 +1,6 @@
 {
   "component": {
-    "com.mbreissi.telemetry-processor": {
+    "com.mbreissi.edgecommons.TelemetryProcessor": {
       "author": "Marc Breissinger",
       "version": "NEXT_PATCH",
       "build": {

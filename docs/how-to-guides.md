@@ -330,7 +330,7 @@ Three independent rotation levers:
 ```jsonc
 "streaming": { "streams": [
   { "name": "hot",
-    "sink": { "type": "kinesis", "streamName": "ggcommons-telemetry-hot", "region": "us-east-1" },
+    "sink": { "type": "kinesis", "streamName": "edgecommons-telemetry-hot", "region": "us-east-1" },
     "buffer": { "path": "/data/stream-hot", "segmentBytes": 4194304, "maxDiskBytes": 268435456, "onFull": "dropOldest" } }
 ] }
 ```
@@ -464,9 +464,9 @@ cargo build --release --features standalone,streaming,streaming-file-parquet
 then deploy with the recipe:
 
 ```bash
-GGCOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
+EDGECOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
 greengrass-cli deployment create --recipeDir . --artifactDir ./artifacts \
-  --merge "com.mbreissi.telemetry-processor=1.0.0"
+  --merge "com.mbreissi.edgecommons.TelemetryProcessor=1.0.0"
 # recipe Run: telemetry-processor --platform GREENGRASS -c GG_CONFIG
 ```
 

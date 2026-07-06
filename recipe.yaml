@@ -1,6 +1,6 @@
 ---
 RecipeFormatVersion: "2020-01-25"
-ComponentName: "com.mbreissi.telemetry-processor"
+ComponentName: "com.mbreissi.edgecommons.TelemetryProcessor"
 ComponentVersion: "1.0.0"
 ComponentDescription: "Reference Rust processing component: subscribes to local telemetry topics, runs a per-route filter/sample/aggregate/project/Rhai pipeline, and forwards to local / northbound MQTT / a durable stream (Kinesis / Kafka / rolling Parquet-AVRO files)."
 ComponentPublisher: "Marc Breissinger"
@@ -25,7 +25,7 @@ ComponentConfiguration:
       # `ecv1/+/+/+/metric/#`). Switch to `log` + a `targetConfig.logFileName` for a local file.
       metricEmission:
         target: "messaging"
-        namespace: "ggcommons"
+        namespace: "edgecommons"
       # Durable streams the routes forward to. The `archive` stream lands rolling Parquet files for
       # later bulk upload; `hot` exports aggregates to Kinesis. Inert unless the matching sink
       # feature is built in (streaming-file-parquet / streaming-kinesis).
@@ -57,7 +57,7 @@ ComponentConfiguration:
           - name: "hot"
             sink:
               type: "kinesis"
-              streamName: "ggcommons-telemetry-hot"
+              streamName: "edgecommons-telemetry-hot"
               region: "us-east-1"
             buffer:
               path: "/greengrass/v2/work/{ComponentFullName}/stream-hot"
@@ -103,7 +103,7 @@ ComponentConfiguration:
               qos: "atLeastOnce"
     accessControl:
       aws.greengrass.ipc.pubsub:
-        "com.mbreissi.telemetry-processor:pubsub:1":
+        "com.mbreissi.edgecommons.TelemetryProcessor:pubsub:1":
           policyDescription: Allows publish/subscribe on all local topics.
           operations:
             - "aws.greengrass#PublishToTopic"
@@ -111,7 +111,7 @@ ComponentConfiguration:
           resources:
             - "*"
       aws.greengrass.ipc.mqttproxy:
-        "com.mbreissi.telemetry-processor:iotcore:1":
+        "com.mbreissi.edgecommons.TelemetryProcessor:iotcore:1":
           policyDescription: Allows publish/subscribe to IoT Core (northbound target).
           operations:
             - "aws.greengrass#PublishToIoTCore"

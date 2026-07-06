@@ -168,11 +168,11 @@ pub struct PublishConfig {
     pub qos: Option<String>,
 }
 
-/// Where a route forwards its output — the `ggcommons` publish-facade [`Channel`] (`local` |
+/// Where a route forwards its output — the `edgecommons` publish-facade [`Channel`] (`local` |
 /// `northbound` | `stream:<name>`, DESIGN-class-facades §4), reused here instead of a bespoke
 /// processor-local enum so the route `target` and the library's `data()`/`events()` channel
 /// routing share one vocabulary.
-pub use ggcommons::facades::Channel;
+pub use edgecommons::facades::Channel;
 
 /// Parse a `target` string into the shared [`Channel`]: `local` | `northbound` | `stream:<name>`
 /// (delegates to [`Channel::from_config`]).

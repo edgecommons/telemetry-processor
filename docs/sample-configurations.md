@@ -1,7 +1,7 @@
 # Sample Configurations
 
 Complete, ready-to-adapt configurations for the **Telemetry Processor**
-(`com.mbreissi.telemetry-processor`), one per realistic deployment scenario. Each sample is
+(`com.mbreissi.edgecommons.TelemetryProcessor`), one per realistic deployment scenario. Each sample is
 a valid config document; the prose after it explains **what every option does and how it changes
 runtime behavior** — which topics a route consumes, how its pipeline filters/samples/aggregates the
 stream, where the result is forwarded (local bus, northbound IoT Core, or a durable stream), and how
@@ -18,7 +18,7 @@ see [how-to-guides.md](how-to-guides.md).
 > `ComponentConfiguration`), `KUBERNETES` → `CONFIGMAP` (a mounted directory). Routes live under
 > `component.instances[]` with cross-route defaults under `component.global.defaults`; the sibling
 > sections (`tags`, `messaging`, `logging`, `heartbeat`, `metricEmission`, `streaming`) are standard
-> ggcommons sections. Only the `streaming.streams[].sink` **`file`** variant is a canonical-schema
+> edgecommons sections. Only the `streaming.streams[].sink` **`file`** variant is a canonical-schema
 > addition; routes live in the permissive `component` subtree and need no schema change.
 
 This page is organized as:
@@ -58,7 +58,7 @@ its own subscription, pipeline, and target. A route may omit any field present i
 | Field | Meaning |
 |-------|---------|
 | `id` (required) | Route id — used in logs and in the `get-stats` command's per-route counters. |
-| `subscribe` | `[string]` of UNS/MQTT topic filters (`+`/`#` wildcards allowed). The fleet consumer for southbound telemetry is `ecv1/+/+/+/data/#` (scope per adapter with `ecv1/+/opcua-adapter/+/data/#`). Each filter is run through the ggcommons template resolver, so `{ThingName}` / `{ComponentName}` / `{site}` (and any `tags` key) expand against the active config. |
+| `subscribe` | `[string]` of UNS/MQTT topic filters (`+`/`#` wildcards allowed). The fleet consumer for southbound telemetry is `ecv1/+/+/+/data/#` (scope per adapter with `ecv1/+/opcua-adapter/+/data/#`). Each filter is run through the edgecommons template resolver, so `{ThingName}` / `{ComponentName}` / `{site}` (and any `tags` key) expand against the active config. |
 | `pipeline` | `[stage]` — an ordered list of transform stages (below). Order matters: stages run left to right. |
 | `target` | `"local"` \| `"northbound"` \| `"stream:<name>"`. Falls back to `global.defaults.target`; a route with no target at all is skipped with an error. |
 | `publish` | `{ topic, partitionKey, qos }` — the output address. `topic` (for `local`/`northbound`) is template-resolved at startup; `partitionKey` (for `stream:`) and `qos` are described per scenario. |
@@ -128,7 +128,7 @@ On HOST the dual-MQTT transport needs broker details. You can supply them inline
     "local": { "host": "localhost", "port": 1883, "clientId": "telemetry-processor-local" }
   },
 
-  "metricEmission": { "target": "log", "namespace": "ggcommons" },
+  "metricEmission": { "target": "log", "namespace": "edgecommons" },
 
   "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
 
@@ -165,7 +165,7 @@ cargo run --features standalone -- --platform HOST --transport MQTT ./standalone
 | Option | Effect on runtime behavior |
 |--------|----------------------------|
 | `messaging.local` | The local MQTT broker the processor both **subscribes to** (the `ecv1/…/data/#` source) and **publishes to** (the `ecv1/…/data/downsampled` output). On HOST this is one half of the dual-MQTT transport; `clientId` must be unique per process or the broker drops the older session. Omit it here and pass the same block as the positional `--transport MQTT ./standalone-messaging.json` instead. |
-| `metricEmission` | Standard ggcommons metric target (`log` / `messaging` / `cloudwatch` / `prometheus`). Observability only — it does not change processing. |
+| `metricEmission` | Standard edgecommons metric target (`log` / `messaging` / `cloudwatch` / `prometheus`). Observability only — it does not change processing. |
 | `tags` | Site/asset identity attached to messages and usable as topic template variables (`{site}`, `{appId}`). Pure metadata. |
 | `global.defaults.key` | Default key **path** every route inherits for `sample`/`aggregate`/`partitionKey` when it doesn't set its own. `body.signal.id` is the southbound contract's stable canonical id. |
 | `global.defaults.target` | Default `target` a route inherits when it omits one. |
@@ -191,7 +191,7 @@ file destination is a normal stream sink, so the route forwards to `stream:archi
 {
   "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
   "messaging": { "local": { "host": "localhost", "port": 1883, "clientId": "telemetry-processor" } },
-  "metricEmission": { "target": "log", "namespace": "ggcommons" },
+  "metricEmission": { "target": "log", "namespace": "edgecommons" },
   "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
 
   "streaming": {
@@ -375,7 +375,7 @@ front of Kinesis means a WAN outage parks records on disk and drains them when c
         "name": "hot",
         "sink": {
           "type": "kinesis",
-          "streamName": "ggcommons-telemetry-hot",
+          "streamName": "edgecommons-telemetry-hot",
           "region": "us-east-1"
         },
         "buffer": { "path": "/data/stream-hot", "segmentBytes": 4194304, "maxDiskBytes": 268435456, "onFull": "dropOldest" },
@@ -498,7 +498,7 @@ ComponentConfiguration:
         measures: { cpu: true, memory: true }
       metricEmission:
         target: "log"
-        namespace: "ggcommons"
+        namespace: "edgecommons"
         targetConfig:
           logFileName: "/greengrass/v2/work/{ComponentFullName}/metric.log"
       streaming:
@@ -523,7 +523,7 @@ ComponentConfiguration:
             batch: { maxRecords: 5000, maxBytes: 8388608, maxLatencyMs: 5000 }
             delivery: { pollIntervalMs: 1000 }
           - name: "hot"
-            sink: { type: "kinesis", streamName: "ggcommons-telemetry-hot", region: "us-east-1" }
+            sink: { type: "kinesis", streamName: "edgecommons-telemetry-hot", region: "us-east-1" }
             buffer:
               path: "/greengrass/v2/work/{ComponentFullName}/stream-hot"
               segmentBytes: 4194304
@@ -597,7 +597,7 @@ data:
   config.json: |
     {
       "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
-      "metricEmission": { "target": "log", "namespace": "ggcommons" },
+      "metricEmission": { "target": "log", "namespace": "edgecommons" },
       "messaging": { "local": { "host": "mqtt-broker", "port": 1883, "clientId": "telemetry-processor" } },
       "streaming": {
         "streams": [
@@ -656,7 +656,7 @@ volumeMounts:
 |--------|----------------------------|
 | `-c CONFIGMAP /config` | Reads `config.json` from the mounted ConfigMap directory. Config is read at startup; to change routes, apply the new ConfigMap and roll the Deployment (`kubectl rollout restart`) so the pod re-reads it. |
 | `messaging.local.host` = a Service name | The in-cluster MQTT broker reached via Kubernetes Service DNS (`mqtt-broker`). Point it at your broker Service. |
-| `POD_NAME` (Downward API) | With no `-t/--thing`, identity resolves from `GGCOMMONS_THING_NAME` ▸ `POD_NAME`, so `{ThingName}` in topics is the pod name unless overridden. |
+| `POD_NAME` (Downward API) | With no `-t/--thing`, identity resolves from `EDGECOMMONS_THING_NAME` ▸ `POD_NAME`, so `{ThingName}` in topics is the pod name unless overridden. |
 | `dir`/`buffer.path` on `/data` (a PVC) | The durable buffer and rolling Parquet files must live on a **persistent** volume so they survive pod restarts/rescheduling; the file sink needs a writable, durable directory. |
 | `ports`/probes on `:8080` | The library serves HTTP health (`/readyz`, `/healthz`) for k8s readiness/liveness gating. |
 | `metricEmission.target` | `log` here; switch to `prometheus` to expose metrics for in-cluster scraping (the idiomatic k8s path). |
@@ -927,7 +927,7 @@ route (instances[]) value  ▸  component.global.defaults  ▸  built-in default
 | `maxQueue` | route `maxQueue` | `256` |
 | flush tick | the smallest **time** aggregate `window` in the route | no flush timer when no time-window stage |
 
-**Templates vs paths.** `subscribe[]` and `publish.topic` are resolved through the ggcommons template
+**Templates vs paths.** `subscribe[]` and `publish.topic` are resolved through the edgecommons template
 engine (`{ThingName}`, `{ComponentName}`, `{ComponentFullName}`, and any `tags` key). `key`, `by`,
 `partitionKey` are **JSON paths** into each message and are never template-substituted.
 

@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use ggcommons::messaging::message::Message;
+use edgecommons::messaging::message::Message;
 use serde_json::{json, Map, Value};
 use smallvec::SmallVec;
 
@@ -226,7 +226,7 @@ impl Processor for AggregateStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggcommons::messaging::message::MessageBuilder;
+    use edgecommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     fn msg(signal: &str, value: f64, recv_ms: u64) -> ProcMsg {

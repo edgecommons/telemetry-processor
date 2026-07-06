@@ -9,18 +9,18 @@
 # (GDK creates those folders before calling us.)
 #
 # Cross-compilation note: Greengrass cores typically run Linux. Build on a Linux host, or set
-# GGCOMMONS_TARGET to a Linux triple you have a toolchain for. The `greengrass` feature is Linux-only.
+# EDGECOMMONS_TARGET to a Linux triple you have a toolchain for. The `greengrass` feature is Linux-only.
 set -euo pipefail
 
-COMPONENT_NAME="com.mbreissi.telemetry-processor"
+COMPONENT_NAME="com.mbreissi.edgecommons.TelemetryProcessor"
 COMPONENT_VERSION="1.0.0"
 BIN_NAME="telemetry-processor"
 
 # Device artifact uses the Greengrass IPC feature (Linux-only; needs libclang). Add the durable
 # targets you need, e.g. to ship Kinesis + rolling Parquet files:
-#   GGCOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
-FEATURES="${GGCOMMONS_FEATURES:-greengrass,streaming,streaming-kinesis,streaming-file-parquet,streaming-file-avro,scripting-lua}"
-TARGET="${GGCOMMONS_TARGET:-}"
+#   EDGECOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
+FEATURES="${EDGECOMMONS_FEATURES:-greengrass,streaming,streaming-kinesis,streaming-file-parquet,streaming-file-avro,scripting-lua}"
+TARGET="${EDGECOMMONS_TARGET:-}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 echo "Building ${BIN_NAME} (release, features=${FEATURES})${TARGET:+ for ${TARGET}}..."

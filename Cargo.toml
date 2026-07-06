@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-description = "Reference Rust processing component for ggcommons/edgecommons: subscribe → filter/sample/aggregate/project/script → forward (local / northbound / durable stream → Kinesis/Kafka/file)."
+description = "Reference Rust processing component for edgecommons/edgecommons: subscribe → filter/sample/aggregate/project/script → forward (local / northbound / durable stream → Kinesis/Kafka/file)."
 publish = false
 
-# The reference Rust processor component, built on the ggcommons Rust library. It is the
+# The reference Rust processor component, built on the edgecommons Rust library. It is the
 # high-throughput northbound seam between southbound adapters (channel 1) and the cloud
-# (channels 2/3). See docs/TELEMETRY_PROCESSOR.md in the ggcommons monorepo.
+# (channels 2/3). See docs/TELEMETRY_PROCESSOR.md in the edgecommons monorepo.
 
 [[bin]]
 name = "telemetry-processor"
@@ -24,16 +24,16 @@ path = "src/main.rs"
 default = ["standalone", "streaming", "streaming-kinesis", "streaming-file-parquet", "streaming-file-avro", "cloudwatch"]
 # Runtime selection (mirrors the library): standalone = dual-broker MQTT (containers/laptops);
 # greengrass = IPC (device; Linux-only build).
-standalone = ["ggcommons/standalone"]
-greengrass = ["ggcommons/greengrass"]
-cloudwatch = ["ggcommons/cloudwatch"]
+standalone = ["edgecommons/standalone"]
+greengrass = ["edgecommons/greengrass"]
+cloudwatch = ["edgecommons/cloudwatch"]
 # Durable streaming targets (the `stream:<name>` route target). `streaming` alone is buffer-only;
-# add a sink feature for real export. The file sink (Parquet/AVRO) lives in the ggstreamlog core.
-streaming = ["ggcommons/streaming"]
-streaming-kinesis = ["streaming", "ggcommons/streaming-kinesis"]
-streaming-kafka = ["streaming", "ggcommons/streaming-kafka"]
-streaming-file-parquet = ["streaming", "ggcommons/streaming-file-parquet"]
-streaming-file-avro = ["streaming", "ggcommons/streaming-file-avro"]
+# add a sink feature for real export. The file sink (Parquet/AVRO) lives in the edgestreamlog core.
+streaming = ["edgecommons/streaming"]
+streaming-kinesis = ["streaming", "edgecommons/streaming-kinesis"]
+streaming-kafka = ["streaming", "edgecommons/streaming-kafka"]
+streaming-file-parquet = ["streaming", "edgecommons/streaming-file-parquet"]
+streaming-file-avro = ["streaming", "edgecommons/streaming-file-avro"]
 # Optional second script engine, runtime-selectable per route via `scriptEngine: "lua"`. OFF by
 # default so the standard build stays pure-Rust and toolchain-free (Rhai only); enable it (release
 # artifacts do) to ship a binary that can also run Lua 5.4 scripts. Pulls mlua's vendored PUC Lua
@@ -42,12 +42,12 @@ streaming-file-avro = ["streaming", "ggcommons/streaming-file-avro"]
 scripting-lua = ["dep:mlua"]
 
 [dependencies]
-# The ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building this
+# The edgecommons Rust library, pinned to a commit on edgecommons/edgecommons (private). Building this
 # repo standalone needs read access to that repo. The fetch goes through the git CLI (see
 # .cargo/config.toml); locally it uses your gh/git credential helper, and in CI the reusable workflow
 # rewrites this https URL with the EDGECOMMONS_READ_TOKEN PAT. For local development against an
-# unpushed change, temporarily swap this for `path = "../ggcommons-monorepo/libs/rust"`.
-ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "b1d8d85bed1e989928d083323ef8be98132d77d5", default-features = false }
+# unpushed change, temporarily swap this for `path = "../core-monorepo/libs/rust"`.
+edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "b1d8d85bed1e989928d083323ef8be98132d77d5", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

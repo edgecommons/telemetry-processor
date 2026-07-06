@@ -5,7 +5,7 @@
 //! control channel, and spawns the route worker. Subscriptions are then established **once per
 //! unique topic filter**, with the handler applying the UNS **self-echo guard** and fanning each
 //! message out to every route that subscribed that filter (so multiple routes can share a topic —
-//! ggcommons keys subscriptions by filter). On shutdown it aborts the metric emitter, unsubscribes,
+//! edgecommons keys subscriptions by filter). On shutdown it aborts the metric emitter, unsubscribes,
 //! closes the channels, and waits for the workers to drain (final aggregate flush).
 //!
 //! ## UNS observability + control (net-new)
@@ -27,12 +27,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use ggcommons::config::model::Config;
-use ggcommons::config::template::resolve;
-use ggcommons::messaging::message::{Message, MessageIdentity};
-use ggcommons::messaging::MessagingService;
-use ggcommons::prelude::*;
-use ggcommons::uns::reserved_class_of;
+use edgecommons::config::model::Config;
+use edgecommons::config::template::resolve;
+use edgecommons::messaging::message::{Message, MessageIdentity};
+use edgecommons::messaging::MessagingService;
+use edgecommons::prelude::*;
+use edgecommons::uns::reserved_class_of;
 use rhai::Engine;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -101,7 +101,7 @@ pub struct ProcessorApp {
 
 impl ProcessorApp {
     /// Wire and start every configured route.
-    pub async fn start(gg: &GgCommons) -> anyhow::Result<Self> {
+    pub async fn start(gg: &EdgeCommons) -> anyhow::Result<Self> {
         let config = gg.config();
         let messaging =
             gg.messaging().map_err(|e| anyhow::anyhow!("messaging transport unavailable: {e}"))?;
@@ -182,7 +182,7 @@ impl ProcessorApp {
         app.senders = built.iter().map(|b| b.tx.clone()).collect();
 
         // 2. Subscribe each UNIQUE filter once, fanning each message out to every route that wants
-        //    it (ggcommons keys subscriptions by filter, so a shared filter must be one subscription).
+        //    it (edgecommons keys subscriptions by filter, so a shared filter must be one subscription).
         let mut by_filter: BTreeMap<String, FilterRoutes> = BTreeMap::new();
         for b in &built {
             for f in &b.filters {
@@ -231,7 +231,7 @@ impl ProcessorApp {
     /// Build one route's worker + channels; return the wired route (no subscription yet).
     fn build_route(
         &mut self,
-        gg: &GgCommons,
+        gg: &EdgeCommons,
         config: &Config,
         ctx: &RouteBuildCtx<'_>,
         evt: &Arc<EvtEmitter>,
@@ -331,7 +331,7 @@ impl ProcessorApp {
 
     /// Run until a shutdown signal, then abort the metric emitter, unsubscribe, close channels, and
     /// drain the workers.
-    pub async fn run(mut self, gg: &GgCommons) -> anyhow::Result<()> {
+    pub async fn run(mut self, gg: &EdgeCommons) -> anyhow::Result<()> {
         gg.shutdown_signal().await;
         tracing::info!("shutdown signal received; stopping routes");
 
@@ -419,7 +419,7 @@ async fn self_subscribe(
 /// Register the processor's custom command verbs on the library command inbox (a no-op when no
 /// messaging transport wired an inbox). The built-in `ping`/`reload-config`/`get-configuration`
 /// verbs are registered by the library and complement these.
-fn register_commands(gg: &GgCommons, handles: Arc<Vec<RouteHandle>>) {
+fn register_commands(gg: &EdgeCommons, handles: Arc<Vec<RouteHandle>>) {
     let Some(cmds) = gg.commands() else {
         tracing::debug!("no command inbox (no messaging transport); custom verbs not registered");
         return;

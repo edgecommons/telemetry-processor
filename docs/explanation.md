@@ -16,14 +16,14 @@ min/max/avg) *before* the data leaves the device — and then route each result 
 
 > **A "signal" is one southbound data point** — an OPC UA node, a Modbus register, … — carried in
 > `body.signal` with its readings in `body.samples[]`. It is what the OPC UA / historian world calls a
-> "tag"; the ggcommons contract names it a **signal** so the word "tag" is free for the message-envelope
+> "tag"; the edgecommons contract names it a **signal** so the word "tag" is free for the message-envelope
 > metadata (`tags`). The two are unrelated — see [the terminology
 > note](reference/messaging-interface.md#envelope-tags-vs-the-signal).
 
 The Telemetry Processor is that stage: the high-throughput northbound seam between the adapters and
-the cloud. It is the reference **Rust processing component** (`com.mbreissi.telemetry-processor`),
-built on the `ggcommons` Rust library. Like the adapters, it is deliberately thin — configuration, the
-messaging transport, the durable streaming buffer, metrics, and lifecycle all come from `ggcommons`,
+the cloud. It is the reference **Rust processing component** (`com.mbreissi.edgecommons.TelemetryProcessor`),
+built on the `edgecommons` Rust library. Like the adapters, it is deliberately thin — configuration, the
+messaging transport, the durable streaming buffer, metrics, and lifecycle all come from `edgecommons`,
 so the component contains only the processing engine and the target dispatch. It subscribes to the
 fleet's `data`-class telemetry, runs a declarative per-route pipeline, and forwards the result onward.
 Its **data path** is one-way transform-and-forward — but it is a full UNS/console citizen: the library
@@ -48,13 +48,13 @@ order, the subscription is opened with concurrency `1`, and a full channel **dro
 debug log, not backpressure into the broker) — so for strict no-loss you size `maxQueue` generously
 and prefer a durable `stream:` target for the output.
 
-**Shared-filter fan-out.** `ggcommons` keys subscriptions by their topic *filter*, so two routes that
+**Shared-filter fan-out.** `edgecommons` keys subscriptions by their topic *filter*, so two routes that
 subscribe the same filter cannot each open their own subscription. The app handles this by collecting
 every route's resolved filters, subscribing each **unique** filter exactly once, and giving that one
 subscription a handler that fans each arriving message out to *every* route channel that registered
 it. Multiple routes can therefore share a topic — one does a 1 Hz downsample to the bus while another
 windows the same stream into a durable archive — without colliding. Filters are MQTT filters: `+`/`#`
-wildcards are allowed, and each is run through `ggcommons`' template resolver so `{ThingName}`,
+wildcards are allowed, and each is run through `edgecommons`' template resolver so `{ThingName}`,
 `{ComponentName}`, and `tags` keys expand against the active config before subscribing. The fleet
 consumer is the single UNS wildcard `ecv1/+/+/+/data/#` (scope it per adapter with
 `ecv1/+/opcua-adapter/+/data/#`). Because the processor also republishes onto the `data` class it
@@ -243,20 +243,20 @@ parses a rollup exactly like any other signal update.
 
 ## Targets and the file sink
 
-A route forwards its output to exactly one target, and every target reuses an existing `ggcommons`
+A route forwards its output to exactly one target, and every target reuses an existing `edgecommons`
 API — the net-new code is only the dispatch glue.
 
 | `target` | What happens | QoS / key |
 |---|---|---|
 | `local` | Republish the processed message on the local bus, on `publish.topic` (resolved at startup) or the source topic. Its `identity` is **restamped** to the processor (loop-safety + provenance). | — |
 | `northbound` | Publish to AWS IoT Core / a northbound MQTT broker. | `publish.qos`: `atLeastOnce` (default) or `atMostOnce` |
-| `stream:<name>` | Append to the named durable `ggcommons` stream, which exports to its configured sink — Kinesis, Kafka, or **file**. | partition key from `publish.partitionKey`, default the route key (`body.signal.id`) |
+| `stream:<name>` | Append to the named durable `edgecommons` stream, which exports to its configured sink — Kinesis, Kafka, or **file**. | partition key from `publish.partitionKey`, default the route key (`body.signal.id`) |
 
 The stream's sink is configured in the `streaming` section, not on the route, so a route forwards to
 `stream:archive` and the `archive` stream decides where the bytes land. (Stream targets require the
 component's `streaming` feature; built without it, a stream target drops with a warning.)
 
-**The file sink** is a shared `ggstreamlog` capability, so a file destination is a normal stream sink
+**The file sink** is a shared `edgestreamlog` capability, so a file destination is a normal stream sink
 that inherits the durable buffer and at-least-once export. It writes **rolling Parquet (default) or
 AVRO** files in one of two modes. **`rows`** mode flattens telemetry into normalized, typed rows —
 query-ready for a lakehouse. Its **default projection** decodes each `SouthboundSignalUpdate` into one

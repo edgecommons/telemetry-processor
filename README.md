@@ -1,6 +1,6 @@
 # telemetry-processor
 
-The **reference Rust processing component** for the ggcommons / edgecommons ecosystem. It is the
+The **reference Rust processing component** for the edgecommons / edgecommons ecosystem. It is the
 high-throughput northbound seam between southbound protocol adapters (which publish high-rate
 `SouthboundSignalUpdate` telemetry on the local bus) and the cloud.
 
@@ -15,11 +15,11 @@ runs a declarative per-route **pipeline** — `filter` / `sample` / `aggregate` 
 
 Each **route is one `component.instances[]` entry** (`{ id, subscribe[], pipeline[], target,
 publish }`); cross-route defaults live in `component.global`. See `docs/TELEMETRY_PROCESSOR.md` in the
-ggcommons monorepo for the full design.
+edgecommons monorepo for the full design.
 
 ## Unified Namespace (UNS)
 
-The processor speaks the ggcommons **Unified Namespace** — all topics are
+The processor speaks the edgecommons **Unified Namespace** — all topics are
 `ecv1/{device}/{component}/{instance}/{class}[/channel]` and it appears on the bus as
 `ecv1/{device}/telemetry-processor/main/…` (its component token is the short name after the last
 `.`). What this means for the processor:
@@ -45,7 +45,7 @@ The processor speaks the ggcommons **Unified Namespace** — all topics are
 ## Run locally (HOST platform, MQTT transport)
 
 ```bash
-docker compose -f ../ggcommons/test-infra/compose.yaml up -d   # local EMQX broker
+docker compose -f ../core/test-infra/compose.yaml up -d   # local EMQX broker
 
 cargo run -- \
   --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
@@ -65,7 +65,7 @@ keepalive, and address `ecv1/my-thing/telemetry-processor/main/cmd/get-stats` to
 ## Build the device artifact (Greengrass, Linux)
 
 ```bash
-GGCOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
+EDGECOMMONS_FEATURES="greengrass,streaming-kinesis,streaming-file-parquet" ./build.sh
 ```
 
 ## Cargo features
@@ -81,7 +81,7 @@ because they need a platform-specific native toolchain — enable them explicitl
 Slim the build with `--no-default-features` plus the subset you want (e.g.
 `--no-default-features --features standalone,streaming,streaming-file-parquet`).
 
-## CLI contract (provided by the ggcommons library)
+## CLI contract (provided by the edgecommons library)
 
 `-c/--config <FILE|ENV|GG_CONFIG|CONFIGMAP|…>` · `--platform <GREENGRASS|HOST|KUBERNETES|auto>` ·
 `--transport <IPC|MQTT [path]>` · `-t/--thing <name>`.
