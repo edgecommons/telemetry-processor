@@ -31,7 +31,7 @@ The **eight classes**, and how the processor uses each:
 | `cfg` | **reserved** (library) | the effective-config publisher |
 | `log` | **reserved** (library) | (library-owned) |
 
-> **Reserved-class publish guard.** A component publish (`publish` / `publish_to_iot_core`) to a
+> **Reserved-class publish guard.** A component publish (`publish` / `publish_northbound`) to a
 > `state` / `metric` / `cfg` / `log` topic is **rejected** by the library — the reserved classes are
 > written only through the library's own publishers. A route `publish.topic` must therefore target
 > `data` / `evt` / `app`; the processor logs a WARN at startup if a resolved `publish.topic` lands on
@@ -147,7 +147,7 @@ The output target is per route (`target`). Route outputs must land on a non-rese
 | `target` | Destination | Topic / key | Transport call |
 |----------|-------------|-------------|----------------|
 | `local` | local bus | `publish.topic` (default = the source topic); identity restamped to the processor | `publish(topic, msg)` |
-| `northbound` | AWS IoT Core / northbound MQTT | `publish.topic` (default = the source topic), QoS from `publish.qos` | `publish_to_iot_core(topic, msg, qos)` |
+| `northbound` | AWS IoT Core / northbound MQTT | `publish.topic` (default = the source topic), QoS from `publish.qos` | `publish_northbound(topic, msg, qos)` |
 | `stream:<name>` | a edgecommons durable stream | partition key from `publish.partitionKey` (default = the route `key`, i.e. `body.signal.id`) | `streams().stream(name).append(record)` |
 
 - Set an explicit `publish.topic` to a UNS `data`/`evt`/`app` topic template, e.g.

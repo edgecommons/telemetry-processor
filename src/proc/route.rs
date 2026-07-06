@@ -138,7 +138,7 @@ impl Dispatcher {
             }
             Channel::Northbound => {
                 let topic = self.out_topic(&m);
-                match self.messaging.publish_to_iot_core(&topic, &m.msg, self.qos).await {
+                match self.messaging.publish_northbound(&topic, &m.msg, self.qos).await {
                     Ok(()) => {
                         self.stats.messages_out.fetch_add(1, Ordering::Relaxed);
                     }

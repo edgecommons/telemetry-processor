@@ -98,7 +98,7 @@ bindings `value`/`quality` (the first sample's). The engine is bounded (Rhai `ma
 | `target` | What it does | Build requirement |
 |----------|--------------|-------------------|
 | `local` | Republish the processed message on the local bus (`messaging.publish`) to `publish.topic`, or — if `topic` is omitted — back onto the **source topic**. | always available |
-| `northbound` | Publish to IoT Core / a northbound MQTT broker (`publish_to_iot_core`) at `publish.qos`. | always available; needs a reachable cloud session (§5) |
+| `northbound` | Publish to IoT Core / a northbound MQTT broker (`publish_northbound`) at `publish.qos`. | always available; needs a reachable cloud session (§5) |
 | `stream:<name>` | Append the serialized message to the durable stream `<name>` (defined under `streaming.streams[]`), partitioned by `publish.partitionKey`. | the `streaming` feature **plus** the matching sink feature; without `streaming` the append is dropped with a warning |
 
 Off-by-default Cargo features compose the binary: `standalone` (default), `greengrass` (IPC — Linux/WSL
@@ -436,7 +436,7 @@ publishes them to IoT Core at a chosen QoS.
 {
   "messaging": {
     "local":   { "host": "localhost", "port": 1883, "clientId": "telemetry-processor" },
-    "iotCore": {
+    "northbound": {
       "endpoint": "a1b2c3d4e5f6g7-ats.iot.us-east-1.amazonaws.com",
       "port": 8883,
       "clientId": "telemetry-processor",
@@ -466,10 +466,10 @@ publishes them to IoT Core at a chosen QoS.
 
 | Option | Effect on runtime behavior |
 |--------|----------------------------|
-| `messaging.iotCore` | The cloud half of the HOST dual-MQTT transport — the mTLS session `northbound` publishes through. Required on `HOST`/`KUBERNETES` for a `northbound` target; on `GREENGRASS` it is **not** needed (the publish routes through the Nucleus' IoT Core connection — see §6 `accessControl`). |
+| `messaging.northbound` | The cloud half of the HOST dual-MQTT transport — the mTLS session `northbound` publishes through. Required on `HOST`/`KUBERNETES` for a `northbound` target; on `GREENGRASS` it is **not** needed (the publish routes through the Nucleus' IoT Core connection — see §6 `accessControl`). |
 | `subscribe` | Subscribes the **full `data` class** (`ecv1/+/+/+/data/#`) — there is no `alarms` topic class (the eight are `data`/`evt`/`cmd`/`app`/`state`/`metric`/`cfg`/`log`). It is the `quality != GOOD` filter below (not the subscription) that selects the alarm/fault readings, so only those reach IoT Core — priced per message — keeping northbound sparse. |
 | `filter.field` / `op: "ne"` / `value: "GOOD"` | Keep a message when **any** `body.samples[].quality` is not `GOOD` — i.e. a fault/alarm/uncertain reading. (Equivalently a Rhai predicate like `samples.any(\|s\| s.quality != "GOOD")` — see §9.) |
-| `target: "northbound"` | Publishes via `publish_to_iot_core` instead of the local bus. |
+| `target: "northbound"` | Publishes via `publish_northbound` instead of the local bus. |
 | `publish.topic` | The IoT Core topic (template-resolved). `ecv1/{ThingName}/telemetry-processor/main/evt/alarms` publishes alarms as the UNS **`evt`** class, namespaced per device (subscribe `ecv1/+/+/+/evt/#`). |
 | `publish.qos` | `atLeastOnce` (default) guarantees delivery with possible duplicates; `atMostOnce` is fire-and-forget (cheaper, may drop). Only these two are accepted; anything else falls back to `atLeastOnce`. |
 
@@ -570,7 +570,7 @@ Manifests:
 
 | Difference from HOST | Effect on runtime behavior |
 |----------------------|----------------------------|
-| No `messaging` section; transport is IPC | Routes subscribe/publish through the Nucleus' local IPC pub/sub; `northbound` publishes through the Nucleus' IoT Core connection (mqttproxy) — no broker block, no `messaging.iotCore`. |
+| No `messaging` section; transport is IPC | Routes subscribe/publish through the Nucleus' local IPC pub/sub; `northbound` publishes through the Nucleus' IoT Core connection (mqttproxy) — no broker block, no `messaging.northbound`. |
 | `--platform GREENGRASS -c GG_CONFIG` | Config is the deployment's `ComponentConfig`; `-c GG_CONFIG` is the platform default. The binary must be built with the **`greengrass`** feature (Linux/WSL only) plus the sink features the streams use. |
 | `TokenExchangeService` dependency | Makes the device role available to the AWS SDK default chain so the Kinesis sink can `PutRecords`. Without it the `hot` stream buffers but never delivers. |
 | `accessControl` | Grants the IPC pub/sub (local bus) and mqttproxy (`PublishToIoTCore`, the northbound target) the routes need. |
