@@ -246,3 +246,33 @@ pub async fn run_worker(
         dispatcher.dispatch(pm).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use edgecommons::messaging::message::{Message, MessageBuilder};
+    use serde_json::json;
+
+    #[test]
+    fn stream_payload_serialization_is_protobuf_wire_bytes() {
+        let msg = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .southbound_signal_update(json!({
+                "signal": { "id": "temp", "name": "Temperature" },
+                "samples": [{
+                    "value": 21.5,
+                    "quality": "GOOD",
+                    "sourceTsMs": 1783360799900u64,
+                    "serverTsMs": 1783360800000u64
+                }]
+            }))
+            .build();
+
+        let payload = msg.to_vec().expect("protobuf stream payload");
+        assert_ne!(payload.first().copied(), Some(b'{'), "stream payload must not be JSON");
+
+        let decoded = Message::from_slice(&payload).expect("decode protobuf stream payload");
+        assert_eq!(decoded.header.name, "SouthboundSignalUpdate");
+        assert_eq!(decoded.body["samples"][0]["value"], json!(21.5));
+        assert_eq!(decoded.body["samples"][0]["sourceTsMs"], json!(1783360799900u64));
+        assert_eq!(decoded.body["samples"][0]["serverTsMs"], json!(1783360800000u64));
+    }
+}

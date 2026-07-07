@@ -201,8 +201,13 @@ The `kinesis` and `kafka` sinks are also standard streaming sinks:
 
 | Sink `type` | Required | Optional |
 |-------------|----------|----------|
-| `kinesis` | `streamName` | `region`, `endpointUrl` |
-| `kafka` | `bootstrapServers`, `topic` | `properties` (librdkafka map) |
+| `kinesis` | `streamName` | `region`, `endpointUrl`, `payloadFormat` |
+| `kafka` | `bootstrapServers`, `topic` | `properties` (librdkafka map), `payloadFormat` |
+
+`payloadFormat` controls what the sink writes to Kinesis/Kafka. The processor appends the
+EdgeCommons protobuf envelope to the durable stream; the sink then either projects it to JSON
+(`"json"`, the default) or preserves the protobuf bytes (`"protobuf"`). File sinks keep their
+file-specific row projection settings instead.
 
 ### File sink (`sink.type: "file"`)
 

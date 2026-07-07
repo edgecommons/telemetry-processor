@@ -99,7 +99,7 @@ bindings `value`/`quality` (the first sample's). The engine is bounded (Rhai `ma
 |----------|--------------|-------------------|
 | `local` | Republish the processed message on the local bus (`messaging.publish`) to `publish.topic`, or — if `topic` is omitted — back onto the **source topic**. | always available |
 | `northbound` | Publish to IoT Core / a northbound MQTT broker (`publish_northbound`) at `publish.qos`. | always available; needs a reachable cloud session (§5) |
-| `stream:<name>` | Append the serialized message to the durable stream `<name>` (defined under `streaming.streams[]`), partitioned by `publish.partitionKey`. | the `streaming` feature **plus** the matching sink feature; without `streaming` the append is dropped with a warning |
+| `stream:<name>` | Append the EdgeCommons protobuf envelope to the durable stream `<name>` (defined under `streaming.streams[]`), partitioned by `publish.partitionKey`. | the `streaming` feature **plus** the matching sink feature; without `streaming` the append is dropped with a warning |
 
 Off-by-default Cargo features compose the binary: `standalone` (default), `greengrass` (IPC — Linux/WSL
 only), `streaming`, and the sink features `streaming-kinesis`, `streaming-file-parquet`,
@@ -376,7 +376,8 @@ front of Kinesis means a WAN outage parks records on disk and drains them when c
         "sink": {
           "type": "kinesis",
           "streamName": "edgecommons-telemetry-hot",
-          "region": "us-east-1"
+          "region": "us-east-1",
+          "payloadFormat": "json"
         },
         "buffer": { "path": "/data/stream-hot", "segmentBytes": 4194304, "maxDiskBytes": 268435456, "onFull": "dropOldest" },
         "batch": { "maxRecords": 500, "maxBytes": 4194304, "maxLatencyMs": 1000 },
@@ -413,6 +414,7 @@ cargo run --features standalone,streaming,streaming-kinesis -- --platform HOST \
 | `sink.streamName` | Target Kinesis stream (supports template vars). |
 | `sink.region` | AWS region for the stream. Optional — falls back to the SDK's default region resolution. |
 | `sink.endpointUrl` | (Not shown) override the Kinesis endpoint for LocalStack/floci/VPC-endpoint testing; the default credential/endpoint chain applies otherwise. |
+| `sink.payloadFormat` | `"json"` (default) asks the sink to convert the protobuf envelope to JSON before putting records; `"protobuf"` preserves the original EdgeCommons protobuf bytes for protobuf-aware consumers such as EMQX/Kafka tooling. |
 | `publish.partitionKey` | Resolved per record as the **Kinesis partition key** (default = route `key` = `body.signal.id`), so a signal's records hash to a consistent shard and stay ordered. |
 | `delivery.maxRetries: -1` | Retry a batch **forever** (the disconnected-edge case) with exponential backoff (`backoffBaseMs`→`backoffMaxMs`). Records sit safely in the durable buffer until accepted. |
 | `buffer.maxDiskBytes` | Caps the on-disk parking lot (256 MiB). On a long outage, `onFull: dropOldest` sheds the oldest undelivered records to stay within budget. |
@@ -944,6 +946,7 @@ engine (`{ThingName}`, `{ComponentName}`, `{ComponentFullName}`, and any `tags` 
 | `buffer.onFull` / `fsync` | `dropOldest` / `perBatch` |
 | `batch.maxRecords` / `maxBytes` / `maxLatencyMs` | `500` / `4194304` / `1000` |
 | `delivery.maxRetries` / `pollIntervalMs` | `-1` (retry forever) / `100` |
+| Kinesis/Kafka `payloadFormat` | `json` |
 
 For the full option matrix and message envelopes, see
 [reference/configuration.md](reference/configuration.md) and

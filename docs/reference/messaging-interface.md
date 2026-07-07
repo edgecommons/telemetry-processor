@@ -40,8 +40,9 @@ The **eight classes**, and how the processor uses each:
 
 ## Envelope
 
-All messages use the edgecommons UNS JSON envelope — `{ header, identity, tags, body }` — the same
-envelope the adapters publish:
+Normal messages arrive on the wire as EdgeCommons protobuf envelopes. The processor exposes the same
+diagnostic/projection shape to filters, scripts, key paths, and file rows — `{ header, identity, tags,
+body }` — that the adapters publish:
 
 ```jsonc
 {
@@ -155,10 +156,11 @@ The output target is per route (`target`). Route outputs must land on a non-rese
   `ecv1/{ThingName}/telemetry-processor/main/evt/alarms`. Templates are resolved at startup.
 - **`northbound`** publishes to IoT Core via the mqttproxy with `qos` = `atLeastOnce` (default) or
   `atMostOnce`.
-- **`stream:<name>`** appends the serialized message as one record; the stream's configured sink
-  (kinesis/kafka/file) delivers it asynchronously. Forwarding errors are logged and tallied (a
-  `stream-unavailable` `evt` fires), never propagated — use a durable `stream:` target for no-loss
-  output.
+- **`stream:<name>`** appends the EdgeCommons protobuf envelope as one record; the stream's
+  configured sink (kinesis/kafka/file) delivers it asynchronously. Kinesis/Kafka sinks default to a
+  JSON projection and can opt into protobuf bytes with `sink.payloadFormat: "protobuf"`. Forwarding
+  errors are logged and tallied (a `stream-unavailable` `evt` fires), never propagated — use a
+  durable `stream:` target for no-loss output.
 
 > **Why this dispatch uses `messaging()`/`streams()` rather than the `data()` facade.** The
 > `edgecommons` library's `data()` publish facade (`gg.instance(id).data()`) is the right tool for a
