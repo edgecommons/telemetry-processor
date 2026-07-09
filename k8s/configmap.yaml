@@ -8,7 +8,7 @@ data:
   # The library's CONFIGMAP config source reads this mounted directory (with ..data-swap hot reload).
   config.json: |
     {
-      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}" },
       "metricEmission": { "target": "messaging", "namespace": "edgecommons" },
       "messaging": { "local": { "host": "mqtt-broker", "port": 1883, "clientId": "telemetry-processor" } },
       "streaming": {

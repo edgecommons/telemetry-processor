@@ -122,7 +122,7 @@ On HOST the dual-MQTT transport needs broker details. You can supply them inline
 ```jsonc
 // config.json
 {
-  "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+  "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}" },
 
   "messaging": {
     "local": { "host": "localhost", "port": 1883, "clientId": "telemetry-processor-local" }
@@ -189,7 +189,7 @@ file destination is a normal stream sink, so the route forwards to `stream:archi
 ```jsonc
 // config.json
 {
-  "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+  "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}" },
   "messaging": { "local": { "host": "localhost", "port": 1883, "clientId": "telemetry-processor" } },
   "metricEmission": { "target": "log", "namespace": "edgecommons" },
   "tags": { "appId": "Demo", "site": "factory-1", "shop": "shopA", "line": "line1" },
@@ -492,7 +492,7 @@ ComponentConfiguration:
     ComponentConfig:
       logging:
         level: "INFO"
-        rust_format: "{timestamp} [{level}] {target} - {message}"
+        rust_format: "{timestamp} [{level}] [{component}] {target} - {message}"
       heartbeat:
         intervalSecs: 5
         targets:
@@ -598,7 +598,7 @@ metadata:
 data:
   config.json: |
     {
-      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}" },
       "metricEmission": { "target": "log", "namespace": "edgecommons" },
       "messaging": { "local": { "host": "mqtt-broker", "port": 1883, "clientId": "telemetry-processor" } },
       "streaming": {
