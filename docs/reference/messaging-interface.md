@@ -261,6 +261,9 @@ the summed per-interval deltas of the route counters: `messagesIn`, `messagesOut
 command. System measures (CPU/memory/…) are emitted automatically by the heartbeat as the `sys`
 metric.
 
+For the purpose of every processor metric and what each measure helps determine, see
+[Reference - Metrics](metrics.md).
+
 ## Topic-template variables
 
 Resolved (once, at startup) into `subscribe` filters and `publish.topic`:

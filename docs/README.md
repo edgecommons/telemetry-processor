@@ -23,6 +23,7 @@ component, a standalone process, or a Kubernetes pod. It appears on the bus as
 - **"I'm new here."** → [Tutorial](tutorial.md).
 - **"What does this config option do?"** → [Reference — Configuration](reference/configuration.md).
 - **"What message do I subscribe to / publish, and on which topic?"** → [Reference — Messaging Interface](reference/messaging-interface.md).
+- **"What does this metric mean?"** → [Reference — Metrics](reference/metrics.md).
 - **"How are values stored in the Parquet / AVRO files?"** → [Reference — Data Types](reference/data-types.md).
 - **"How do I downsample a fast signal or aggregate per signal?"** → [How-to guides](how-to-guides.md).
 - **"How do I write a script, and what can it see/return?"** → [Scripting](scripting.mdx).

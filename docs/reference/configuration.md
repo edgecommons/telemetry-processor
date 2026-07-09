@@ -278,7 +278,8 @@ The processor is a first-class UNS/console citizen. Beyond the library-automatic
 
 - **`metric/pipeline`** — with `metricEmission.target: "messaging"`, a throughput metric
   (`messagesIn`/`messagesOut`/`messagesDropped`/`streamAppends`/`publishFailures`) every 30 s on the
-  UNS `metric` class. (System CPU/memory come from the heartbeat's `sys` metric.)
+  UNS `metric` class. See [metrics.md](metrics.md). (System CPU/memory come from the heartbeat's
+  `sys` metric.)
 - **`evt/warning/*`** — rate-limited `queue-overflow` / `route-error` / `stream-unavailable` health
   events, published through the library's `events()` facade.
 - **Command verbs** — built-in `ping` / `reload-config` / `get-configuration`, plus the processor's
