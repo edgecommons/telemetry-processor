@@ -26,7 +26,7 @@ The **eight classes**, and how the processor uses each:
 | `evt` | application | **Output** — pipeline health events (see [Events](#events-evt)) and forwarded alarms |
 | `cmd` | application | **Input** — the library command inbox (built-in + [custom verbs](#command-verbs)) |
 | `app` | application | free-form; unused by default |
-| `state` | **reserved** (library) | the automatic keepalive on `ecv1/{device}/telemetry-processor/main/state` |
+| `state` | **reserved** (library) | the automatic keepalive on `ecv1/{device}/telemetry-processor/state` |
 | `metric` | **reserved** (library) | the processor's `metric/pipeline` throughput metric |
 | `cfg` | **reserved** (library) | the effective-config publisher |
 | `log` | **reserved** (library) | (library-owned) |
@@ -152,8 +152,8 @@ The output target is per route (`target`). Route outputs must land on a non-rese
 | `stream:<name>` | a edgecommons durable stream | partition key from `publish.partitionKey` (default = the route `key`, i.e. `body.signal.id`) | `streams().stream(name).append(record)` |
 
 - Set an explicit `publish.topic` to a UNS `data`/`evt`/`app` topic template, e.g.
-  `ecv1/{ThingName}/telemetry-processor/main/data/downsampled` or
-  `ecv1/{ThingName}/telemetry-processor/main/evt/alarms`. Templates are resolved at startup.
+  `ecv1/{ThingName}/telemetry-processor/data/downsampled` or
+  `ecv1/{ThingName}/telemetry-processor/evt/alarms`. Templates are resolved at startup.
 - **`northbound`** publishes to IoT Core via the mqttproxy with `qos` = `atLeastOnce` (default) or
   `atMostOnce`.
 - **`stream:<name>`** appends the EdgeCommons protobuf envelope as one record; the stream's
@@ -205,7 +205,7 @@ except on a `local` target where it is restamped):
 
 ## Command verbs
 
-The processor subscribes its own command inbox `ecv1/{device}/telemetry-processor/main/cmd/#` (wired
+The processor subscribes its own command inbox `ecv1/{device}/telemetry-processor/cmd/#` (wired
 automatically by the library). A `cmd` request whose `header.reply_to` is set gets a structured reply
 `{"ok": true, "result": …}` or `{"ok": false, "error": {"code", "message"}}`; a request without
 `reply_to` is fire-and-forget.
@@ -234,8 +234,8 @@ automatically by the library). A `cmd` request whose `header.reply_to` is set ge
 ## Events (`evt`)
 
 The processor publishes rate-limited health events through the `edgecommons` `events()` publish facade
-(`gg.events()`, bound to the `main` instance) on
-`ecv1/{device}/telemetry-processor/main/evt/{severity}/{type}` (a non-reserved class; subscribe the
+(`gg.events()`, at component scope — no instance token) on
+`ecv1/{device}/telemetry-processor/evt/{severity}/{type}` (a non-reserved class; subscribe the
 fleet with `ecv1/+/+/+/evt/#`). The facade derives the channel from the body's own `severity`/`type`
 (so topic and body can never disagree) and stamps `timestamp`; every one of the processor's own health
 events currently uses `severity: "warning"`:
@@ -255,7 +255,7 @@ forwarding an already-shaped signal reading, not minting a processor health even
 ## Metrics (`metric`)
 
 With `metricEmission.target: "messaging"` the processor emits a `pipeline` metric every 30 s on
-`ecv1/{device}/telemetry-processor/main/metric/pipeline` (subscribe `ecv1/+/+/+/metric/#`), carrying
+`ecv1/{device}/telemetry-processor/metric/pipeline` (subscribe `ecv1/+/+/+/metric/#`), carrying
 the summed per-interval deltas of the route counters: `messagesIn`, `messagesOut`, `messagesDropped`,
 `streamAppends`, `publishFailures`. Per-route detail is available on demand via the `get-stats`
 command. System measures (CPU/memory/…) are emitted automatically by the heartbeat as the `sys`

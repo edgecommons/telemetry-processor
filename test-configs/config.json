@@ -80,7 +80,7 @@
         ],
         "target": "local",
         "publish": {
-          "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled"
+          "topic": "ecv1/{ThingName}/telemetry-processor/data/downsampled"
         }
       },
       {

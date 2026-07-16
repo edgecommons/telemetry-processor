@@ -19,10 +19,11 @@ edgecommons monorepo for the full design.
 
 ## Unified Namespace (UNS)
 
-The processor speaks the edgecommons **Unified Namespace** — all topics are
-`ecv1/{device}/{component}/{instance}/{class}[/channel]` and it appears on the bus as
-`ecv1/{device}/telemetry-processor/main/…` (its component token is the short name after the last
-`.`). What this means for the processor:
+The processor speaks the edgecommons **Unified Namespace** — topics are
+`ecv1/{device}/{component}/[{instance}/]{class}[/channel]` (the instance segment is optional), and
+because it is a single instance the processor appears on the bus at **component scope**:
+`ecv1/{device}/telemetry-processor/{class}[/channel]` — the component token (the short name after the
+last `.`) is followed directly by the class, with no instance segment. What this means for the processor:
 
 - **Ingest** the fleet's southbound telemetry (the `data` class) with a single wildcard:
   `ecv1/+/+/+/data/#` (or scope it, e.g. `ecv1/+/opcua-adapter/+/data/#`).
@@ -58,9 +59,9 @@ file sinks + CloudWatch are all on by default, so the command above needs no `--
 
 Publish synthetic `SouthboundSignalUpdate` messages (envelopes with a top-level `identity`) to an
 adapter's UNS data topic, e.g. `ecv1/gw-01/opcua-adapter/kep1/data/<signal>`, and watch: downsampled
-messages on `ecv1/my-thing/telemetry-processor/main/data/downsampled` (MQTTX), and rolling Parquet
+messages on `ecv1/my-thing/telemetry-processor/data/downsampled` (MQTTX), and rolling Parquet
 files under `./out/archive/dt=…/`. Subscribe `ecv1/+/+/+/state` to see the processor's automatic
-keepalive, and address `ecv1/my-thing/telemetry-processor/main/cmd/get-stats` to read its counters.
+keepalive, and address `ecv1/my-thing/telemetry-processor/cmd/get-stats` to read its counters.
 
 ## Build the device artifact (Greengrass, Linux)
 

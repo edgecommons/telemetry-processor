@@ -9,8 +9,8 @@
 //!   by the fan-out handler and the route [`crate::proc::route::Dispatcher`], read by the
 //!   `get-stats` command and the metric emitter.
 //! - [`EvtEmitter`] — a rate-limited publisher of the processor's own **`evt`** events, now a thin
-//!   wrapper over the library's [`edgecommons::facades::EventsFacade`] (`gg.events()`, bound to the
-//!   `main` instance): the facade owns the `evt/{severity}/{type}` channel derivation, the body
+//!   wrapper over the library's [`edgecommons::facades::EventsFacade`] (`gg.events()`, at component
+//!   scope — D-U28, no instance token): the facade owns the `evt/{severity}/{type}` channel derivation, the body
 //!   contract (`severity`/`type`/`message`/`timestamp`/`context`), and the envelope/identity
 //!   stamping — this migration is exactly what `docs/platform/DESIGN-class-facades.md` §1.2 calls
 //!   out as the drift the facade fixes (the old hand-rolled emitter had **no severity segment** at
@@ -21,7 +21,7 @@
 //! - [`spawn_metric_emitter`] — the periodic task that emits the summed counters as the **`metric`**
 //!   class through `gg.metrics()` (interval deltas), mirroring the `uns-bridge` `RelayCounters →
 //!   gg.metrics()` pattern. With `metricEmission.target: "messaging"` the messaging metric target
-//!   lands them on `ecv1/{device}/telemetry-processor/main/metric/pipeline`.
+//!   lands them on `ecv1/{device}/telemetry-processor/metric/pipeline`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -88,8 +88,8 @@ impl RouteStats {
 }
 
 /// The processor's rate-limited `evt` publisher — a thin wrapper over the library's
-/// [`EventsFacade`] (`gg.events()`, bound to the `main` instance, matching the pre-migration
-/// `gg.uns()` topic instance). The facade owns the `evt/{severity}/{type}` channel, the body
+/// [`EventsFacade`] (`gg.events()`, at component scope — D-U28, no instance token). The facade owns
+/// the `evt/{severity}/{type}` channel, the body
 /// contract, and the envelope/identity stamping; this type owns only the processor-specific
 /// per-channel **cooldown** gate. Publishing is best-effort: `evt` is a non-reserved class, so the
 /// reserved-class guard passes; a failed publish is logged at DEBUG and swallowed (the facade

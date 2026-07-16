@@ -7,7 +7,7 @@ northbound to MQTT / AWS IoT Core, or append to a durable stream that lands in *
 rolling Parquet/AVRO files**. Built on the `edgecommons` library, it is the high-throughput seam between
 southbound protocol adapters and the cloud, and runs wherever you deploy it — as a Greengrass v2
 component, a standalone process, or a Kubernetes pod. It appears on the bus as
-`ecv1/{device}/telemetry-processor/main/…` and answers UNS commands (`get-stats` / `flush` / `pause` /
+`ecv1/{device}/telemetry-processor/…` and answers UNS commands (`get-stats` / `flush` / `pause` /
 `resume` + the library built-ins).
 
 | Doc | Start here when you want to… |

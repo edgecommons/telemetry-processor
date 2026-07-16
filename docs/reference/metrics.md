@@ -4,7 +4,7 @@ The telemetry-processor emits pipeline throughput metrics through the EdgeCommon
 `metricEmission.target: messaging`, metrics are published on the reserved UNS `metric` class:
 
 ```text
-ecv1/{device}/telemetry-processor/main/metric/pipeline
+ecv1/{device}/telemetry-processor/metric/pipeline
 ```
 
 The processor does not publish directly to reserved `metric` topics. It defines and emits the metric
@@ -47,7 +47,7 @@ Dimensions: runtime-injected component dimensions only.
 Use the `get-stats` command for per-route counters:
 
 ```text
-ecv1/{device}/telemetry-processor/main/cmd/get-stats
+ecv1/{device}/telemetry-processor/cmd/get-stats
 ```
 
 The command returns route ids, cumulative in/out/drop counts, stream appends, publish failures,

@@ -99,7 +99,7 @@ ComponentConfiguration:
               - filter: { field: "body.samples[].quality", op: "ne", value: "GOOD" }
             target: "northbound"
             publish:
-              topic: "ecv1/{ThingName}/telemetry-processor/main/evt/alarms"
+              topic: "ecv1/{ThingName}/telemetry-processor/evt/alarms"
               qos: "atLeastOnce"
     accessControl:
       aws.greengrass.ipc.pubsub:

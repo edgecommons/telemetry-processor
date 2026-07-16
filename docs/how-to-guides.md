@@ -351,7 +351,7 @@ credentials the SDK chain can find (env / profile / instance role).
   "subscribe": ["ecv1/+/+/+/data/#"],
   "pipeline": [ { "filter": { "field": "body.samples[].quality", "op": "ne", "value": "GOOD" } } ],
   "target": "northbound",
-  "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/evt/alarms", "qos": "atLeastOnce" } }
+  "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/evt/alarms", "qos": "atLeastOnce" } }
 ```
 
 - `target: "northbound"` publishes via IoT Core / the northbound MQTT broker.
@@ -375,7 +375,7 @@ once and fans every message out to every route that registered it, so the routes
 "instances": [
   { "id": "downsample-local", "subscribe": ["ecv1/+/+/+/data/#"],
     "pipeline": [ { "filter": { "quality": "GOOD" } }, { "sample": { "everyMs": 1000 } } ],
-    "target": "local", "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" } },
+    "target": "local", "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/data/downsampled" } },
   { "id": "archive", "subscribe": ["ecv1/+/+/+/data/#"],
     "pipeline": [ { "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg", "max"] } } ],
     "target": "stream:archive" }
@@ -427,7 +427,7 @@ filter to specific adapters instead when you don't need the whole fleet, e.g.
 
 **Goal:** inspect and control a running processor from the console / any MQTT client.
 
-The processor answers its command inbox at `ecv1/{device}/telemetry-processor/main/cmd/<verb>`. Send a
+The processor answers its command inbox at `ecv1/{device}/telemetry-processor/cmd/<verb>`. Send a
 `cmd` envelope (`header.name` = the verb) with `header.reply_to` set to get a structured reply.
 
 | Verb | What it does |
@@ -440,7 +440,7 @@ The processor answers its command inbox at `ecv1/{device}/telemetry-processor/ma
 | `pause` / `resume` | stop / restart enqueuing to a route (`{route}`) or all routes (body omitted) |
 
 The processor also publishes, without any request: its `state` keepalive
-(`ecv1/{device}/telemetry-processor/main/state`), a `metric/pipeline` throughput metric (when
+(`ecv1/{device}/telemetry-processor/state`), a `metric/pipeline` throughput metric (when
 `metricEmission.target: "messaging"`), and `evt/warning/{queue-overflow,route-error,stream-unavailable}`
 health events (via the library's `events()` facade). Subscribe the fleet with
 `ecv1/+/+/+/{state,metric,evt}/#`.

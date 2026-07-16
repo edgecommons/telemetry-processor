@@ -144,8 +144,8 @@ impl ProcessorApp {
         // The processor's own UNS identity — the self-echo guard's match, and the restamp source.
         let own_device = config.identity().device().to_string();
         let own_component = config.identity().component().to_string();
-        // The `evt` health-event publisher — a thin wrapper over the library's `events()` facade,
-        // bound to the `main` instance (matches the pre-migration `gg.uns()` topic instance).
+        // The `evt` health-event publisher — a thin wrapper over the library's `events()` facade at
+        // component scope (D-U28: no instance token, so events land on `.../telemetry-processor/evt/…`).
         let evt = EvtEmitter::new(gg.events());
 
         let mut app = Self {
