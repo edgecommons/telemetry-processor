@@ -7,7 +7,7 @@ In this tutorial you bring the `telemetry-processor` up on your laptop, feed it 
 of Python.
 
 By the end you will have seen a downsampled message land on the Unified-Namespace `data` topic
-`ecv1/my-thing/telemetry-processor/main/data/downsampled`, and a rolling `.parquet` file appear under
+`ecv1/my-thing/telemetry-processor/data/downsampled`, and a rolling `.parquet` file appear under
 `./out/archive/dt=…/hr=…/`.
 
 > This is a guided first run — it makes the choices for you and keeps the explanation short. For the
@@ -54,7 +54,7 @@ subscribed to the fleet's UNS `data` class `ecv1/+/+/+/data/#`:
 
 - **`downsample-local`** — drops any update that isn't all-`GOOD` quality, then keeps **at most one
   message per signal per second** (`sample everyMs:1000`), and republishes the survivors on
-  `ecv1/my-thing/telemetry-processor/main/data/downsampled`. Target `local` (straight back onto the
+  `ecv1/my-thing/telemetry-processor/data/downsampled`. Target `local` (straight back onto the
   bus; the output's `identity` is restamped to the processor so it can't self-echo through the fleet
   filter).
 - **`archive`** — also drops non-`GOOD`, then rolls each signal's values into **5-second tumbling
@@ -136,10 +136,10 @@ appears**: the `filter { quality: GOOD }` stage dropped it before sampling. You'
 (exact values and cadence depend on arrival timing):
 
 ```
-ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1001  =    20.0  [GOOD]
-ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1002  =     1.0  [GOOD]
-ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1001  =    20.8  [GOOD]
-ecv1/my-thing/telemetry-processor/main/data/downsampled  ns=3;i=1002  =    1.08  [GOOD]
+ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1001  =    20.0  [GOOD]
+ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1002  =     1.0  [GOOD]
+ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1001  =    20.8  [GOOD]
+ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1002  =    1.08  [GOOD]
 ```
 
 ## 5. Find the Parquet archive
@@ -192,7 +192,7 @@ results to different channels. That is the whole idea of the processor.
 While it ran, the processor was also a full **Unified-Namespace citizen**: subscribe
 `ecv1/+/+/+/state` to see its automatic keepalive, `ecv1/+/+/+/metric/#` for its `pipeline` throughput
 metric, and `ecv1/+/+/+/evt/#` for health events — and you can address its command inbox at
-`ecv1/my-thing/telemetry-processor/main/cmd/get-stats` (or `flush` / `pause` / `resume`, plus the
+`ecv1/my-thing/telemetry-processor/cmd/get-stats` (or `flush` / `pause` / `resume`, plus the
 library built-ins `ping` / `reload-config` / `get-configuration`) to read the per-route counters. See
 the [messaging-interface reference](reference/messaging-interface.md#command-verbs).
 

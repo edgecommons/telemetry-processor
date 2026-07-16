@@ -143,7 +143,7 @@ On HOST the dual-MQTT transport needs broker details. You can supply them inline
           { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
         ],
         "target": "local",
-        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" }
+        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/data/downsampled" }
       }
     ]
   }
@@ -459,7 +459,7 @@ publishes them to IoT Core at a chosen QoS.
           { "filter": { "field": "body.samples[].quality", "op": "ne", "value": "GOOD" } }
         ],
         "target": "northbound",
-        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/evt/alarms", "qos": "atLeastOnce" }
+        "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/evt/alarms", "qos": "atLeastOnce" }
       }
     ]
   }
@@ -472,7 +472,7 @@ publishes them to IoT Core at a chosen QoS.
 | `subscribe` | Subscribes the **full `data` class** (`ecv1/+/+/+/data/#`) — there is no `alarms` topic class (the eight are `data`/`evt`/`cmd`/`app`/`state`/`metric`/`cfg`/`log`). It is the `quality != GOOD` filter below (not the subscription) that selects the alarm/fault readings, so only those reach IoT Core — priced per message — keeping northbound sparse. |
 | `filter.field` / `op: "ne"` / `value: "GOOD"` | Keep a message when **any** `body.samples[].quality` is not `GOOD` — i.e. a fault/alarm/uncertain reading. (Equivalently a Rhai predicate like `samples.any(\|s\| s.quality != "GOOD")` — see §9.) |
 | `target: "northbound"` | Publishes via `publish_northbound` instead of the local bus. |
-| `publish.topic` | The IoT Core topic (template-resolved). `ecv1/{ThingName}/telemetry-processor/main/evt/alarms` publishes alarms as the UNS **`evt`** class, namespaced per device (subscribe `ecv1/+/+/+/evt/#`). |
+| `publish.topic` | The IoT Core topic (template-resolved). `ecv1/{ThingName}/telemetry-processor/evt/alarms` publishes alarms as the UNS **`evt`** class, namespaced per device (subscribe `ecv1/+/+/+/evt/#`). |
 | `publish.qos` | `atLeastOnce` (default) guarantees delivery with possible duplicates; `atMostOnce` is fire-and-forget (cheaper, may drop). Only these two are accepted; anything else falls back to `atLeastOnce`. |
 
 ---
@@ -551,7 +551,7 @@ ComponentConfiguration:
             pipeline:
               - filter: { field: "body.samples[].quality", op: "ne", value: "GOOD" }
             target: "northbound"
-            publish: { topic: "ecv1/{ThingName}/telemetry-processor/main/evt/alarms", qos: "atLeastOnce" }
+            publish: { topic: "ecv1/{ThingName}/telemetry-processor/evt/alarms", qos: "atLeastOnce" }
 ```
 
 The component also needs `ComponentDependencies` and `accessControl` (abbreviated here):
@@ -685,7 +685,7 @@ processed independently by each route's pipeline and target.
         { "sample": { "everyMs": 1000, "by": "body.signal.id" } }
       ],
       "target": "local",
-      "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/downsampled" }
+      "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/data/downsampled" }
     },
     {
       "id": "archive-good",
@@ -736,7 +736,7 @@ the convenience bindings `value`/`quality` (the first sample's). The example bel
         { "script": "#{ \"signal\": body.signal, \"scaled\": value * 0.1, \"q\": quality, \"src\": topic }" }
       ],
       "target": "local",
-      "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/main/data/scaled" }
+      "publish": { "topic": "ecv1/{ThingName}/telemetry-processor/data/scaled" }
     }
   ]
 }
