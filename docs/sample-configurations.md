@@ -494,9 +494,9 @@ ComponentConfiguration:
         level: "INFO"
         rust_format: "{timestamp} [{level}] [{component}] {target} - {message}"
       heartbeat:
+        enabled: true
         intervalSecs: 5
-        targets:
-          - type: "metric"
+        destination: "local"
         measures: { cpu: true, memory: true }
       metricEmission:
         target: "log"
