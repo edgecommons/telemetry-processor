@@ -15,6 +15,7 @@ use crate::config::{ScriptEngineKind, StageConfig, Window};
 
 pub mod aggregate;
 pub mod filter;
+pub mod multi;
 pub mod project;
 pub mod route;
 pub mod sample;
@@ -86,9 +87,25 @@ impl Pipeline {
                     Box::new(aggregate::AggregateStage::build(spec, route_key)?)
                 }
                 StageConfig::Project(spec) => Box::new(project::ProjectStage::build(spec)),
-                StageConfig::Script(src) => {
-                    Box::new(script::ScriptStage::build(src, engine_kind, engine, loader, ctx)?)
-                }
+                StageConfig::Script(spec) => match spec {
+                    crate::config::ScriptStageSpec::Inline(s) => Box::new(script::ScriptStage::build(
+                        &crate::config::ScriptSource::Inline(s.clone()),
+                        engine_kind,
+                        engine,
+                        loader,
+                        ctx,
+                    )?),
+                    crate::config::ScriptStageSpec::Spec(sp) if sp.is_multi() => Box::new(
+                        multi::MultiScriptStage::build(sp, engine_kind, engine, loader, ctx)?,
+                    ),
+                    crate::config::ScriptStageSpec::Spec(sp) => Box::new(script::ScriptStage::build(
+                        &sp.script_source()?,
+                        engine_kind,
+                        engine,
+                        loader,
+                        ctx,
+                    )?),
+                },
             };
             built.push(stage);
         }

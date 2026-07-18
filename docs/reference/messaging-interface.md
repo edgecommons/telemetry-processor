@@ -154,6 +154,9 @@ The output target is per route (`target`). Route outputs must land on a non-rese
 - Set an explicit `publish.topic` to a UNS `data`/`evt`/`app` topic template, e.g.
   `ecv1/{ThingName}/telemetry-processor/data/downsampled` or
   `ecv1/{ThingName}/telemetry-processor/evt/alarms`. Templates are resolved at startup.
+- A multi-signal `script` stage with an `output.topic` carries its own topic: the derived message
+  reaches the target on that topic, and combining it with a route-level `publish.topic` is a
+  startup error (the route topic would override the stage's).
 - **`northbound`** publishes to IoT Core via the mqttproxy with `qos` = `atLeastOnce` (default) or
   `atMostOnce`.
 - **`stream:<name>`** appends the EdgeCommons protobuf envelope as one record; the stream's
@@ -202,6 +205,24 @@ except on a `local` target where it is restamped):
 
 > Numeric reducers (`avg`/`max`/`min`/`sum`) are emitted only when ≥1 sample in the window was
 > numeric; otherwise that reducer is `null`.
+
+## Script output (`ScriptResult`)
+
+A multi-signal `script` stage with a configured `output` publishes one **new** envelope per
+successful evaluation on `output.topic` ([configuration
+reference](configuration.md#script-inputs)):
+
+| Envelope field | Value |
+|----------------|-------|
+| `header.name` / `header.version` | `output.name` / `output.version` — default `ScriptResult` / `1.0`. |
+| `header.uuid` / `header.timestamp` | fresh, minted for the derived message. |
+| `header.correlation_id` | the **triggering message's `uuid`** — trace a result back to the exact update that fired it. |
+| `identity` | the **processor's own** identity with `instance` = the route id — the derived signal's producer is the processor, on every target (not only `local`). |
+| `body` | exactly what the script returned (map/table → JSON object). |
+
+The triggering input message is consumed, never republished on the output topic. Without a
+configured `output`, a `script` stage keeps its in-place contract: the result replaces the body of
+the triggering message, which continues on the source topic.
 
 ## Command verbs
 

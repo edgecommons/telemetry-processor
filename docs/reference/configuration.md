@@ -140,11 +140,51 @@ follows the engine. The source is given **inline** or from an **external file**:
 |------|---------|
 | `{"script": "<source>"}` | Inline source. Good for a one-liner. |
 | `{"script": {"file": "rules/x.rhai"}}` | Read the program from a `.rhai`/`.lua` file at startup. The path resolves against [`global.defaults.scriptsDir`](#componentglobaldefaults) when relative, or is used as-is when absolute. Use this for anything beyond a one-liner — see [Use an external script file](../how-to-guides.md#use-an-external-script-file). |
+| `{"script": {"file"\|"source": …, "inputs": {…}, "output": {…}}}` | The **multi-signal form**: named stateful inputs and/or an explicit output topic — see below. `source` is the object-form spelling of an inline script; exactly one of `file`/`source` is required. |
 
-Both forms are **compiled once at startup** (a bad path or a compile error fails fast, before any
+All forms are **compiled once at startup** (a bad path or a compile error fails fast, before any
 message flows), sandboxed, and bounded (1,000,000 ops/eval) so a runaway script cannot wedge a worker.
 For the full scripting model — engine selection, scope, state, return values, both languages, and a
 cookbook of worked examples in **both engines** — see the dedicated **[Scripting guide](../scripting.mdx)**.
+
+<a id="script-inputs"></a>**`inputs` — named multi-signal inputs.** A map of input name →
+**selector**. The stage caches the latest observation of every input and evaluates the script when a
+matched input's **value or quality changes**, binding the full snapshot as
+[`inputs` and the firing input as `trigger`](../scripting.mdx#multi-signal-inputs). The script does
+not run until every required input has been observed. Each selector needs at least one of
+`signalId`/`signalName`/`topic`; unknown selector fields fail the route at build time, as do two
+inputs with identical selectors.
+
+| Selector field | Type | Meaning |
+|----------------|------|---------|
+| `signalId` | string | Match `body.signal.id`. |
+| `signalName` | string | Match `body.signal.name`. |
+| `topic` | string (MQTT filter) | Match the arriving topic (`+`/`#` wildcards supported). The way to select identity-less (non-EdgeCommons) publishers. |
+| `device` | string | Match the source envelope identity's device. Identity-based fields never match a message without an envelope identity. |
+| `component` | string | Match the source envelope identity's component token. |
+| `instance` | string | Match the source envelope identity's instance token. |
+| `required` | boolean (default `true`) | Whether the script waits for this input before its first evaluation. An optional input is absent from the `inputs` snapshot until it arrives. |
+
+Cached input state is **partitioned by the source device** (the envelope identity), so two devices
+publishing the same signal ids never mix into one snapshot. State is in-memory and empty at startup:
+the stage re-awaits every required input before the first evaluation. A message that matches no
+input is consumed by the stage.
+
+**`output` — an explicit output topic.** Without `output`, the script result replaces the triggering
+message's body in place (the classic behavior). With `output`, each successful evaluation is
+published as a **new** EdgeCommons envelope and the triggering message is consumed, never
+republished:
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `topic` | string (template) | — (required) | The output topic. Template-resolved at startup. A reserved UNS class (`state`/`metric`/`cfg`/`log`) or a topic matching one of the route's own `subscribe` filters (a feedback loop) fails the route at build time, as does combining `output.topic` with a route-level `publish.topic`. |
+| `name` | string | `ScriptResult` | The envelope header `name` of the derived message. |
+| `version` | string | `1.0` | The envelope header `version` of the derived message. |
+
+The derived envelope's producer is the **processor itself** (identity instance = the route id), and
+its header `correlation_id` carries the triggering message's `uuid` so a consumer can trace each
+result back to the update that fired it. The message flows to the route's `target` like any other
+stage output.
 
 <a id="rhai-scope"></a>**Script scope (Rhai or Lua)** (available to both `filter` `script` and the `script` stage; identical in both engines) —
 the per-message **message view** plus the constant **runtime context**:
@@ -164,6 +204,8 @@ the per-message **message view** plus the constant **runtime context**:
 | `componentFullName` | string | the fully-qualified component name (`{ComponentFullName}`) |
 | `routeId` | string | the id of the route running the script |
 | `recvMs` | integer | this message's broker receive time (Unix ms) |
+| `inputs` | map | **multi-signal `script` stage only** — `{name: {value, quality, timestamp, recvMs, topic}}` for every observed input; unbound/`nil` elsewhere |
+| `trigger` | map | **multi-signal `script` stage only** — `{name, value, quality, timestamp, recvMs, topic}` of the input that fired this evaluation; unbound/`nil` elsewhere |
 
 <a id="key-paths"></a>
 > **Key paths** are dotted paths over the message: roots `body.` (the default when no known root

@@ -59,6 +59,95 @@ pub enum ScriptSource {
     File { file: String },
 }
 
+/// The `script` stage config: the bare inline form (`{"script": "<expr>"}`), or the object form
+/// (`{"script": {...}}`) carrying the source plus the optional multi-signal `inputs` map and the
+/// optional explicit `output`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ScriptStageSpec {
+    /// `{"script": "<expr>"}` — inline source, result replaces the message body in place.
+    Inline(String),
+    /// `{"script": {"file"|"source": …, "inputs": {...}, "output": {...}}}`.
+    Spec(ScriptSpec),
+}
+
+/// The object form of a `script` stage: the script source (exactly one of `file`/`source`), plus
+/// the optional stateful multi-signal `inputs` and the optional explicit `output`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct ScriptSpec {
+    /// Path to a script file (relative to `global.defaults.scriptsDir`, or absolute), read once at
+    /// startup.
+    pub file: Option<String>,
+    /// Inline script source (the object-form equivalent of `{"script": "<expr>"}`).
+    pub source: Option<String>,
+    /// Named multi-signal inputs: `{name: selector}`. When present the stage caches the latest
+    /// value of every input and evaluates the script on change with the full snapshot bound as
+    /// `inputs` (plus the triggering message as `trigger`). Name-ordered, so multi-match trigger
+    /// resolution is deterministic.
+    pub inputs: Option<std::collections::BTreeMap<String, InputSelector>>,
+    /// Explicit output: publish each successful result as a **new** message on `output.topic`
+    /// instead of mutating the triggering message in place.
+    pub output: Option<OutputSpec>,
+}
+
+impl ScriptSpec {
+    /// The script source: exactly one of `file`/`source` must be set.
+    pub fn script_source(&self) -> anyhow::Result<ScriptSource> {
+        match (&self.file, &self.source) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("script stage: `file` and `source` are mutually exclusive")
+            }
+            (Some(f), None) => Ok(ScriptSource::File { file: f.clone() }),
+            (None, Some(s)) => Ok(ScriptSource::Inline(s.clone())),
+            (None, None) => anyhow::bail!("script stage needs `file` or `source`"),
+        }
+    }
+
+    /// Whether this spec uses the stateful multi-signal stage (`inputs` and/or `output` present).
+    pub fn is_multi(&self) -> bool {
+        self.inputs.is_some() || self.output.is_some()
+    }
+}
+
+/// Selects the signal a named script input binds to. At least one of `signalId`/`signalName`/
+/// `topic` is required; `device`/`component`/`instance` narrow by the source envelope identity.
+/// Unknown selector fields are a configuration error (never silently ignored).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct InputSelector {
+    /// Match the envelope identity's device (the deepest hierarchy value).
+    pub device: Option<String>,
+    /// Match the envelope identity's component token.
+    pub component: Option<String>,
+    /// Match the envelope identity's instance token.
+    pub instance: Option<String>,
+    /// Match `body.signal.id`.
+    pub signal_id: Option<String>,
+    /// Match `body.signal.name`.
+    pub signal_name: Option<String>,
+    /// Match the arriving topic against this MQTT-style filter (`+`/`#` supported).
+    pub topic: Option<String>,
+    /// Whether the script waits for this input before its first evaluation. Default `true`; an
+    /// optional input (`false`) is simply absent from the `inputs` snapshot until it arrives.
+    pub required: Option<bool>,
+}
+
+/// Explicit `script` output: the derived result is published as a new EdgeCommons envelope on
+/// `topic`, produced by the processor (identity instance = route id) and correlated to the
+/// triggering message.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct OutputSpec {
+    /// Output topic (template-substituted). Must not target a reserved UNS class and must not
+    /// overlap the route's subscribe filters.
+    pub topic: String,
+    /// Envelope header name for the derived message. Default `ScriptResult`.
+    pub name: Option<String>,
+    /// Envelope header version for the derived message. Default `1.0`.
+    pub version: Option<String>,
+}
+
 /// One route (a `component.instances[]` entry).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,9 +182,10 @@ pub enum StageConfig {
     Sample(SampleSpec),
     Aggregate(AggregateSpec),
     Project(ProjectSpec),
-    /// A Rhai transform: `{"script": "<expr>"}` (inline) or `{"script": {"file": "rules/x.rhai"}}`.
-    /// The script sees `topic` + the message fields and returns a new body map, or `()` to drop.
-    Script(ScriptSource),
+    /// A script transform: `{"script": "<expr>"}` (inline), `{"script": {"file": "rules/x.rhai"}}`,
+    /// or the extended object form with multi-signal `inputs` and/or an explicit `output`. The
+    /// script sees `topic` + the message fields and returns a new body map, or `()`/`nil` to drop.
+    Script(ScriptStageSpec),
 }
 
 /// `filter` stage. Exactly one form applies, checked in order: `script` (Rhai predicate) →
@@ -232,17 +322,69 @@ mod tests {
 
     #[test]
     fn script_stage_parses_inline_and_file_forms() {
-        // Inline string → ScriptSource::Inline.
+        // Inline string → the bare inline form.
         let inline: StageConfig = serde_json::from_value(json!({ "script": "body" })).unwrap();
-        assert!(matches!(inline, StageConfig::Script(ScriptSource::Inline(s)) if s == "body"));
-        // Object `{"file": "..."}` → ScriptSource::File.
+        assert!(matches!(inline, StageConfig::Script(ScriptStageSpec::Inline(s)) if s == "body"));
+        // Object `{"file": "..."}` → the object form; the source resolves to the file.
         let file: StageConfig =
             serde_json::from_value(json!({ "script": { "file": "rules/x.rhai" } })).unwrap();
-        assert!(matches!(file, StageConfig::Script(ScriptSource::File { file }) if file == "rules/x.rhai"));
+        let StageConfig::Script(ScriptStageSpec::Spec(spec)) = file else { panic!() };
+        assert!(!spec.is_multi());
+        assert!(
+            matches!(spec.script_source().unwrap(), ScriptSource::File { file } if file == "rules/x.rhai")
+        );
         // A `filter` may also take a `{"file": "..."}` predicate.
         let f: FilterSpec =
             serde_json::from_value(json!({ "script": { "file": "rules/keep.rhai" } })).unwrap();
         assert!(matches!(f.script, Some(ScriptSource::File { file }) if file == "rules/keep.rhai"));
+    }
+
+    #[test]
+    fn script_stage_parses_multi_signal_form() {
+        let v = json!({ "script": {
+            "file": "oee.lua",
+            "inputs": {
+                "running":    { "device": "gw-fill-01", "signalId": "FillerRunning" },
+                "totalCount": { "topic": "ecv1/gw-fill-01/opcua-adapter/+/data/TotalBottleCount",
+                                "required": false }
+            },
+            "output": { "topic": "ecv1/gw-fill-01/telemetry-processor/oee/data/current" }
+        }});
+        let s: StageConfig = serde_json::from_value(v).unwrap();
+        let StageConfig::Script(ScriptStageSpec::Spec(spec)) = s else { panic!() };
+        assert!(spec.is_multi());
+        let inputs = spec.inputs.as_ref().unwrap();
+        assert_eq!(inputs["running"].device.as_deref(), Some("gw-fill-01"));
+        assert_eq!(inputs["running"].signal_id.as_deref(), Some("FillerRunning"));
+        assert_eq!(inputs["running"].required, None); // default: required
+        assert_eq!(inputs["totalCount"].required, Some(false));
+        assert!(inputs["totalCount"].topic.as_deref().unwrap().contains("+/data/"));
+        assert_eq!(
+            spec.output.as_ref().unwrap().topic,
+            "ecv1/gw-fill-01/telemetry-processor/oee/data/current"
+        );
+    }
+
+    #[test]
+    fn script_source_exactly_one_of_file_or_source() {
+        let both: ScriptSpec =
+            serde_json::from_value(json!({ "file": "a.lua", "source": "return 1" })).unwrap();
+        assert!(both.script_source().is_err());
+        let neither: ScriptSpec = serde_json::from_value(json!({})).unwrap();
+        assert!(neither.script_source().is_err());
+        let src: ScriptSpec = serde_json::from_value(json!({ "source": "return 1" })).unwrap();
+        assert!(matches!(src.script_source().unwrap(), ScriptSource::Inline(s) if s == "return 1"));
+    }
+
+    #[test]
+    fn unknown_selector_fields_are_rejected() {
+        // An unknown selector field must fail configuration, never silently bind the wrong signal.
+        let v = json!({ "script": {
+            "file": "x.lua",
+            "inputs": { "a": { "signalld": "Typo" } },
+            "output": { "topic": "t" }
+        }});
+        assert!(serde_json::from_value::<StageConfig>(v).is_err());
     }
 
     #[test]
