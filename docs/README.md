@@ -13,7 +13,7 @@ component, a standalone process, or a Kubernetes pod. It appears on the bus as
 | Doc | Start here when you want to… |
 |-----|------------------------------|
 | **[Tutorial](tutorial.md)** | learn by doing — bring the processor up against a local broker and watch it downsample and archive telemetry, end to end |
-| **[How-to guides](how-to-guides.md)** | accomplish a specific task — filter, downsample, window-aggregate, handle array signals, script, archive to Parquet, forward alarms northbound, deploy |
+| **[How-to guides](how-to-guides.md)** | accomplish a specific task — filter, downsample, window-aggregate, handle array signals, script, derive a multi-signal KPI, archive to Parquet, forward alarms northbound, deploy |
 | **[Scripting](scripting.mdx)** | write `filter`/`script` logic in **Rhai or Lua** (runtime-selectable) — engine selection, the shared scope, return semantics, sandbox/budget, and a cookbook shown in both engines |
 | **[Reference](reference/)** | look up an exact option, topic, payload, or column type |
 | **[Explanation](explanation.md)** | understand how it works and why — the route/worker model, the processing-and-timing pipeline, targets and the file sink |

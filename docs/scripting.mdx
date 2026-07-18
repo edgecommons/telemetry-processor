@@ -3,7 +3,8 @@
 The built-in stages (`filter`, `sample`, `aggregate`, `project`) cover the shapes most routes need, and
 they are the right tool when they fit. **Scripting is the escape hatch** for logic they don't express:
 a derived engineering unit, a reading you only care about when it moves, a vendor payload that doesn't
-match the southbound shape, a decision that depends on the *relationship* between several samples.
+match the southbound shape, a decision that depends on the *relationship* between several samples, or
+a KPI computed from several independent signals ([multi-signal inputs](#multi-signal-inputs)).
 
 The processor embeds **two** script engines, and a route picks one at runtime:
 
@@ -119,12 +120,133 @@ The return value is the whole contract — a script never mutates the message in
   envelope is preserved. Return **`()`** (Rhai) / **`nil`** (Lua) to **drop**. A result that can't
   convert to JSON, or a runtime error, also drops (logged).
 
-## Scripts are stateless
+<a id="multi-signal-inputs"></a>
+## Multi-signal inputs
 
-Each evaluation gets a **fresh view** of only the current message — no variable survives between
-messages in either engine. This keeps a script a pure function and lets one engine instance serve a
-route safely. **Cross-message state lives in the built-in stages** — `sample` for rate limiting,
-`aggregate` for windowed counters/min/max/avg. A common pattern is a `script` that *shapes* each message
+A plain `script` stage sees one message at a time. Many industrial calculations don't work that way:
+OEE, a ratio of two counters, an interlock over several states — the operands are **independent
+signals**, each arriving on its own cadence, and the result should refresh whenever *any* of them
+moves. The multi-signal form of the `script` stage does exactly that. The stage declares **named
+inputs**, caches the latest observation of each, and runs the script with the whole snapshot
+whenever a matched input's **value or quality changes**:
+
+```jsonc
+{ "script": {
+    "file": "oee.lua",
+    "inputs": {
+      "running":      { "device": "gw-fill-01", "signalId": "FillerRunning" },
+      "idealCycleS":  { "device": "gw-fill-01", "signalId": "IdealCycleSeconds" },
+      "plannedRunS":  { "device": "gw-fill-01", "signalId": "PlannedRunSeconds" },
+      "totalCount":   { "device": "gw-fill-01", "signalId": "TotalBottleCount" },
+      "goodCount":    { "device": "gw-fill-01", "signalId": "GoodBottleCount" }
+    },
+    "output": { "topic": "ecv1/gw-fill-01/telemetry-processor/oee/data/current" }
+} }
+```
+
+Each selector names a signal (`signalId`/`signalName`), a topic filter (`topic`, with `+`/`#`
+wildcards — the way to bind identity-less publishers), and/or the source identity
+(`device`/`component`/`instance`, matched against the message envelope). The
+[configuration reference](reference/configuration.md#script-inputs) has the full selector table and
+validation rules.
+
+Two bindings join the ordinary scope (which still describes the *triggering* message):
+
+| Binding | Value |
+|---------|-------|
+| `inputs` | `{name: {value, quality, timestamp, recvMs, topic}}` — the current snapshot of every observed input. `value`/`quality`/`timestamp` come from the signal's first sample (`timestamp` is the source timestamp; `recvMs` the broker receive time). |
+| `trigger` | `{name, value, quality, timestamp, recvMs, topic}` — the input whose change fired this evaluation. |
+
+The semantics, precisely:
+
+- **Completeness is the script's job, not the stage's.** By default the stage does **not** withhold
+  evaluation for missing inputs: it runs the script on the first — and every — matched change, and an
+  input that hasn't arrived yet is simply absent from `inputs`. The script decides whether it has
+  enough to compute and returns the drop value (`()` in Rhai / `nil` in Lua) otherwise. Check for an
+  input with `"x" in inputs` (Rhai) or `inputs.x ~= nil` (Lua). This keeps the *policy* — which
+  operands are essential, and what to do while you wait — in the script, where the domain logic lives.
+- **Opt-in stage gating (`required: true`).** If you'd rather the stage hold off until an operand
+  exists, mark that input `"required": true`; the stage then withholds every evaluation until all
+  such inputs have been observed. It's a convenience for the common "need them all" case — the script
+  is still free to guard beyond it (e.g. on quality). With no `required` input, the stage never gates.
+- **Change detection.** A message that repeats an input's current value *and* quality refreshes its
+  timestamps but does not re-evaluate. A quality flip alone (GOOD → BAD) *is* a change — the script
+  decides what to do with a bad-quality operand (return the drop value to hold the last output).
+- **Per-device isolation.** The input cache is partitioned by the source device of the envelope
+  identity: two lines publishing the same signal ids each get their own snapshot, and one device's
+  values can never leak into another's calculation.
+- **Consumed, not forwarded.** A multi-input stage is a *sink* for its matched messages: the
+  triggering message is consumed (its data lives on in the snapshot), and a subscribed message that
+  matches no input is consumed silently. Put a multi-input `script` last in its pipeline.
+- **Restart-empty.** The cache is in-memory; after a restart each input re-initializes on its next
+  message (an `inputs`-guarding script simply waits for what it needs, as it does at first startup).
+
+**The output side.** Without `output`, the result replaces the triggering message's body in place —
+which couples the derived value to whichever source topic happened to move last. A derived signal
+like OEE is its own signal with its own UNS topic, so the multi-signal form usually configures
+`output.topic`: every successful evaluation then publishes a **new** envelope there (header `name`
+`ScriptResult` by default, configurable), produced by the processor itself (identity instance = the
+route id) and carrying the triggering message's `uuid` as its `correlation_id` for provenance. The
+route's startup validation rejects an output topic on a reserved UNS class or one the route's own
+`subscribe` filters would re-consume (a feedback loop), and the processor's self-echo guard drops
+any re-consumed copy of its own output as a second line of defense.
+
+A working OEE script over those inputs. Because the stage doesn't gate, the script waits for its
+operands itself — a one-line guard. (Prefer `"required": true` on the five inputs if you'd rather the
+stage hold off until they exist; then you can drop the presence check.)
+
+<Tabs syncKey="script-engine">
+<TabItem label="Rhai">
+
+```rhai
+// Availability × Performance × Quality, refreshed on any operand change.
+for k in ["running", "idealCycleS", "plannedRunS", "totalCount", "goodCount"] {
+    if !(k in inputs) { return (); }                    // wait until every operand exists
+}
+if inputs.running.value != true { return (); }          // line stopped → hold the last value
+
+let perf = (inputs.idealCycleS.value * inputs.totalCount.value) / inputs.plannedRunS.value;
+let qual = inputs.goodCount.value / inputs.totalCount.value;
+
+#{
+  "oee":     perf * qual,
+  "performance": perf,
+  "quality": qual,
+  "basedOn": trigger.name       // which operand refreshed this result
+}
+```
+
+</TabItem>
+<TabItem label="Lua">
+
+```lua
+-- Availability × Performance × Quality, refreshed on any operand change.
+for _, k in ipairs({ "running", "idealCycleS", "plannedRunS", "totalCount", "goodCount" }) do
+  if inputs[k] == nil then return nil end               -- wait until every operand exists
+end
+if inputs.running.value ~= true then return nil end     -- line stopped → hold the last value
+
+local perf = (inputs.idealCycleS.value * inputs.totalCount.value) / inputs.plannedRunS.value
+local qual = inputs.goodCount.value / inputs.totalCount.value
+
+return {
+  oee         = perf * qual,
+  performance = perf,
+  quality     = qual,
+  basedOn     = trigger.name    -- which operand refreshed this result
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Script state
+
+Each evaluation is a **pure function of its bindings** — no script variable survives between
+messages in either engine, which is what lets one engine instance serve a route safely.
+**Cross-message state lives in the stages, not the script**: `sample` for rate limiting, `aggregate`
+for windowed counters/min/max/avg, and the multi-signal `script` stage's input cache for
+latest-value snapshots across signals. A common pattern is a `script` that *shapes* each message
 feeding an `aggregate` that *accumulates*.
 
 ## Sandbox & limits
@@ -484,7 +606,8 @@ first-class facts about a message, not implementation detail.
 
 ## Limits and gotchas
 
-- **Stateless** — no memory across messages; use `sample`/`aggregate` for cross-message state.
+- **No script-held state** — no script variable survives across messages; cross-message state comes
+  from the stages (`sample`, `aggregate`, or the [multi-signal input cache](#multi-signal-inputs)).
 - **Fail-closed / drop-on-error** — a filter that errors drops the message; a transform that errors or
   returns a non-JSON value drops it. Scripts never crash the route.
 - **The op budget** bounds each evaluation in both engines — deep loops over large arrays on every

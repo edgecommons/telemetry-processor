@@ -30,7 +30,7 @@ use std::sync::Arc;
 use edgecommons::config::model::Config;
 use edgecommons::config::template::resolve;
 use edgecommons::messaging::message::{Message, MessageIdentity};
-use edgecommons::messaging::MessagingService;
+use edgecommons::messaging::{topic_matches, MessagingService};
 use edgecommons::prelude::*;
 use edgecommons::uns::reserved_class_of;
 use rhai::Engine;
@@ -38,7 +38,9 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::config::{parse_target, GlobalDefaults, RouteConfig, ScriptEngineKind};
+use crate::config::{
+    parse_target, GlobalDefaults, RouteConfig, ScriptEngineKind, ScriptStageSpec, StageConfig,
+};
 use crate::observe::{spawn_metric_emitter, EvtEmitter, RouteStats};
 use crate::proc::route::{run_worker, Dispatcher};
 use crate::proc::{now_ms, Control, Pipeline, ProcMsg};
@@ -235,7 +237,7 @@ impl ProcessorApp {
         config: &Config,
         ctx: &RouteBuildCtx<'_>,
         evt: &Arc<EvtEmitter>,
-        route: RouteConfig,
+        mut route: RouteConfig,
     ) -> anyhow::Result<BuiltRoute> {
         let _ = gg; // used only under the `streaming` feature (stream targets)
         let route_key = route.key.clone().unwrap_or_else(|| ctx.default_key.to_string());
@@ -247,6 +249,7 @@ impl ProcessorApp {
         let target = parse_target(&target_str)?;
 
         anyhow::ensure!(!route.subscribe.is_empty(), "route '{}' has no subscribe topics", route.id);
+        let filters: Vec<String> = route.subscribe.iter().map(|f| resolve(config, f)).collect();
 
         let mut publish = route.publish.clone().unwrap_or_default();
         if let Some(t) = &publish.topic {
@@ -263,6 +266,23 @@ impl ProcessorApp {
                 );
             }
             publish.topic = Some(resolved);
+        }
+
+        // Resolve + validate every script stage's explicit output topic: reserved classes and
+        // subscribe-overlap feedback loops are startup errors, and a route-level `publish.topic`
+        // may not silently override a stage output topic.
+        for sc in route.pipeline.iter_mut() {
+            let StageConfig::Script(ScriptStageSpec::Spec(sp)) = sc else { continue };
+            let Some(out) = sp.output.as_mut() else { continue };
+            let resolved = resolve(config, &out.topic);
+            validate_script_output_topic(
+                &route.id,
+                &resolved,
+                config.effective_include_root(),
+                &filters,
+                publish.topic.as_deref(),
+            )?;
+            out.topic = resolved;
         }
 
         // Restamp policy: `local` output carries the processor's own identity (instance = route id)
@@ -292,6 +312,8 @@ impl ProcessorApp {
             component_name: ctx.component_name.to_string(),
             component_full_name: ctx.component_full_name.to_string(),
             route_id: route.id.clone(),
+            // The producer identity for multi-signal script output envelopes (instance = route id).
+            identity: config.identity().with_instance(&route.id).ok(),
         });
         let engine_kind = route.script_engine.unwrap_or(ctx.default_script_engine);
         let pipeline = Pipeline::build(
@@ -322,7 +344,6 @@ impl ProcessorApp {
         let (control_tx, control_rx) = mpsc::channel::<Control>(CONTROL_QUEUE);
         self.workers.push(tokio::spawn(run_worker(pipeline, rx, control_rx, dispatcher)));
 
-        let filters: Vec<String> = route.subscribe.iter().map(|f| resolve(config, f)).collect();
         for f in &filters {
             tracing::info!(route = %route.id, filter = %f, "route wired");
         }
@@ -514,4 +535,91 @@ fn set_paused(handles: &[RouteHandle], request: &Message, paused: bool) -> Value
     }
     let key = if paused { "paused" } else { "resumed" };
     json!({ key: affected })
+}
+
+/// Validate a script stage's resolved `output.topic` for one route: reject reserved UNS classes,
+/// reject an output that any of the route's own subscribe filters would re-consume (a direct
+/// feedback loop — cross-route re-consumption is stopped at runtime by the self-echo guard), and
+/// reject a route-level `publish.topic` alongside it (the dispatcher's per-route topic would
+/// silently override the per-stage output topic).
+fn validate_script_output_topic(
+    route_id: &str,
+    topic: &str,
+    include_root: bool,
+    filters: &[String],
+    route_publish_topic: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(cls) = reserved_class_of(topic, include_root) {
+        anyhow::bail!(
+            "route '{route_id}': script output.topic '{topic}' targets the RESERVED UNS class \
+             '{}' — target a data/evt/app class instead",
+            cls.token()
+        );
+    }
+    for f in filters {
+        anyhow::ensure!(
+            !topic_matches(f, topic),
+            "route '{route_id}': script output.topic '{topic}' overlaps this route's subscribe \
+             filter '{f}' — a feedback loop; publish the derived signal outside the route's input \
+             filters"
+        );
+    }
+    anyhow::ensure!(
+        route_publish_topic.is_none(),
+        "route '{route_id}': `publish.topic` and a script stage `output.topic` are mutually \
+         exclusive — the route-level topic would override the stage output; drop one of the two"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_output_topic_validation() {
+        let filters = vec!["ecv1/+/+/+/data/#".to_string()];
+        // A data-class topic under the subscribed fleet filter is a feedback loop.
+        let err = validate_script_output_topic(
+            "r1",
+            "ecv1/gw-1/telemetry-processor/r1/data/derived",
+            true,
+            &filters,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("feedback loop"), "{err}");
+
+        // A reserved class (`metric`) is rejected outright.
+        let err = validate_script_output_topic(
+            "r1",
+            "ecv1/gw-1/telemetry-processor/r1/metric/derived",
+            true,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("RESERVED"), "{err}");
+
+        // A route publish.topic alongside a stage output topic is ambiguous.
+        let err = validate_script_output_topic(
+            "r1",
+            "ecv1/gw-1/telemetry-processor/r1/data/derived",
+            true,
+            &[],
+            Some("ecv1/gw-1/telemetry-processor/r1/data/other"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually"), "{err}");
+
+        // A non-overlapping data topic with no publish.topic passes.
+        validate_script_output_topic(
+            "r1",
+            "ecv1/gw-1/telemetry-processor/r1/data/derived",
+            true,
+            &["ecv1/+/opcua-adapter/+/data/#".to_string()],
+            None,
+        )
+        .unwrap();
+    }
 }

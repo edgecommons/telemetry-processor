@@ -85,6 +85,7 @@ to 0 or 1, an `aggregate` accumulates and emits on window close, the rest pass 1
 | `aggregate` | `{ "aggregate": { "window": "10s", "by": "body.signal.id", "fn": ["avg","max","min","sum","count","first","last"] } }` | Tumbling-window reduction per key. `window` is time (`"10s"` / `"500ms"`) or a bare record count (`"100"`). Emits one `ProcessedTelemetry` message per `(key, window)` on close (§2). |
 | `project` | `{ "project": { "keep": ["signal","samples"], "set": { "origin": "processor" } } }` | `keep` whitelists **top-level body keys** (the first segment of each listed path); `set` overlays literal fields onto the body. With neither, the body passes through. |
 | `script` | `{ "script": "#{ \"scaled\": value * 0.1 }" }` | A Rhai program that returns a new body map; `()` drops the message (§9). |
+| `script` (multi-signal) | `{ "script": { "file": "oee.lua", "inputs": { … }, "output": { "topic": "…" } } }` | Stateful named inputs: cache the latest value of every selected signal, evaluate on any change with the full snapshot bound as `inputs`, and publish the result as a new envelope on `output.topic` (§12). |
 
 Scripts run in the route's `scriptEngine` — `rhai` (default, always compiled in) or `lua` (needs the
 `scripting-lua` build); the scope and return contract are **identical** in both engines. A
@@ -907,6 +908,81 @@ What each lever does here:
 > The same config works unchanged for a genuinely southbound payload — drop the two scripts, set
 > `key` back to `body.signal.id`, and omit the `rows` block to fall back to the built-in projection.
 > Payload-agnostic is the default posture; the southbound shape is just the most common case.
+
+---
+
+## 12. Multi-signal OEE from named inputs (Lua)
+
+A derived KPI whose operands are **independent signals**: the script declares named `inputs`, the
+stage caches the latest value of each, and every change to any operand refreshes the calculation.
+The result is published as a **new signal** on its own UNS topic via `output.topic` — not spliced
+into whichever source message happened to arrive last. See
+[Scripting — multi-signal inputs](scripting.mdx#multi-signal-inputs) for the semantics and the
+[configuration reference](reference/configuration.md#script-inputs) for every selector field.
+
+```jsonc
+// config.json — component section
+"component": {
+  "global": { "defaults": { "scriptsDir": "./scripts", "scriptEngine": "lua" } },
+  "instances": [
+    {
+      "id": "oee-filler",
+      "subscribe": [ "ecv1/gw-fill-01/opcua-adapter/+/data/#" ],
+      "pipeline": [
+        { "script": {
+            "file": "oee.lua",
+            "inputs": {
+              "running":     { "device": "gw-fill-01", "signalId": "FillerRunning" },
+              "idealCycleS": { "device": "gw-fill-01", "signalId": "IdealCycleSeconds" },
+              "plannedRunS": { "device": "gw-fill-01", "signalId": "PlannedRunSeconds" },
+              "totalCount":  { "device": "gw-fill-01", "signalId": "TotalBottleCount" },
+              "goodCount":   { "device": "gw-fill-01", "signalId": "GoodBottleCount" }
+            },
+            "output": {
+              "topic": "ecv1/gw-fill-01/telemetry-processor/oee/data/current",
+              "name": "OeeSnapshot"
+            }
+        } }
+      ],
+      "target": "local"
+    }
+  ]
+}
+```
+
+```lua
+-- scripts/oee.lua — the script owns completeness (the stage does not gate by default)
+for _, k in ipairs({ "running", "idealCycleS", "plannedRunS", "totalCount", "goodCount" }) do
+  if inputs[k] == nil then return nil end               -- wait until every operand has arrived
+end
+if inputs.running.value ~= true then return nil end     -- line stopped → hold the last output
+
+local perf = (inputs.idealCycleS.value * inputs.totalCount.value) / inputs.plannedRunS.value
+local qual = inputs.goodCount.value / inputs.totalCount.value
+
+return {
+  oee         = perf * qual,
+  performance = perf,
+  quality     = qual,
+  basedOn     = trigger.name    -- which operand refreshed this result
+}
+```
+
+What each lever does here:
+
+- **`inputs` selectors** — each operand is pinned by `device` + `signalId`, so an unrelated signal
+  under the same subscribe filter is consumed without effect. The stage runs the script on every
+  value/quality change of any operand and does **not** gate on missing inputs, so the script waits
+  for all five itself (the `ipairs` guard). Prefer `"required": true` on each input if you'd rather
+  the stage do the waiting and drop the guard. Input state is partitioned per source device.
+- **`output.topic`** — every successful evaluation publishes a fresh `OeeSnapshot` envelope on the
+  `oee` instance's `data/current` topic, produced by the processor (identity instance =
+  `oee-filler`) and correlated (`correlation_id`) to the triggering update. The topic must not fall
+  under the route's own `subscribe` filters — here the route listens on `opcua-adapter` topics and
+  publishes on the processor's own, so there is no feedback loop.
+- **`return nil` on a stopped line** — a `nil`/`()` result publishes nothing, so downstream
+  consumers keep the last computed OEE while `running` is false. A bad-quality operand can be held
+  the same way (`if inputs.goodCount.quality ~= "GOOD" then return nil end`).
 
 ---
 

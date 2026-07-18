@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use edgecommons::messaging::message::MessageIdentity;
 use rhai::{Dynamic, Engine, Scope, AST};
 use serde_json::Value;
 use smallvec::smallvec;
@@ -42,6 +43,20 @@ pub struct ScriptContext {
     pub component_full_name: String,
     /// The owning route's id — exposed as `routeId`.
     pub route_id: String,
+    /// The processor's own message identity for this route (instance = route id) — the producer
+    /// identity stamped on a multi-signal script stage's configured-output envelopes. Not exposed
+    /// as a script binding.
+    pub identity: Option<MessageIdentity>,
+}
+
+/// The extra bindings a multi-signal `script` stage passes into an evaluation: the `inputs`
+/// snapshot map and the `trigger` view of the input that fired it.
+#[derive(Debug, Clone)]
+pub struct MultiBindings {
+    /// `{name: {value, quality, timestamp, recvMs, topic}}` for every initialized input.
+    pub inputs: Value,
+    /// `{name, value, quality, timestamp, recvMs, topic}` of the triggering input.
+    pub trigger: Value,
 }
 
 /// Resolves [`ScriptSource`]s to Rhai source text. `File` paths resolve against `base` (the
@@ -82,7 +97,12 @@ pub trait ScriptEngine: Send {
     /// Evaluate as a `filter` predicate. Truthy → keep; error → `false` (drop), logged. Fails closed.
     fn eval_bool(&self, m: &ProcMsg) -> bool;
     /// Evaluate as a `script` transform: `Some(new_body)` or `None` to drop. Error / non-JSON → `None`.
-    fn eval_body(&self, m: &ProcMsg) -> Option<Value>;
+    fn eval_body(&self, m: &ProcMsg) -> Option<Value> {
+        self.eval_body_with(m, None)
+    }
+    /// [`Self::eval_body`] with the multi-signal `inputs`/`trigger` bindings additionally in scope
+    /// (`None` leaves them unbound / `nil`).
+    fn eval_body_with(&self, m: &ProcMsg, multi: Option<&MultiBindings>) -> Option<Value>;
 }
 
 /// Compile `src` into the engine selected by `kind`, sharing the Rhai `engine` (Rhai) or building a
@@ -133,7 +153,7 @@ impl RhaiEval {
         Ok(Self { engine: engine.clone(), ast, ctx: ctx.clone() })
     }
 
-    fn scope_for(&self, m: &ProcMsg) -> Scope<'static> {
+    fn scope_for(&self, m: &ProcMsg, multi: Option<&MultiBindings>) -> Scope<'static> {
         let mut scope = Scope::new();
         scope.push("topic", m.topic.clone());
         // Runtime context — constant per route, so a generic/reused script can branch on identity.
@@ -164,6 +184,11 @@ impl RhaiEval {
             first.and_then(|s| s.get("quality")).and_then(|q| q.as_str()).unwrap_or("").to_string();
         scope.push_dynamic("value", to_dyn(&value));
         scope.push("quality", quality);
+        // Multi-signal bindings (only a multi-input stage passes them).
+        if let Some(mb) = multi {
+            scope.push_dynamic("inputs", to_dyn(&mb.inputs));
+            scope.push_dynamic("trigger", to_dyn(&mb.trigger));
+        }
         scope
     }
 
@@ -172,7 +197,7 @@ impl RhaiEval {
 impl ScriptEngine for RhaiEval {
     /// Errors → `false` (drop), logged.
     fn eval_bool(&self, m: &ProcMsg) -> bool {
-        let mut scope = self.scope_for(m);
+        let mut scope = self.scope_for(m, None);
         match self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &self.ast) {
             Ok(d) => d.as_bool().unwrap_or(false),
             Err(e) => {
@@ -183,8 +208,8 @@ impl ScriptEngine for RhaiEval {
     }
 
     /// `()` → drop; non-convertible/error → drop, logged.
-    fn eval_body(&self, m: &ProcMsg) -> Option<Value> {
-        let mut scope = self.scope_for(m);
+    fn eval_body_with(&self, m: &ProcMsg, multi: Option<&MultiBindings>) -> Option<Value> {
+        let mut scope = self.scope_for(m, multi);
         match self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &self.ast) {
             Ok(d) if d.is_unit() => None,
             Ok(d) => match rhai::serde::from_dynamic::<Value>(&d) {
@@ -248,7 +273,7 @@ mod lua {
     use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, VmState};
     use serde_json::Value;
 
-    use super::{ProcMsg, ScriptContext, ScriptEngine};
+    use super::{MultiBindings, ProcMsg, ScriptContext, ScriptEngine};
 
     /// Per-evaluation instruction budget, mirroring Rhai's `max_operations`.
     const OP_BUDGET: i64 = 1_000_000;
@@ -304,7 +329,7 @@ mod lua {
         }
 
         /// Marshal the per-message data into globals + reset the op budget.
-        fn bind(&self, m: &ProcMsg) {
+        fn bind(&self, m: &ProcMsg, multi: Option<&MultiBindings>) {
             self.budget.store(OP_BUDGET, Ordering::Relaxed);
             let g = self.lua.globals();
             let _ = g.set("topic", m.topic.clone());
@@ -338,12 +363,28 @@ mod lua {
                 let _ = g.set("value", v);
             }
             let _ = g.set("quality", quality);
+            // Multi-signal bindings — always (re)set, so a stale `inputs`/`trigger` from a prior
+            // evaluation can never leak into a later one (globals persist across calls).
+            match multi {
+                Some(mb) => {
+                    if let Ok(v) = self.lua.to_value(&mb.inputs) {
+                        let _ = g.set("inputs", v);
+                    }
+                    if let Ok(v) = self.lua.to_value(&mb.trigger) {
+                        let _ = g.set("trigger", v);
+                    }
+                }
+                None => {
+                    let _ = g.set("inputs", LuaValue::Nil);
+                    let _ = g.set("trigger", LuaValue::Nil);
+                }
+            }
         }
     }
 
     impl ScriptEngine for LuaEngine {
         fn eval_bool(&self, m: &ProcMsg) -> bool {
-            self.bind(m);
+            self.bind(m, None);
             match self.func.call::<LuaValue>(()) {
                 // Lua truthiness: only `nil` and `false` drop; everything else keeps.
                 Ok(LuaValue::Nil) | Ok(LuaValue::Boolean(false)) => false,
@@ -355,8 +396,8 @@ mod lua {
             }
         }
 
-        fn eval_body(&self, m: &ProcMsg) -> Option<Value> {
-            self.bind(m);
+        fn eval_body_with(&self, m: &ProcMsg, multi: Option<&MultiBindings>) -> Option<Value> {
+            self.bind(m, multi);
             match self.func.call::<LuaValue>(()) {
                 Ok(LuaValue::Nil) => None,
                 Ok(v) => match self.lua.from_value::<Value>(v) {
@@ -490,6 +531,7 @@ mod tests {
             component_name: comp.into(),
             component_full_name: full.into(),
             route_id: route.into(),
+            identity: None,
         })
     }
 

@@ -75,7 +75,7 @@ the later stages' `process`.
 | `sample` | Per-key downsampling: keep one message per `everyMs` time window, or one in every `everyN`. The key path is `by`, falling back to the route key (`body.signal.id`). | yes (per key) |
 | `aggregate` | Tumbling-window reduction. The window is time (`"10s"`, `"500ms"`) or a bare count (`"100"`); state is keyed by `by`/route key; the folded value is `value` (default `body.samples[].value`); reducers are `avg` `max` `min` `sum` `count` `first` `last`. Emits one `ProcessedTelemetry` message per `(key, window)` when the window closes. | yes (per key) |
 | `project` | Reshape the body: `keep` a whitelist of **top-level** body keys (the first segment of each dotted path — so `keep: ["signal.id"]` retains the whole `signal` object), and/or `set` literal fields onto the body. | no |
-| `script` | A Rhai or Lua program (inline or from a file) that returns a new body map, or a "nothing" value to drop the message. Its scope exposes `topic`, `header`, `body`, `tags`, `identity` (the source publisher's UNS identity), `samples`, and the conveniences `value`/`quality`. See [Scripting](#scripting). | no |
+| `script` | A Rhai or Lua program (inline or from a file) that returns a new body map, or a "nothing" value to drop the message. Its scope exposes `topic`, `header`, `body`, `tags`, `identity` (the source publisher's UNS identity), `samples`, and the conveniences `value`/`quality`. The **multi-signal form** declares named `inputs` (cached latest values across independent signals, evaluated on change with an `inputs`/`trigger` scope) and an optional `output` topic that publishes each result as a new envelope. See [Scripting](#scripting). | no (multi-signal form: yes — per-device input cache) |
 
 Rhai is **always compiled in** — there is no feature gate, and the runtime cost is negligible when no
 route uses a script. One engine is shared by every `filter`/`script` stage, bounded to a million
@@ -93,21 +93,27 @@ with `scriptEngine`: **[Rhai](https://rhai.rs)** (pure-Rust, always compiled in,
 is compiled **once at startup**, sandboxed, and bounded, so it can shape data but can't reach outside
 the pipeline.
 
-Scripting appears in **two roles**, both backed by the same scope:
+Scripting appears in **three roles**, all backed by the same scope:
 
 - a **`filter` `script`** — a predicate; a truthy result keeps the message (it fails *closed* — an
   error drops).
 - a **`script` stage** — a transform that returns the **new body**, or a "nothing" value (`()` in
   Rhai, `nil` in Lua) to **drop** the message.
+- a **multi-signal `script` stage** — the same transform contract computed over **several
+  independent signals**: the stage caches the latest value of each named input and re-runs the
+  script whenever one changes, binding the snapshot as `inputs` and the firing input as `trigger`.
+  The stage does not gate on missing inputs by default — the script owns completeness (an input
+  opts into stage-level waiting with `required: true`). With an `output` topic the result becomes a
+  **new derived signal** rather than an edit of the triggering message.
 
 A script sees the **message view** (`topic`, the `header`/`body`/`tags` maps, the source publisher's
 `identity`, `samples`, and the first-sample conveniences `value`/`quality`) plus the **runtime
 context** (`thingName`, `componentName`, `componentFullName`, `routeId`, `recvMs`) so a generic,
 reusable script can branch on which component/route/thing it runs in, or on the source device/adapter
-(`identity.device` / `identity.component`). Scripts are **stateless** —
-each evaluation sees only the current
-message; cross-message state belongs in `sample`/`aggregate`. Array-valued fields arrive as native
-arrays, so a script can iterate/reduce over them like any collection.
+(`identity.device` / `identity.component`). A script itself holds **no state** — each evaluation is
+a pure function of its bindings; cross-message state belongs to the stages (`sample`, `aggregate`,
+and the multi-signal `script` stage's input cache). Array-valued fields arrive as native arrays, so
+a script can iterate/reduce over them like any collection.
 
 > **Scripting has its own guide.** The dedicated **[Scripting page](scripting.mdx)** is the full
 > treatment: every scope binding, return and error semantics, a Rhai language primer (functions,
@@ -225,7 +231,9 @@ can be declared column-by-column. A payload that is *not* southbound-shaped is n
 the defaults, the aggregate stage folds the whole body as one value.
 
 `filter`, `sample`, `project`, and `script` preserve the envelope (filter passes it untouched; project
-and script rewrite the body). The `aggregate` stage is the one that **emits a new message shape**,
+and script rewrite the body) — except a multi-signal `script` with an `output`, which mints a fresh
+`ScriptResult` envelope produced by the processor itself. The `aggregate` stage is the other one that
+**emits a new message shape**,
 `ProcessedTelemetry`: it reuses the first message of the window as the base (so the envelope `tags` and
 the source `signal` carry through) and rewrites the body to
 
