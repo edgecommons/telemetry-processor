@@ -951,7 +951,10 @@ into whichever source message happened to arrive last. See
 ```
 
 ```lua
--- scripts/oee.lua
+-- scripts/oee.lua — the script owns completeness (the stage does not gate by default)
+for _, k in ipairs({ "running", "idealCycleS", "plannedRunS", "totalCount", "goodCount" }) do
+  if inputs[k] == nil then return nil end               -- wait until every operand has arrived
+end
 if inputs.running.value ~= true then return nil end     -- line stopped → hold the last output
 
 local perf = (inputs.idealCycleS.value * inputs.totalCount.value) / inputs.plannedRunS.value
@@ -968,9 +971,10 @@ return {
 What each lever does here:
 
 - **`inputs` selectors** — each operand is pinned by `device` + `signalId`, so an unrelated signal
-  under the same subscribe filter is consumed without effect. The stage evaluates only after **all
-  five** inputs have been observed (they are all `required` by default) and then on every
-  value/quality change of any one of them. Input state is partitioned per source device.
+  under the same subscribe filter is consumed without effect. The stage runs the script on every
+  value/quality change of any operand and does **not** gate on missing inputs, so the script waits
+  for all five itself (the `ipairs` guard). Prefer `"required": true` on each input if you'd rather
+  the stage do the waiting and drop the guard. Input state is partitioned per source device.
 - **`output.topic`** — every successful evaluation publishes a fresh `OeeSnapshot` envelope on the
   `oee` instance's `data/current` topic, produced by the processor (identity instance =
   `oee-filler`) and correlated (`correlation_id`) to the triggering update. The topic must not fall

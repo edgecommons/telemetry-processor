@@ -128,8 +128,10 @@ pub struct InputSelector {
     pub signal_name: Option<String>,
     /// Match the arriving topic against this MQTT-style filter (`+`/`#` supported).
     pub topic: Option<String>,
-    /// Whether the script waits for this input before its first evaluation. Default `true`; an
-    /// optional input (`false`) is simply absent from the `inputs` snapshot until it arrives.
+    /// Opt this input into stage-level gating: when `true`, the stage withholds every evaluation
+    /// until this input has been observed. Default `false` — the stage does not gate and the
+    /// script decides whether the (possibly partial) `inputs` snapshot is enough to compute; an
+    /// input that has not arrived is simply absent from the snapshot.
     pub required: Option<bool>,
 }
 

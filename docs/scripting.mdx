@@ -159,10 +159,16 @@ Two bindings join the ordinary scope (which still describes the *triggering* mes
 
 The semantics, precisely:
 
-- **Initialization gate.** The script does not run until every input marked `required` (the default)
-  has been observed at least once — a half-initialized OEE is never computed. An input with
-  `"required": false` doesn't gate; it is simply absent from `inputs` until it arrives, so the
-  script checks for it (`inputs.x != ()` in Rhai, `inputs.x ~= nil` in Lua… or Rhai's `"x" in inputs`).
+- **Completeness is the script's job, not the stage's.** By default the stage does **not** withhold
+  evaluation for missing inputs: it runs the script on the first — and every — matched change, and an
+  input that hasn't arrived yet is simply absent from `inputs`. The script decides whether it has
+  enough to compute and returns the drop value (`()` in Rhai / `nil` in Lua) otherwise. Check for an
+  input with `"x" in inputs` (Rhai) or `inputs.x ~= nil` (Lua). This keeps the *policy* — which
+  operands are essential, and what to do while you wait — in the script, where the domain logic lives.
+- **Opt-in stage gating (`required: true`).** If you'd rather the stage hold off until an operand
+  exists, mark that input `"required": true`; the stage then withholds every evaluation until all
+  such inputs have been observed. It's a convenience for the common "need them all" case — the script
+  is still free to guard beyond it (e.g. on quality). With no `required` input, the stage never gates.
 - **Change detection.** A message that repeats an input's current value *and* quality refreshes its
   timestamps but does not re-evaluate. A quality flip alone (GOOD → BAD) *is* a change — the script
   decides what to do with a bad-quality operand (return the drop value to hold the last output).
@@ -172,8 +178,8 @@ The semantics, precisely:
 - **Consumed, not forwarded.** A multi-input stage is a *sink* for its matched messages: the
   triggering message is consumed (its data lives on in the snapshot), and a subscribed message that
   matches no input is consumed silently. Put a multi-input `script` last in its pipeline.
-- **Restart-empty.** The cache is in-memory; after a restart the stage deterministically re-awaits
-  its required inputs before the first evaluation (each initialization is logged).
+- **Restart-empty.** The cache is in-memory; after a restart each input re-initializes on its next
+  message (an `inputs`-guarding script simply waits for what it needs, as it does at first startup).
 
 **The output side.** Without `output`, the result replaces the triggering message's body in place —
 which couples the derived value to whichever source topic happened to move last. A derived signal
@@ -185,13 +191,18 @@ route's startup validation rejects an output topic on a reserved UNS class or on
 `subscribe` filters would re-consume (a feedback loop), and the processor's self-echo guard drops
 any re-consumed copy of its own output as a second line of defense.
 
-A working OEE script over those inputs:
+A working OEE script over those inputs. Because the stage doesn't gate, the script waits for its
+operands itself — a one-line guard. (Prefer `"required": true` on the five inputs if you'd rather the
+stage hold off until they exist; then you can drop the presence check.)
 
 <Tabs syncKey="script-engine">
 <TabItem label="Rhai">
 
 ```rhai
 // Availability × Performance × Quality, refreshed on any operand change.
+for k in ["running", "idealCycleS", "plannedRunS", "totalCount", "goodCount"] {
+    if !(k in inputs) { return (); }                    // wait until every operand exists
+}
 if inputs.running.value != true { return (); }          // line stopped → hold the last value
 
 let perf = (inputs.idealCycleS.value * inputs.totalCount.value) / inputs.plannedRunS.value;
@@ -210,6 +221,9 @@ let qual = inputs.goodCount.value / inputs.totalCount.value;
 
 ```lua
 -- Availability × Performance × Quality, refreshed on any operand change.
+for _, k in ipairs({ "running", "idealCycleS", "plannedRunS", "totalCount", "goodCount" }) do
+  if inputs[k] == nil then return nil end               -- wait until every operand exists
+end
 if inputs.running.value ~= true then return nil end     -- line stopped → hold the last value
 
 local perf = (inputs.idealCycleS.value * inputs.totalCount.value) / inputs.plannedRunS.value

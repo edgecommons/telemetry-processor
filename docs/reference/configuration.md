@@ -149,11 +149,13 @@ cookbook of worked examples in **both engines** — see the dedicated **[Scripti
 
 <a id="script-inputs"></a>**`inputs` — named multi-signal inputs.** A map of input name →
 **selector**. The stage caches the latest observation of every input and evaluates the script when a
-matched input's **value or quality changes**, binding the full snapshot as
-[`inputs` and the firing input as `trigger`](../scripting.mdx#multi-signal-inputs). The script does
-not run until every required input has been observed. Each selector needs at least one of
-`signalId`/`signalName`/`topic`; unknown selector fields fail the route at build time, as do two
-inputs with identical selectors.
+matched input's **value or quality changes**, binding the current snapshot as
+[`inputs` and the firing input as `trigger`](../scripting.mdx#multi-signal-inputs). **By default the
+stage does not gate on missing inputs** — it runs the script on the first (and every) matched change,
+an unarrived input is simply absent from the snapshot, and the script decides whether it has enough
+to compute (see [completeness](../scripting.mdx#multi-signal-inputs)). Each selector needs at least
+one of `signalId`/`signalName`/`topic`; unknown selector fields fail the route at build time, as do
+two inputs with identical selectors.
 
 | Selector field | Type | Meaning |
 |----------------|------|---------|
@@ -163,12 +165,12 @@ inputs with identical selectors.
 | `device` | string | Match the source envelope identity's device. Identity-based fields never match a message without an envelope identity. |
 | `component` | string | Match the source envelope identity's component token. |
 | `instance` | string | Match the source envelope identity's instance token. |
-| `required` | boolean (default `true`) | Whether the script waits for this input before its first evaluation. An optional input is absent from the `inputs` snapshot until it arrives. |
+| `required` | boolean (default `false`) | Opt this input into stage-level gating. When `true`, the stage withholds every evaluation until this input has been observed. When `false` (default), the stage never waits on it — the script owns completeness and the input is simply absent from the snapshot until it arrives. |
 
 Cached input state is **partitioned by the source device** (the envelope identity), so two devices
-publishing the same signal ids never mix into one snapshot. State is in-memory and empty at startup:
-the stage re-awaits every required input before the first evaluation. A message that matches no
-input is consumed by the stage.
+publishing the same signal ids never mix into one snapshot. State is in-memory and empty at startup;
+each input (re)initializes on its next message. A message that matches no input is consumed by the
+stage.
 
 **`output` — an explicit output topic.** Without `output`, the script result replaces the triggering
 message's body in place (the classic behavior). With `output`, each successful evaluation is

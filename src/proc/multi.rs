@@ -4,16 +4,23 @@
 //! by a selector (`device`/`component`/`instance` against the envelope identity, `signalId`/
 //! `signalName` against `body.signal`, and/or an MQTT-style `topic` filter). The stage caches the
 //! latest value/quality/timestamps of every input and evaluates the script when a matched input's
-//! **value or quality changes**, binding a consistent snapshot of all inputs as `inputs` and the
-//! firing input as `trigger` (alongside the ordinary per-message bindings for the triggering
-//! message). The script does not run until every `required` input has been initialized.
+//! **value or quality changes**, binding a consistent snapshot of the currently-known inputs as
+//! `inputs` and the firing input as `trigger` (alongside the ordinary per-message bindings for the
+//! triggering message).
+//!
+//! **Completeness is the script's responsibility, not the stage's.** By default the stage does not
+//! withhold evaluation for missing inputs: it runs the script on the first (and every) matched
+//! change, and an input that has not arrived yet is simply absent from the `inputs` snapshot
+//! (`inputs.x == ()` in Rhai / `nil` in Lua). The script decides whether it has enough to compute
+//! and returns the drop value (`()` / `nil`) otherwise. An input may **opt in** to stage-level
+//! gating with `required: true`; the stage then withholds every evaluation until all such inputs
+//! have been observed. With no `required` input configured, the stage never gates.
 //!
 //! Cached state is **partitioned by the source device** (the envelope identity's deepest hierarchy
 //! value), so two devices publishing the same signal ids can never contaminate each other's
 //! snapshot. Identity-based selectors only match messages that carry an envelope identity;
 //! identity-less sources are selected by explicit `topic` filters and share one partition. State is
-//! in-memory and restart-empty: after a restart the stage deterministically re-awaits every
-//! required input before the first evaluation.
+//! in-memory and restart-empty.
 //!
 //! With an `output` configured, each successful evaluation is published as a **new** EdgeCommons
 //! envelope on `output.topic`: the body is the script result, the producer identity is the
@@ -98,7 +105,9 @@ impl MultiScriptStage {
                 inputs.push(CompiledInput {
                     name: name.clone(),
                     sel: sel.clone(),
-                    required: sel.required.unwrap_or(true),
+                    // Completeness is the script's job by default; `required: true` opts an input
+                    // into stage-level gating.
+                    required: sel.required.unwrap_or(false),
                 });
             }
             for i in 0..inputs.len() {
@@ -201,7 +210,9 @@ impl Processor for MultiScriptStage {
             return smallvec![];
         }
 
-        // 3. Gate: every required input must be initialized before the first evaluation.
+        // 3. Optional gate: only inputs that explicitly opt in with `required: true` withhold
+        //    evaluation. By default nothing is required, so the stage never gates here and the
+        //    script itself decides whether the (possibly partial) snapshot is enough to compute.
         let missing: Vec<&str> = self
             .inputs
             .iter()
@@ -209,7 +220,7 @@ impl Processor for MultiScriptStage {
             .map(|ci| ci.name.as_str())
             .collect();
         if !missing.is_empty() {
-            tracing::debug!(missing = ?missing, "multi-signal evaluation deferred: awaiting inputs");
+            tracing::debug!(missing = ?missing, "multi-signal evaluation deferred: awaiting required inputs");
             return smallvec![];
         }
 
@@ -372,10 +383,13 @@ mod tests {
         )
     }
 
-    /// A two-input spec (a + b) whose script returns both values plus the trigger name.
+    /// A two-input spec (a + b). The stage does not gate (no `required`), so the **script** guards
+    /// its own completeness — it computes only once both inputs are present, else drops.
     fn two_input_spec(output: bool) -> ScriptSpec {
         let mut v = json!({
-            "source": r#"#{ "a": inputs.a.value, "b": inputs.b.value, "by": trigger.name }"#,
+            "source": r#"if "a" in inputs && "b" in inputs {
+                             #{ "a": inputs.a.value, "b": inputs.b.value, "by": trigger.name }
+                         } else { () }"#,
             "inputs": {
                 "a": { "device": "gw-1", "signalId": "A" },
                 "b": { "device": "gw-1", "signalId": "B" }
@@ -388,11 +402,12 @@ mod tests {
     }
 
     #[test]
-    fn does_not_evaluate_until_all_required_inputs_initialized() {
+    fn script_owns_completeness_and_computes_once_all_inputs_present() {
         let mut s = build(&two_input_spec(false));
-        // Only `a` has arrived → no evaluation, out-of-order init is fine.
+        // Only `a` has arrived. The stage DOES invoke the script (it does not gate); the script
+        // itself drops because `b` is not in the snapshot yet. Out-of-order init is fine.
         assert!(s.process(signal_msg("gw-1", "A", json!(1), "GOOD")).is_empty());
-        // `b` arrives → the snapshot is complete and the script runs once.
+        // `b` arrives → the script sees both and computes.
         let out = s.process(signal_msg("gw-1", "B", json!(2), "GOOD"));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].msg.body, json!({ "a": 1, "b": 2, "by": "b" }));
@@ -422,30 +437,44 @@ mod tests {
     }
 
     // A script that ignores its inputs and always returns a constant. It CANNOT be the thing
-    // deciding whether to emit — so if the stage ever invokes it, output appears. These two tests
-    // therefore isolate the *stage's* gating/change-detection from any fail-closed script
-    // behavior (a real script that errors or returns nil on a missing/unchanged input would also
-    // yield no output, which would not distinguish the two layers).
-    fn constant_two_input_spec() -> ScriptSpec {
+    // deciding whether to emit — so output appears exactly when the stage invokes it. These tests
+    // therefore isolate the *stage's* (non-)gating and change-detection from any fail-closed
+    // script behavior (a real script that drops on a missing input would also yield no output,
+    // which would not distinguish the two layers).
+    fn constant_two_input_spec(required: bool) -> ScriptSpec {
+        let sel = |id: &str| {
+            if required {
+                json!({ "device": "gw-1", "signalId": id, "required": true })
+            } else {
+                json!({ "device": "gw-1", "signalId": id })
+            }
+        };
         spec_from(json!({
             "source": r#"#{ "fired": true }"#,
-            "inputs": {
-                "a": { "device": "gw-1", "signalId": "A" },
-                "b": { "device": "gw-1", "signalId": "B" }
-            }
+            "inputs": { "a": sel("A"), "b": sel("B") }
         }))
     }
 
     #[test]
-    fn stage_gates_invocation_the_script_is_not_called_before_all_inputs() {
-        let mut s = build(&constant_two_input_spec());
-        // Only `a` present. A constant script WOULD emit `{fired:true}` if the stage called it —
-        // it doesn't, proving the stage withholds the invocation itself.
+    fn default_does_not_gate_the_script_runs_on_the_first_change() {
+        // No `required` inputs → the stage must NOT gate. A constant script that ignores its
+        // inputs fires on the very first matched change, proving the core does not withhold
+        // invocation for missing inputs — completeness is the script's own responsibility.
+        let mut s = build(&constant_two_input_spec(false));
+        let out = s.process(signal_msg("gw-1", "A", json!(1), "GOOD"));
+        assert_eq!(out.len(), 1, "stage must invoke the script on the first change, not gate");
+        assert_eq!(out[0].msg.body, json!({ "fired": true }));
+    }
+
+    #[test]
+    fn required_true_opts_into_stage_gating() {
+        // With `required: true` on both inputs, the stage DOES withhold evaluation until both are
+        // present. A constant script would emit if called, so its silence proves the stage gates.
+        let mut s = build(&constant_two_input_spec(true));
         assert!(
             s.process(signal_msg("gw-1", "A", json!(1), "GOOD")).is_empty(),
-            "the stage must not invoke the script before all required inputs are initialized"
+            "with required:true the stage withholds invocation until all required inputs arrive"
         );
-        // `b` completes the set → now the stage invokes it and the constant is emitted.
         let out = s.process(signal_msg("gw-1", "B", json!(2), "GOOD"));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].msg.body, json!({ "fired": true }));
@@ -453,13 +482,12 @@ mod tests {
 
     #[test]
     fn stage_suppresses_invocation_on_an_unchanged_value() {
-        let mut s = build(&constant_two_input_spec());
-        s.process(signal_msg("gw-1", "A", json!(1), "GOOD"));
-        let first = s.process(signal_msg("gw-1", "B", json!(2), "GOOD"));
-        assert_eq!(first.len(), 1, "fires once both inputs are present");
-        // Re-send `a` with the same value + quality. A constant script WOULD emit again if the
-        // stage called it — it doesn't, proving the stage's change detection suppresses the
-        // invocation (not the script choosing to return nothing).
+        // Change detection is independent of gating. A constant script fires on each genuine
+        // change but not on a repeat, proving the STAGE suppresses the unchanged re-evaluation.
+        let mut s = build(&constant_two_input_spec(false));
+        assert_eq!(s.process(signal_msg("gw-1", "A", json!(1), "GOOD")).len(), 1, "fires on init");
+        assert_eq!(s.process(signal_msg("gw-1", "B", json!(2), "GOOD")).len(), 1, "fires on change");
+        // Re-send `a` with the same value + quality → the stage does not invoke the script again.
         assert!(
             s.process(signal_msg("gw-1", "A", json!(1), "GOOD")).is_empty(),
             "the stage must not invoke the script when no input value/quality changed"
@@ -568,7 +596,7 @@ mod tests {
             }
         }));
         let mut s = build(&spec);
-        // The optional `c` is absent from the snapshot; the required `a` alone evaluates.
+        // `c` is absent from the snapshot; the script computes from `a` alone (no gating).
         let out = s.process(signal_msg("gw-1", "A", json!(3), "GOOD"));
         assert_eq!(out[0].msg.body, json!({ "a": 3 }));
         // Once `c` arrives it appears in the snapshot.
@@ -634,10 +662,16 @@ mod tests {
         use super::*;
 
         /// The OEE shape from the design: named inputs, a Lua calculation, an explicit output.
+        /// The stage does not gate (no `required`); the **script** owns completeness by checking
+        /// each operand is present before computing.
         #[test]
-        fn lua_oee_calculation_over_named_inputs() {
+        fn lua_oee_script_owns_completeness_over_named_inputs() {
             let spec = spec_from(json!({
                 "source": r#"
+                    if inputs.running == nil or inputs.totalCount == nil
+                       or inputs.plannedCount == nil then
+                        return nil    -- wait for all operands (the script gates, not the stage)
+                    end
                     if inputs.running.value ~= true then return nil end
                     local avail = inputs.totalCount.value / inputs.plannedCount.value
                     return { oee = avail, by = trigger.name }

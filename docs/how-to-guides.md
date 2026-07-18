@@ -210,7 +210,8 @@ topic.
 
 Give a `script` stage named `inputs` (one selector per operand) and an `output.topic`. The stage
 caches the latest value of every input, runs the script whenever one of them **changes**, and
-publishes each result as a fresh envelope:
+publishes each result as a fresh envelope. Here both operands are marked `"required": true`, so the
+stage waits until both exist before running — which lets the script stay a clean one-liner:
 
 ```jsonc
 "instances": [
@@ -219,8 +220,8 @@ publishes each result as a fresh envelope:
       { "script": {
           "source": "return { ratio = inputs.good.value / inputs.total.value, by = trigger.name }",
           "inputs": {
-            "good":  { "device": "gw-fill-01", "signalId": "GoodBottleCount" },
-            "total": { "device": "gw-fill-01", "signalId": "TotalBottleCount" }
+            "good":  { "device": "gw-fill-01", "signalId": "GoodBottleCount", "required": true },
+            "total": { "device": "gw-fill-01", "signalId": "TotalBottleCount", "required": true }
           },
           "output": { "topic": "ecv1/gw-fill-01/telemetry-processor/fill-ratio/data/current" }
       } }
@@ -231,8 +232,11 @@ publishes each result as a fresh envelope:
 ```
 
 - The script sees `inputs.<name>.value` / `.quality` / `.timestamp` / `.recvMs` / `.topic` for every
-  operand, and `trigger` for the one whose change fired the evaluation. It does not run until every
-  `required` input (the default) has been observed.
+  operand, and `trigger` for the one whose change fired the evaluation.
+- **Completeness is the script's call.** By default the stage does not wait for missing inputs — it
+  runs the script on the first change and the script guards itself (`if inputs.total == nil then
+  return nil end`). Marking an input `"required": true` (as above) opts into stage-level waiting so
+  the script doesn't have to check; with no `required` input the stage never waits.
 - Input state is isolated **per source device**, so two lines with the same signal ids never mix.
 - The published result is a new envelope — producer = the processor (instance = the route id),
   `correlation_id` = the triggering message's `uuid`. The output topic must not fall under the

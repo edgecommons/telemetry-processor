@@ -101,9 +101,10 @@ Scripting appears in **three roles**, all backed by the same scope:
   Rhai, `nil` in Lua) to **drop** the message.
 - a **multi-signal `script` stage** — the same transform contract computed over **several
   independent signals**: the stage caches the latest value of each named input and re-runs the
-  script whenever one changes, binding the snapshot as `inputs` and the firing input as `trigger`;
-  with an `output` topic the result becomes a **new derived signal** rather than an edit of the
-  triggering message.
+  script whenever one changes, binding the snapshot as `inputs` and the firing input as `trigger`.
+  The stage does not gate on missing inputs by default — the script owns completeness (an input
+  opts into stage-level waiting with `required: true`). With an `output` topic the result becomes a
+  **new derived signal** rather than an edit of the triggering message.
 
 A script sees the **message view** (`topic`, the `header`/`body`/`tags` maps, the source publisher's
 `identity`, `samples`, and the first-sample conveniences `value`/`quality`) plus the **runtime
