@@ -421,6 +421,51 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 
+    // A script that ignores its inputs and always returns a constant. It CANNOT be the thing
+    // deciding whether to emit — so if the stage ever invokes it, output appears. These two tests
+    // therefore isolate the *stage's* gating/change-detection from any fail-closed script
+    // behavior (a real script that errors or returns nil on a missing/unchanged input would also
+    // yield no output, which would not distinguish the two layers).
+    fn constant_two_input_spec() -> ScriptSpec {
+        spec_from(json!({
+            "source": r#"#{ "fired": true }"#,
+            "inputs": {
+                "a": { "device": "gw-1", "signalId": "A" },
+                "b": { "device": "gw-1", "signalId": "B" }
+            }
+        }))
+    }
+
+    #[test]
+    fn stage_gates_invocation_the_script_is_not_called_before_all_inputs() {
+        let mut s = build(&constant_two_input_spec());
+        // Only `a` present. A constant script WOULD emit `{fired:true}` if the stage called it —
+        // it doesn't, proving the stage withholds the invocation itself.
+        assert!(
+            s.process(signal_msg("gw-1", "A", json!(1), "GOOD")).is_empty(),
+            "the stage must not invoke the script before all required inputs are initialized"
+        );
+        // `b` completes the set → now the stage invokes it and the constant is emitted.
+        let out = s.process(signal_msg("gw-1", "B", json!(2), "GOOD"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].msg.body, json!({ "fired": true }));
+    }
+
+    #[test]
+    fn stage_suppresses_invocation_on_an_unchanged_value() {
+        let mut s = build(&constant_two_input_spec());
+        s.process(signal_msg("gw-1", "A", json!(1), "GOOD"));
+        let first = s.process(signal_msg("gw-1", "B", json!(2), "GOOD"));
+        assert_eq!(first.len(), 1, "fires once both inputs are present");
+        // Re-send `a` with the same value + quality. A constant script WOULD emit again if the
+        // stage called it — it doesn't, proving the stage's change detection suppresses the
+        // invocation (not the script choosing to return nothing).
+        assert!(
+            s.process(signal_msg("gw-1", "A", json!(1), "GOOD")).is_empty(),
+            "the stage must not invoke the script when no input value/quality changed"
+        );
+    }
+
     #[test]
     fn quality_and_timestamps_available_to_the_script() {
         let spec = spec_from(json!({
