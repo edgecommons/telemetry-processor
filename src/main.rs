@@ -18,9 +18,13 @@
 
 mod app;
 mod config;
+mod dispatch;
 mod json_path;
 mod observe;
 mod proc;
+mod route_build;
+#[cfg(test)]
+mod test_support;
 
 use edgecommons::prelude::*;
 

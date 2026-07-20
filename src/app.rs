@@ -14,47 +14,55 @@
 //!   `metric` class (see [`crate::observe`]);
 //! - an [`EvtEmitter`] for the processor's own `evt` health events;
 //! - the custom command verbs `flush` / `get-stats` / `pause` / `resume` (registered on
-//!   `gg.commands()`), which the built-in `ping` / `reload-config` / `get-configuration` complement.
+//!   `gg.commands()`), which the built-in `ping` / `reload-config` / `get-configuration` complement;
+//! - two `scope: "component"` edge-console panel descriptors (`overview`, `routes`) bound to those
+//!   verbs — an optional enhancement (not a baseline requirement for processors).
 //!
 //! ## Self-echo guard (loop safety)
 //! Under a fleet `ecv1/+/+/+/data/#` input a `local` republish onto the processor's own `data`
 //! class would be re-consumed → an amplifying loop. The dispatcher restamps `local` output with the
-//! processor's identity (see [`crate::proc::route`]) and this fan-out handler drops any inbound
-//! message whose `identity` device+component equal the processor's own — so a re-consumed copy is
-//! discarded. Cross-device processor chaining still works (a different device does not match).
+//! processor's identity (see [`crate::proc::route`]) and the fan-out handler ([`crate::dispatch`])
+//! drops any inbound message whose `identity` device+component equal the processor's own — so a
+//! re-consumed copy is discarded. Cross-device processor chaining still works (a different device
+//! does not match).
+//!
+//! ## Why this file is the coverage seam — and why it is now narrow
+//! The genuinely untestable surface is obtaining live library handles from a real `&EdgeCommons` —
+//! `Arc<dyn MessagingService>` (`gg.messaging()`), `EventsFacade` (`gg.events()`),
+//! `Arc<CommandInbox>` (`gg.commands()`), `Arc<dyn MetricService>` (`gg.metrics()`), `Arc<dyn
+//! StreamService>` (`gg.streams()`, stream targets only), and `gg.shutdown_signal()` — none of which
+//! has a public (or test) constructor outside the `edgecommons` crate. That is the only reason this
+//! file cannot be unit-tested; there is no broker or protocol involved, just library types this
+//! crate cannot fabricate. Every *decision* — cross-route defaulting, route target/filter/publish
+//! resolution, script-output-topic validation, the `local`-target restamp policy, the fan-out
+//! handler, the command/panel registration — needs only `Config` (publicly constructible via
+//! `Config::from_value`) or a fakeable trait object, and lives in [`crate::route_build`] /
+//! [`crate::dispatch`] instead, fully unit-tested. See `AGENTS.md` and the `coverage` job in
+//! `.github/workflows/ci.yml`, which excludes only this file and `main.rs`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use edgecommons::config::model::Config;
-use edgecommons::config::template::resolve;
-use edgecommons::messaging::message::{Message, MessageIdentity};
-use edgecommons::messaging::{topic_matches, MessagingService};
+use edgecommons::messaging::MessagingService;
 use edgecommons::prelude::*;
-use edgecommons::uns::reserved_class_of;
 use rhai::Engine;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::config::{
-    parse_target, GlobalDefaults, RouteConfig, ScriptEngineKind, ScriptStageSpec, StageConfig,
-};
+use crate::config::{RouteConfig, ScriptEngineKind};
+use crate::dispatch::{self_subscribe, register_commands, FilterRoutes, RouteHandle};
 use crate::observe::{spawn_metric_emitter, EvtEmitter, RouteStats};
 use crate::proc::route::{run_worker, Dispatcher};
-use crate::proc::{now_ms, Control, Pipeline, ProcMsg};
+use crate::proc::{Control, Pipeline, ProcMsg};
+use crate::route_build::{
+    compute_restamp, resolve_filters, resolve_global_wiring, resolve_publish_topic,
+    resolve_script_output_topics, resolve_target,
+};
 
-/// Default aggregation/partition key when neither the route nor the global defaults set one.
-const DEFAULT_KEY: &str = "body.signal.id";
 /// Default route channel capacity (also the broker-side subscribe queue depth).
 const DEFAULT_QUEUE: usize = 256;
 /// Depth of a route's out-of-band control channel (the `flush` command verb).
 const CONTROL_QUEUE: usize = 4;
-
-/// The routes registered on one subscribe filter: each a `(worker data sender, route counters)`
-/// pair the fan-out handler forwards to.
-type FilterRoutes = Vec<(mpsc::Sender<ProcMsg>, Arc<RouteStats>)>;
 
 /// One fully wired route (produced by [`ProcessorApp::build_route`]).
 struct BuiltRoute {
@@ -65,18 +73,10 @@ struct BuiltRoute {
     stats: Arc<RouteStats>,
 }
 
-/// A command-facing route handle. Deliberately holds **no** data sender, so the app remains the
-/// sole owner of the data channels — dropping [`ProcessorApp::senders`] on shutdown then closes
-/// every worker (the control sender kept here does not gate worker shutdown).
-struct RouteHandle {
-    id: String,
-    control: mpsc::Sender<Control>,
-    stats: Arc<RouteStats>,
-}
-
 /// Per-route-invariant build context: the shared Rhai engine, the script-file loader, the
 /// cross-route defaults, and the component identity injected into scripts. Bundled so `build_route`
-/// takes the route plus one context, not a long argument list.
+/// takes the route plus one context, not a long argument list. Populated from
+/// [`crate::route_build::GlobalWiring`] (the actual defaulting logic lives there, tested).
 struct RouteBuildCtx<'a> {
     engine: &'a Arc<Engine>,
     loader: &'a crate::proc::script::ScriptLoader,
@@ -113,39 +113,22 @@ impl ProcessorApp {
         engine.set_max_operations(1_000_000);
         let engine = Arc::new(engine);
 
-        let defaults: GlobalDefaults = config
-            .global()
-            .get("defaults")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let default_key = defaults.key.clone().unwrap_or_else(|| DEFAULT_KEY.to_string());
-        // Script files (`{"file": "..."}`) resolve relative to this dir (template-substituted).
-        let scripts_dir = defaults
-            .scripts_dir
-            .as_deref()
-            .map(|d| resolve(&config, d))
-            .unwrap_or_else(|| ".".to_string());
-        let loader = crate::proc::script::ScriptLoader::new(scripts_dir);
-        // Component identity for the script runtime context. Read the raw values (the template
-        // resolver would sanitize them for topic/path safety, which we don't want in a script).
-        let component_full_name = config.component_name.clone();
-        let component_name =
-            component_full_name.rsplit('.').next().unwrap_or(&component_full_name).to_string();
-        let thing_name = config.thing_name.clone();
+        // Cross-route defaults + the processor's own identity strings — the actual defaulting
+        // decisions live in `route_build::resolve_global_wiring`, tested there against a plain
+        // `Config` (no live `EdgeCommons` needed).
+        let wiring = resolve_global_wiring(&config);
+        let loader = crate::proc::script::ScriptLoader::new(wiring.scripts_dir.clone());
         let ctx = RouteBuildCtx {
             engine: &engine,
             loader: &loader,
-            default_key: &default_key,
-            default_target: defaults.target.as_deref(),
-            thing_name: &thing_name,
-            component_name: &component_name,
-            component_full_name: &component_full_name,
-            default_script_engine: defaults.script_engine.unwrap_or_default(),
+            default_key: &wiring.default_key,
+            default_target: wiring.default_target.as_deref(),
+            thing_name: &wiring.thing_name,
+            component_name: &wiring.component_name,
+            component_full_name: &wiring.component_full_name,
+            default_script_engine: wiring.default_script_engine,
         };
 
-        // The processor's own UNS identity — the self-echo guard's match, and the restamp source.
-        let own_device = config.identity().device().to_string();
-        let own_component = config.identity().component().to_string();
         // The `evt` health-event publisher — a thin wrapper over the library's `events()` facade at
         // component scope (D-U28: no instance token, so events land on `.../telemetry-processor/evt/…`).
         let evt = EvtEmitter::new(gg.events());
@@ -196,8 +179,8 @@ impl ProcessorApp {
                 &app.messaging,
                 &filter,
                 routes,
-                own_device.clone(),
-                own_component.clone(),
+                wiring.own_device.clone(),
+                wiring.own_component.clone(),
                 evt.clone(),
             )
             .await?;
@@ -208,19 +191,24 @@ impl ProcessorApp {
         let stats_vec: Vec<Arc<RouteStats>> = built.iter().map(|b| b.stats.clone()).collect();
         app.metric_task = Some(spawn_metric_emitter(gg.metrics(), config.clone(), stats_vec));
 
-        // 4. Register the custom command verbs (flush / get-stats / pause / resume). The built-in
-        //    ping / reload-config / get-configuration are already wired by the library.
-        let handles: Arc<Vec<RouteHandle>> = Arc::new(
-            built
-                .iter()
-                .map(|b| RouteHandle {
-                    id: b.id.clone(),
-                    control: b.control.clone(),
-                    stats: b.stats.clone(),
-                })
-                .collect(),
-        );
-        register_commands(gg, handles);
+        // 4. Register the custom command verbs (flush / get-stats / pause / resume) + the console
+        //    panel pair. The built-in ping / reload-config / get-configuration are already wired by
+        //    the library. A no-op when no messaging transport wired an inbox.
+        if let Some(cmds) = gg.commands() {
+            let handles: Arc<Vec<RouteHandle>> = Arc::new(
+                built
+                    .iter()
+                    .map(|b| RouteHandle {
+                        id: b.id.clone(),
+                        control: b.control.clone(),
+                        stats: b.stats.clone(),
+                    })
+                    .collect(),
+            );
+            register_commands(&cmds, handles);
+        } else {
+            tracing::debug!("no command inbox (no messaging transport); custom verbs not registered");
+        }
 
         tracing::info!(
             routes = app.workers.len(),
@@ -230,7 +218,11 @@ impl ProcessorApp {
         Ok(app)
     }
 
-    /// Build one route's worker + channels; return the wired route (no subscription yet).
+    /// Build one route's worker + channels; return the wired route (no subscription yet). The
+    /// route-level decisions (target/filter/publish/script-output-topic resolution, the restamp
+    /// policy) are delegated to `crate::route_build`, which needs only `config` — the sole thing
+    /// here that genuinely requires a live `&EdgeCommons` is `gg.streams()` for a `Channel::Stream`
+    /// target (behind the `streaming` feature).
     fn build_route(
         &mut self,
         gg: &EdgeCommons,
@@ -241,61 +233,11 @@ impl ProcessorApp {
     ) -> anyhow::Result<BuiltRoute> {
         let _ = gg; // used only under the `streaming` feature (stream targets)
         let route_key = route.key.clone().unwrap_or_else(|| ctx.default_key.to_string());
-        let target_str = route
-            .target
-            .clone()
-            .or_else(|| ctx.default_target.map(String::from))
-            .ok_or_else(|| anyhow::anyhow!("route '{}' has no target", route.id))?;
-        let target = parse_target(&target_str)?;
-
-        anyhow::ensure!(!route.subscribe.is_empty(), "route '{}' has no subscribe topics", route.id);
-        let filters: Vec<String> = route.subscribe.iter().map(|f| resolve(config, f)).collect();
-
-        let mut publish = route.publish.clone().unwrap_or_default();
-        if let Some(t) = &publish.topic {
-            let resolved = resolve(config, t);
-            // Defensive: a publish topic that resolves to a reserved UNS class (state|metric|cfg|log)
-            // is rejected at publish time by the reserved-class guard (silent drop). Warn at startup.
-            if let Some(cls) = reserved_class_of(&resolved, config.effective_include_root()) {
-                tracing::warn!(
-                    route = %route.id,
-                    topic = %resolved,
-                    class = cls.token(),
-                    "publish.topic targets a RESERVED UNS class; the reserved-class guard will drop \
-                     these publishes — target a data/evt/app class instead"
-                );
-            }
-            publish.topic = Some(resolved);
-        }
-
-        // Resolve + validate every script stage's explicit output topic: reserved classes and
-        // subscribe-overlap feedback loops are startup errors, and a route-level `publish.topic`
-        // may not silently override a stage output topic.
-        for sc in route.pipeline.iter_mut() {
-            let StageConfig::Script(ScriptStageSpec::Spec(sp)) = sc else { continue };
-            let Some(out) = sp.output.as_mut() else { continue };
-            let resolved = resolve(config, &out.topic);
-            validate_script_output_topic(
-                &route.id,
-                &resolved,
-                config.effective_include_root(),
-                &filters,
-                publish.topic.as_deref(),
-            )?;
-            out.topic = resolved;
-        }
-
-        // Restamp policy: `local` output carries the processor's own identity (instance = route id)
-        // — loop-safety for the self-echo guard + correct provenance for the processor's product.
-        let restamp: Option<MessageIdentity> = match &target {
-            Channel::Local => Some(
-                config
-                    .identity()
-                    .with_instance(&route.id)
-                    .map_err(|e| anyhow::anyhow!("route '{}' identity restamp: {e}", route.id))?,
-            ),
-            _ => None,
-        };
+        let target = resolve_target(&route, ctx.default_target)?;
+        let filters = resolve_filters(config, &route)?;
+        let publish = resolve_publish_topic(config, &route.id, route.publish.clone().unwrap_or_default());
+        resolve_script_output_topics(config, &mut route, &filters, publish.topic.as_deref())?;
+        let restamp = compute_restamp(config, &target, &route.id)?;
 
         #[cfg(feature = "streaming")]
         let stream = match &target {
@@ -370,256 +312,5 @@ impl ProcessorApp {
             let _ = w.await;
         }
         Ok(())
-    }
-}
-
-/// Subscribe one filter with a fan-out handler: apply the UNS self-echo guard, then forward each
-/// message to every route channel that registered for it (tallying `messages_in`/`messages_dropped`
-/// and the queue-depth gauge, honoring the per-route `paused` flag, and emitting a rate-limited
-/// `evt/warning/queue-overflow` on backpressure drops). Concurrency is 1 so ordered consumers get
-/// messages in order.
-async fn self_subscribe(
-    messaging: &Arc<dyn MessagingService>,
-    filter: &str,
-    routes: FilterRoutes,
-    own_device: String,
-    own_component: String,
-    evt: Arc<EvtEmitter>,
-) -> anyhow::Result<()> {
-    let filter_owned = filter.to_string();
-    messaging
-        .subscribe(
-            filter,
-            message_handler(move |topic, msg| {
-                let routes = routes.clone();
-                let filter_owned = filter_owned.clone();
-                let own_device = own_device.clone();
-                let own_component = own_component.clone();
-                let evt = evt.clone();
-                async move {
-                    // Self-echo guard: drop our own re-consumed output (identity device+component
-                    // match ours) so a `local` republish onto the consumed `data` class can't loop.
-                    if let Some(id) = &msg.identity {
-                        if id.device() == own_device && id.component() == own_component {
-                            tracing::trace!(topic = %topic, "self-echo dropped (own identity)");
-                            return;
-                        }
-                    }
-                    let pm = ProcMsg { topic, msg, recv_ms: now_ms() };
-                    for (tx, stats) in &routes {
-                        if stats.is_paused() {
-                            continue;
-                        }
-                        match tx.try_send(pm.clone()) {
-                            Ok(()) => {
-                                stats.messages_in.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => {
-                                stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    filter = %filter_owned,
-                                    route = %stats.id,
-                                    "route queue full; dropping message"
-                                );
-                                evt.queue_overflow(&stats.id).await;
-                            }
-                        }
-                        // Update the queue-depth gauge (max_capacity - remaining permits).
-                        let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
-                        stats.queue_depth.store(depth, Ordering::Relaxed);
-                    }
-                }
-            }),
-            DEFAULT_QUEUE,
-            1,
-        )
-        .await?;
-    Ok(())
-}
-
-/// Register the processor's custom command verbs on the library command inbox (a no-op when no
-/// messaging transport wired an inbox). The built-in `ping`/`reload-config`/`get-configuration`
-/// verbs are registered by the library and complement these.
-fn register_commands(gg: &EdgeCommons, handles: Arc<Vec<RouteHandle>>) {
-    let Some(cmds) = gg.commands() else {
-        tracing::debug!("no command inbox (no messaging transport); custom verbs not registered");
-        return;
-    };
-
-    // get-stats — per-route counters snapshot.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "get-stats", command_handler(move |_req| {
-            let handles = handles.clone();
-            async move { Ok(Some(stats_json(&handles))) }
-        }));
-    }
-
-    // flush — force-close every route's open time windows now; report the total emitted.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "flush", command_handler(move |_req| {
-            let handles = handles.clone();
-            async move {
-                let mut flushed = 0u64;
-                for route in handles.iter() {
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    if route.control.send(Control::Flush(reply_tx)).await.is_ok() {
-                        if let Ok(n) = reply_rx.await {
-                            flushed += n;
-                        }
-                    }
-                }
-                Ok(Some(json!({ "flushed": flushed })))
-            }
-        }));
-    }
-
-    // pause — stop enqueuing to a route (body `{route}`), or all routes when omitted.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "pause", command_handler(move |req| {
-            let handles = handles.clone();
-            async move { Ok(Some(set_paused(&handles, &req, true))) }
-        }));
-    }
-
-    // resume — the inverse of pause.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "resume", command_handler(move |req| {
-            let handles = handles.clone();
-            async move { Ok(Some(set_paused(&handles, &req, false))) }
-        }));
-    }
-}
-
-/// Register a verb, logging (not failing) if the inbox rejects it.
-fn try_register(cmds: &Arc<CommandInbox>, verb: &str, handler: Arc<dyn CommandHandler>) {
-    if let Err(e) = cmds.register(verb, handler) {
-        tracing::warn!(verb, error = %e, "failed to register command verb");
-    }
-}
-
-/// The `get-stats` reply body: `{routes: [{id, in, out, dropped, streamAppends, publishFailures,
-/// queueDepth, paused}]}`.
-fn stats_json(handles: &[RouteHandle]) -> Value {
-    let routes: Vec<Value> = handles
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.id,
-                "in": r.stats.messages_in.load(Ordering::Relaxed),
-                "out": r.stats.messages_out.load(Ordering::Relaxed),
-                "dropped": r.stats.messages_dropped.load(Ordering::Relaxed),
-                "streamAppends": r.stats.stream_appends.load(Ordering::Relaxed),
-                "publishFailures": r.stats.publish_failures.load(Ordering::Relaxed),
-                "queueDepth": r.stats.queue_depth.load(Ordering::Relaxed),
-                "paused": r.stats.paused.load(Ordering::Relaxed),
-            })
-        })
-        .collect();
-    json!({ "routes": routes })
-}
-
-/// Apply `paused` to the route named in `request.body.route` (or all routes when absent). Returns
-/// `{paused|resumed: [ids...]}`.
-fn set_paused(handles: &[RouteHandle], request: &Message, paused: bool) -> Value {
-    let route = request.body.get("route").and_then(Value::as_str);
-    let mut affected = Vec::new();
-    for r in handles {
-        if route.is_none() || route == Some(r.id.as_str()) {
-            r.stats.paused.store(paused, Ordering::Relaxed);
-            affected.push(r.id.clone());
-        }
-    }
-    let key = if paused { "paused" } else { "resumed" };
-    json!({ key: affected })
-}
-
-/// Validate a script stage's resolved `output.topic` for one route: reject reserved UNS classes,
-/// reject an output that any of the route's own subscribe filters would re-consume (a direct
-/// feedback loop — cross-route re-consumption is stopped at runtime by the self-echo guard), and
-/// reject a route-level `publish.topic` alongside it (the dispatcher's per-route topic would
-/// silently override the per-stage output topic).
-fn validate_script_output_topic(
-    route_id: &str,
-    topic: &str,
-    include_root: bool,
-    filters: &[String],
-    route_publish_topic: Option<&str>,
-) -> anyhow::Result<()> {
-    if let Some(cls) = reserved_class_of(topic, include_root) {
-        anyhow::bail!(
-            "route '{route_id}': script output.topic '{topic}' targets the RESERVED UNS class \
-             '{}' — target a data/evt/app class instead",
-            cls.token()
-        );
-    }
-    for f in filters {
-        anyhow::ensure!(
-            !topic_matches(f, topic),
-            "route '{route_id}': script output.topic '{topic}' overlaps this route's subscribe \
-             filter '{f}' — a feedback loop; publish the derived signal outside the route's input \
-             filters"
-        );
-    }
-    anyhow::ensure!(
-        route_publish_topic.is_none(),
-        "route '{route_id}': `publish.topic` and a script stage `output.topic` are mutually \
-         exclusive — the route-level topic would override the stage output; drop one of the two"
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn script_output_topic_validation() {
-        let filters = vec!["ecv1/+/+/+/data/#".to_string()];
-        // A data-class topic under the subscribed fleet filter is a feedback loop.
-        let err = validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/data/derived",
-            true,
-            &filters,
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("feedback loop"), "{err}");
-
-        // A reserved class (`metric`) is rejected outright.
-        let err = validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/metric/derived",
-            true,
-            &[],
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("RESERVED"), "{err}");
-
-        // A route publish.topic alongside a stage output topic is ambiguous.
-        let err = validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/data/derived",
-            true,
-            &[],
-            Some("ecv1/gw-1/telemetry-processor/r1/data/other"),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("mutually"), "{err}");
-
-        // A non-overlapping data topic with no publish.topic passes.
-        validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/data/derived",
-            true,
-            &["ecv1/+/opcua-adapter/+/data/#".to_string()],
-            None,
-        )
-        .unwrap();
     }
 }

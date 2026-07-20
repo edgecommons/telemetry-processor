@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.edgecommons.mbreissi.com/schemas/telemetry-processor/config.schema.json",
+  "title": "telemetry-processor component configuration",
+  "description": "The configuration telemetry-processor itself understands: the object at `component.global` (checked here by `edgecommons component validate`), plus reusable `$defs` describing each `component.instances[]` entry (one ROUTE per instance — see `$defs/route`) for documentation and forward compatibility. The library envelope (logging, messaging, metricEmission, heartbeat, streaming, credentials, parameters, health, hierarchy, identity, tags, `component.token`) is owned by the canonical schema and is deliberately not redeclared here. `additionalProperties: false` throughout so a typo'd key is caught rather than silently ignored. See docs/reference/configuration.md for the authoritative field-by-field prose this schema was derived from.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Cross-route defaults under `component.global.defaults`, overlaid by each route (global ⊕ instance, instance wins per key).",
+      "properties": {
+        "key": {
+          "type": "string",
+          "default": "body.signal.id",
+          "description": "Default aggregation / sample / stream-partition key path (a dotted key path — see `$defs/keyPath`)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Default `target` for a route that omits one: `local` | `northbound` | `stream:<name>`."
+        },
+        "scriptsDir": {
+          "type": "string",
+          "description": "Base directory for `{\"file\": \"...\"}` script references (template-resolved at startup). A relative script path resolves against it; an absolute path is used as-is. Defaults to the process working directory when unset."
+        },
+        "scriptEngine": {
+          "$ref": "#/$defs/scriptEngine",
+          "default": "rhai",
+          "description": "Default engine for every route's `filter`/`script` stages; a route's own `scriptEngine` overrides this."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "scriptEngine": {
+      "type": "string",
+      "enum": ["rhai", "lua"],
+      "description": "`rhai` (pure-Rust, always compiled in) or `lua` (Lua 5.4 — needs the component's `scripting-lua` build feature)."
+    },
+    "keyPath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A dotted path over the message: roots `body.` (default when no known root prefix is present), `identity.`, `tags.`, `header.`; a `[]` suffix on a segment spreads across an array. Examples: `body.signal.id`, `body.samples[].quality`, `identity.device`."
+    },
+    "route": {
+      "title": "One route — a component.instances[] entry",
+      "description": "Each `component.instances[]` entry is one independent route: subscribe → pipeline → target. A malformed instance is logged and skipped at startup; startup fails only if zero routes build.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "subscribe"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Route id — log-only identity, and (for `local` targets) the UNS `{instance}` token the dispatcher restamps output with. Unique among the component's routes."
+        },
+        "subscribe": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Topic filters on the local bus (MQTT `+`/`#` wildcards allowed). Each filter is template-resolved at startup. A filter shared by several routes is subscribed once and fanned out.",
+          "examples": [["ecv1/+/+/+/data/#"], ["ecv1/+/opcua-adapter/+/data/#"]]
+        },
+        "pipeline": {
+          "type": "array",
+          "default": [],
+          "description": "Ordered processing stages. Empty = pass-through republisher.",
+          "items": { "$ref": "#/$defs/stage" }
+        },
+        "target": {
+          "type": "string",
+          "description": "Where the route's output goes. Required unless `global.defaults.target` is set. `local` (republish on the local bus), `northbound` (IoT Core / a northbound MQTT broker), or `stream:<name>` (a named entry under the top-level `streaming.streams[]`).",
+          "examples": ["local", "northbound", "stream:archive"]
+        },
+        "publish": { "$ref": "#/$defs/publish" },
+        "key": {
+          "$ref": "#/$defs/keyPath",
+          "description": "Route default key path for `sample`/`aggregate`/stream partitioning. Falls back to `global.defaults.key`, then `body.signal.id`."
+        },
+        "maxQueue": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 256,
+          "description": "Per-route internal queue depth (also the broker-side subscribe queue depth). Drop-on-full: when the route's worker can't keep up, new messages are dropped (tallied in `get-stats` `dropped`, surfaced as a rate-limited `evt/warning/queue-overflow`). Numeric fields accept an integer or an integer-valued float (Greengrass delivers config numbers as doubles)."
+        },
+        "scriptEngine": {
+          "$ref": "#/$defs/scriptEngine",
+          "description": "Engine for this route's `filter`/`script` stages. Falls back to `global.defaults.scriptEngine`, then `rhai`."
+        }
+      }
+    },
+    "publish": {
+      "title": "instances[].publish",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "topic": {
+          "type": "string",
+          "description": "Output topic template for `local`/`northbound` (default: the source topic). Template-resolved at startup. Must not resolve to a reserved UNS class (`state`/`metric`/`cfg`/`log`) and must not be combined with a script stage's own `output.topic`."
+        },
+        "partitionKey": {
+          "$ref": "#/$defs/keyPath",
+          "description": "Partition-key path for `stream:<name>` targets (default: the route `key`, resolved per message)."
+        },
+        "qos": {
+          "type": "string",
+          "enum": ["atLeastOnce", "atMostOnce"],
+          "default": "atLeastOnce",
+          "description": "`northbound` targets only."
+        }
+      }
+    },
+    "stage": {
+      "title": "One pipeline stage",
+      "description": "An externally-tagged object: exactly one of `filter` / `sample` / `aggregate` / `project` / `script`.",
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "filter": { "$ref": "#/$defs/filterStage" },
+        "sample": { "$ref": "#/$defs/sampleStage" },
+        "aggregate": { "$ref": "#/$defs/aggregateStage" },
+        "project": { "$ref": "#/$defs/projectStage" },
+        "script": { "$ref": "#/$defs/scriptStage" }
+      },
+      "additionalProperties": false
+    },
+    "filterStage": {
+      "title": "filter — keep/drop whole messages",
+      "description": "Exactly one form applies, checked in order: `script` → `quality` → `field`. A filter with none of the three fails the route at build time.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "script": {
+          "$ref": "#/$defs/scriptSource",
+          "description": "A boolean predicate (per the route's `scriptEngine`) over the message view; keep the message when it returns `true`."
+        },
+        "quality": {
+          "type": "string",
+          "description": "Shorthand: keep only when every `body.samples[].quality` equals this (and ≥1 sample exists).",
+          "examples": ["GOOD"]
+        },
+        "field": {
+          "$ref": "#/$defs/keyPath",
+          "description": "Built-in predicate path (supports a `[]` array-spread segment → any-element match)."
+        },
+        "op": {
+          "type": "string",
+          "enum": ["eq", "ne", "gt", "lt", "ge", "le", "exists", "contains", "==", "!=", ">", "<", ">=", "<="],
+          "default": "eq",
+          "description": "Comparison operator for the `field` form."
+        },
+        "value": {
+          "description": "Right-hand value for the `field`/`op` comparison. Numbers and numeric strings compare numerically."
+        }
+      }
+    },
+    "sampleStage": {
+      "title": "sample — per-key downsampling",
+      "description": "Needs exactly one of `everyMs` / `everyN`.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "everyMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Keep at most one message per key per this many ms."
+        },
+        "everyN": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Keep one in every N messages per key."
+        },
+        "by": {
+          "$ref": "#/$defs/keyPath",
+          "description": "Per-key path. Falls back to the route `key`."
+        }
+      }
+    },
+    "aggregateStage": {
+      "title": "aggregate — tumbling windowed reduction",
+      "description": "Emits one ProcessedTelemetry message per (key, window) on close. Time windows close on the worker flush tick or when a message for a newer window arrives; count windows close in-line when N is reached.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["window", "fn"],
+      "properties": {
+        "window": {
+          "type": "string",
+          "description": "A time window (`\"10s\"` / `\"500ms\"`), or a bare record count (`\"100\"`).",
+          "examples": ["10s", "500ms", "100"]
+        },
+        "by": {
+          "$ref": "#/$defs/keyPath",
+          "description": "Per-key path. Falls back to the route `key`."
+        },
+        "fn": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "enum": ["avg", "max", "min", "sum", "count", "first", "last"] },
+          "description": "Reducers. The first listed is the primary (lands in `samples[0].value`)."
+        },
+        "value": {
+          "$ref": "#/$defs/keyPath",
+          "description": "Path to the value(s) to fold (a `[]` segment spreads an array). Defaults to every `body.samples[].value`, falling back to the whole body for a payload with no `samples`. Set this for a non-SouthboundSignalUpdate payload, e.g. `body.temperature`."
+        }
+      }
+    },
+    "projectStage": {
+      "title": "project — reshape / whitelist the body",
+      "description": "With neither `keep` nor `set`, the body passes through unchanged.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keep": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Body paths to retain. Only the first path segment (top-level body key) is kept — e.g. `\"signal.id\"` retains the whole `signal` object."
+        },
+        "set": {
+          "type": "object",
+          "description": "Literal fields overlaid onto the body."
+        }
+      }
+    },
+    "scriptStage": {
+      "title": "script — a transform (Rhai or Lua)",
+      "description": "Inline source (`{\"script\": \"<source>\"}`), the object form (`{\"script\": {\"file\"|\"source\": ..., \"inputs\": {...}, \"output\": {...}}}`, exactly one of file/source required), or the multi-signal object form carrying stateful `inputs` and/or an explicit `output`. All forms compile once at startup.",
+      "oneOf": [
+        { "type": "string", "minLength": 1, "description": "Inline source. Good for a one-liner." },
+        { "$ref": "#/$defs/scriptSpec" }
+      ]
+    },
+    "scriptSource": {
+      "description": "Inline script source, or `{\"file\": \"<path>\"}` read once at startup (relative to `global.defaults.scriptsDir`, or absolute).",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file"],
+          "properties": { "file": { "type": "string", "minLength": 1 } }
+        }
+      ]
+    },
+    "scriptSpec": {
+      "title": "The object form of a script stage",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to a `.rhai`/`.lua` file (relative to `global.defaults.scriptsDir`, or absolute), read once at startup. Exactly one of `file`/`source` is required."
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Inline script source (the object-form equivalent of the bare string form). Exactly one of `file`/`source` is required."
+        },
+        "inputs": {
+          "type": "object",
+          "description": "Named multi-signal inputs: `{name: selector}`. Turns this into the stateful multi-signal stage — the stage caches the latest observation of every input and evaluates the script when a matched input's value or quality changes.",
+          "additionalProperties": { "$ref": "#/$defs/inputSelector" }
+        },
+        "output": {
+          "$ref": "#/$defs/outputSpec",
+          "description": "Publish each successful evaluation as a new EdgeCommons envelope on `output.topic` instead of mutating the triggering message in place."
+        }
+      }
+    },
+    "inputSelector": {
+      "title": "A named script input's selector",
+      "description": "At least one of `signalId`/`signalName`/`topic` is required; unknown selector fields fail the route at build time.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "signalId": { "type": "string", "description": "Match `body.signal.id`." },
+        "signalName": { "type": "string", "description": "Match `body.signal.name`." },
+        "topic": { "type": "string", "description": "Match the arriving topic against this MQTT-style filter (`+`/`#` supported)." },
+        "device": { "type": "string", "description": "Match the source envelope identity's device." },
+        "component": { "type": "string", "description": "Match the source envelope identity's component token." },
+        "instance": { "type": "string", "description": "Match the source envelope identity's instance token." },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "When `true`, the stage withholds every evaluation until this input has been observed. When `false` (default), the stage never waits on it."
+        }
+      }
+    },
+    "outputSpec": {
+      "title": "An explicit script output",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic"],
+      "properties": {
+        "topic": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The output topic (template-resolved at startup). Must not be a reserved UNS class and must not match one of the route's own `subscribe` filters (a feedback loop)."
+        },
+        "name": {
+          "type": "string",
+          "default": "ScriptResult",
+          "description": "The envelope header `name` of the derived message."
+        },
+        "version": {
+          "type": "string",
+          "default": "1.0",
+          "description": "The envelope header `version` of the derived message."
+        }
+      }
+    }
+  }
+}

@@ -21,3 +21,54 @@ jobs:
       # ubuntu runner has gcc) so both script engines are compiled + tested in CI.
       rust-features: "streaming,streaming-file-parquet,streaming-file-avro,scripting-lua"
     secrets: inherit
+
+  coverage:
+    # The 90% line-coverage gate (org validation matrix / AGENTS.md), actually RUN here (the
+    # reusable component-ci only does build/test/clippy). This repo has no live-infra driver seam of
+    # its own — the Kinesis/Kafka/file-sink clients live in the `edgecommons`/`edgestreamlog`
+    # library, not here — so the excluded set is deliberately THIN, not a broad "the whole wiring
+    # file" carve-out: `main.rs` (the runtime bootstrap shim) and `app.rs` (only the residual glue
+    # that obtains a live `Arc<dyn MessagingService>`/`EventsFacade`/`Arc<CommandInbox>`/
+    # `Arc<dyn MetricService>`/`Arc<dyn StreamService>` from a real `EdgeCommons` and
+    # `gg.shutdown_signal()` — none of which has a public or test constructor outside the
+    # `edgecommons` crate). Every *decision* branch that does not itself require a live
+    # `EdgeCommons` — cross-route defaulting, route target/filter/publish-topic resolution,
+    # script-output-topic validation, the `local`-target restamp policy (all of it needs only a
+    # plain `Config`, built in tests via `Config::from_value`) — was extracted to
+    # `src/route_build.rs`, which stays in the denominator and is unit-tested (see its own module
+    # doc + `src/app.rs`'s "Why this file is the coverage seam" doc for the exact boundary).
+    # `test_support.rs` (this crate's own downstream `MessagingService` fake, the analog of the
+    # library's crate-private `testutil::RecordingMessaging`) is test-only support code, not
+    # production logic, and is excluded the same way `file-replicator` excludes its `testutil.rs`.
+    # Do not lower the gate or exclude testable code to pass it — add tests.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Authenticate to the private edgecommons git dependency
+        env:
+          # Same org read token the reusable workflow uses (secrets: inherit); the repo must be on
+          # that secret's allow-list. Rewrites the https git URL so cargo can fetch the private dep.
+          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
+            "https://github.com/edgecommons/edgecommons.git"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
+            "https://github.com/edgecommons/edgecommons"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+      - name: Coverage gate (90% lines; composition root + main.rs + test-only messaging fake excluded)
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: >
+          cargo llvm-cov --locked --features streaming,streaming-file-parquet,streaming-file-avro,scripting-lua
+          --ignore-filename-regex '(app|main|test_support)\.rs'
+          --fail-under-lines 90
