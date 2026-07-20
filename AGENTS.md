@@ -19,14 +19,16 @@ durable `stream:<name>` (Kinesis / Kafka / rolling Parquet-AVRO files). Runs on 
 
 `src/proc/mod.rs`'s `Processor` trait is the one place stage logic lives: `process` handles an
 inbound message and returns zero or more; `on_tick` lets a stateful stage (an aggregate window) emit
-on a timer instead of on arrival. Everything above it — `src/app.rs` (the composition root: reads
-config, builds routes, spawns workers), `src/dispatch.rs` (the self-echo guard + fan-out handler,
-command-verb + console-panel registration), and `src/proc/route.rs` (the per-route worker + target
-dispatch) — is written against the trait and does not change when a new stage is added.
-`src/proc/script.rs` implements the `script`/`filter.script` stage over either engine (Rhai always
-compiled in; Lua behind the `scripting-lua` feature) and its stateful multi-signal variant
-(`src/proc/multi.rs`). `src/app.rs` and `src/dispatch.rs` split along a testability line, not a
-logical one — see [Validation expectations](#validation-expectations).
+on a timer instead of on arrival. Everything above it — `src/app.rs` (the thin composition root:
+obtains live handles from `EdgeCommons`, spawns workers), `src/route_build.rs` (route target/filter/
+publish/script-output-topic resolution, the restamp policy, cross-route defaulting), `src/dispatch.rs`
+(the self-echo guard + fan-out handler, command-verb + console-panel registration), and
+`src/proc/route.rs` (the per-route worker + target dispatch) — is written against the trait and does
+not change when a new stage is added. `src/proc/script.rs` implements the `script`/`filter.script`
+stage over either engine (Rhai always compiled in; Lua behind the `scripting-lua` feature) and its
+stateful multi-signal variant (`src/proc/multi.rs`). `src/app.rs` vs. `src/route_build.rs`/
+`src/dispatch.rs` split along a testability line, not a logical one — see
+[Validation expectations](#validation-expectations).
 
 ## Config location
 
@@ -42,30 +44,40 @@ reference.
 
 ## Validation expectations
 
-- `cargo test` covers the pipeline stages (`src/proc/*.rs`), route config (`src/config.rs`), the
-  route dispatcher (`src/proc/route.rs`), the fan-out handler + command/panel registration
-  (`src/dispatch.rs`), and the metric/event surface (`src/observe.rs`) directly — no broker required.
+- `cargo test` covers the pipeline stages (`src/proc/*.rs`), route config (`src/config.rs`), route
+  build decisions (`src/route_build.rs`), the route dispatcher (`src/proc/route.rs`), the fan-out
+  handler + command/panel registration (`src/dispatch.rs`), and the metric/event surface
+  (`src/observe.rs`) directly — no broker required.
 - `cargo llvm-cov --fail-under-lines 90` is the coverage gate (`.github/workflows/ci.yml`'s
   `coverage` job) — the org rule is 90% line coverage per language. This repo has no live-infra
   *driver* seam of its own (the Kinesis/Kafka/file-sink clients live in the
   `edgecommons`/`edgestreamlog` library, not here); the seam it does have is narrower and different
-  in kind — the **EdgeCommons composition root**. `src/app.rs`'s `ProcessorApp::start`/`build_route`/
-  `run` must obtain a live `Config`/`Arc<dyn MessagingService>`/`EventsFacade`/`Arc<CommandInbox>`/
-  `Arc<dyn StreamService>` from a real `&EdgeCommons`, and none of those types has a public or test
-  constructor outside the `edgecommons` crate — there is no way to fabricate one in a unit test. That
-  is why the wiring logic is split: everything that does *not* need a live `EdgeCommons` directly
-  (the self-echo guard + fan-out handler, the command verbs, the two console panels, script-output
-  topic validation) lives in `src/dispatch.rs`, fully unit-tested against a downstream
-  `MessagingService` fake (`src/test_support.rs`, this crate's own analog of the library's
-  crate-private `testutil::RecordingMessaging`) and a test-only recording `EvtEmitter`
-  (`EvtEmitter::recording`, mirroring `file-replicator`'s `Events::recording_events` — `EventsFacade`
-  likewise has no public constructor). The coverage job excludes exactly three files:
-  `main.rs` (the runtime bootstrap shim), `app.rs` (the composition root above), and
-  `test_support.rs` (test-only support code, not production logic — the same treatment
-  `file-replicator` gives its own `testutil.rs`). Every other line — pipeline mechanics, route/config
-  parsing, the fan-out handler, dispatch/restamping, the command surface, the metric/event emitters —
-  stays in the denominator and is unit-tested. Do not lower the gate or exclude testable code to pass
-  it — add tests.
+  in kind — the **EdgeCommons composition root** — and it is kept **thin on purpose**: only the code
+  that must obtain a live `Arc<dyn MessagingService>` (`gg.messaging()`), `EventsFacade`
+  (`gg.events()`), `Arc<CommandInbox>` (`gg.commands()`), `Arc<dyn MetricService>` (`gg.metrics()`),
+  `Arc<dyn StreamService>` (`gg.streams()`, stream targets only), or `gg.shutdown_signal()` stays in
+  `src/app.rs` — none of those types has a public or test constructor outside the `edgecommons`
+  crate, so there is no way to fabricate one. Every *decision* that does not itself need a live
+  `EdgeCommons` was pulled out so it stays in the coverage denominator:
+  - `src/route_build.rs` — cross-route defaulting (`resolve_global_wiring`), a route's target/
+    filter/publish-topic resolution, script-output-topic validation, and the `local`-target restamp
+    policy. All of it needs only a plain `Config`, which a test builds directly via
+    `Config::from_value` (no live `EdgeCommons` required) — see its own module doc for the one
+    exception (`gg.streams()`, which stays in `app.rs`'s `build_route`).
+  - `src/dispatch.rs` — the self-echo guard + fan-out handler, the command verbs, the two console
+    panels — unit-tested against a downstream `MessagingService` fake (`src/test_support.rs`, this
+    crate's own analog of the library's crate-private `testutil::RecordingMessaging`) and a test-only
+    recording `EvtEmitter` (`EvtEmitter::recording`, mirroring `file-replicator`'s
+    `Events::recording_events` — `EventsFacade` likewise has no public constructor).
+
+  The coverage job excludes exactly three files: `main.rs` (the runtime bootstrap shim), `app.rs`
+  (the thin composition root above), and `test_support.rs` (test-only support code, not production
+  logic — the same treatment `file-replicator` gives its own `testutil.rs`). Every other line —
+  pipeline mechanics, route/config parsing, route-build decisions, the fan-out handler, dispatch/
+  restamping, the command surface, the metric/event emitters — stays in the denominator and is
+  unit-tested. Do not lower the gate or exclude testable code to pass it — add tests. If you add a
+  branch to `app.rs` and it doesn't need a live `EdgeCommons` type to run, it almost certainly
+  belongs in `route_build.rs` or `dispatch.rs` instead.
 - The `scripting-lua` feature (Lua 5.4 via vendored `mlua`) is built and tested in CI alongside the
   default Rhai-only build, so both script engines are exercised.
 - `edgecommons component validate` checks this repo's config against `config.schema.json` and warns

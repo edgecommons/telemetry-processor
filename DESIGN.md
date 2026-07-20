@@ -59,18 +59,27 @@ Numbered `D-TP-<n>` so later sessions can cite them.
   `CLAUDE.md` for the local-dev override that must stay inactive when regenerating this file.
   License metadata was also reconciled: `Cargo.toml`'s `license` field was `Apache-2.0` (a stale
   leftover) against the actual `BUSL-1.1` `LICENSE` file; fixed to `license = "BUSL-1.1"` (`#9`).
-- **D-TP-7 (this remediation). `app.rs` / `dispatch.rs` split is a testability boundary, not a
-  logical one.** `ProcessorApp::start`/`build_route`/`run` (`src/app.rs`) must obtain a live
-  `Config`/`Arc<dyn MessagingService>`/`EventsFacade`/`Arc<CommandInbox>`/`Arc<dyn StreamService>`
-  from a real `&EdgeCommons`; none of those types has a public or test constructor outside the
-  `edgecommons` crate (`EventsFacade::new` and `CommandInbox::new` are both `pub(crate)` in the
-  library), so this file cannot be unit-tested without a live runtime — the CI coverage job excludes
-  it (with `main.rs`) for exactly this reason, mirroring the "supervisor.rs" seam pattern the
-  protocol-adapter templates use for a genuinely different reason (a live device driver). Everything
-  that does *not* need `&EdgeCommons` directly — the self-echo guard + fan-out handler, the
-  `get-stats`/`flush`/`pause`/`resume` command verbs, the two console panels, script-output-topic
-  validation — was moved to `src/dispatch.rs`, which *is* fully unit-tested: it operates over the
-  public `MessagingService` trait (faked downstream in `src/test_support.rs`, since the library's own
+- **D-TP-7 (this remediation, revised). `app.rs` vs. `route_build.rs`/`dispatch.rs` is a testability
+  boundary, kept deliberately thin, not a broad "the whole wiring file" carve-out.** The first cut of
+  this split (excluding all of `app.rs`) was too broad — `build_route` still contained testable
+  decision branches (target/filter/publish-topic resolution, script-output-topic validation, the
+  restamp policy), all of which need only a plain `Config` (publicly constructible via
+  `Config::from_value`), not a live `EdgeCommons`. Those moved to a new `src/route_build.rs`
+  (`resolve_global_wiring`, `resolve_target`, `resolve_filters`, `resolve_publish_topic`,
+  `resolve_script_output_topics`, `compute_restamp`), unit-tested directly against
+  `Config::from_value`-built configs — no fakes needed, since `Config` itself has a public test
+  constructor. What remains in `src/app.rs` is only the code that must obtain a live
+  `Arc<dyn MessagingService>` (`gg.messaging()`), `EventsFacade` (`gg.events()`),
+  `Arc<CommandInbox>` (`gg.commands()`), `Arc<dyn MetricService>` (`gg.metrics()`),
+  `Arc<dyn StreamService>` (`gg.streams()`, stream targets only — `build_route`'s one remaining
+  live dependency), or `gg.shutdown_signal()` — none of those types has a public or test constructor
+  outside the `edgecommons` crate (`EventsFacade::new` and `CommandInbox::new` are both `pub(crate)`
+  in the library), so `app.rs` genuinely cannot be unit-tested without a live runtime. The CI
+  coverage job excludes it (with `main.rs`) for exactly this reason, mirroring the "supervisor.rs"
+  seam pattern the protocol-adapter templates use for a genuinely different reason (a live device
+  driver). The self-echo guard + fan-out handler, the `get-stats`/`flush`/`pause`/`resume` command
+  verbs, and the two console panels live in `src/dispatch.rs`, unit-tested against a downstream
+  `MessagingService` fake (`src/test_support.rs`, since the library's own
   `testutil::RecordingMessaging` is `pub(crate)` and unreachable from this crate) and a test-only
   recording `EvtEmitter` (`EvtEmitter::recording`, added to `src/observe.rs` for the same reason —
   `EventsFacade` has no public constructor — mirroring `file-replicator`'s `Events::recording_events`
@@ -118,12 +127,14 @@ summed across routes and emitted as interval deltas every 30s via `gg.metrics()`
 
 ## Validation
 
-- `cargo test` (96 tests as of this remediation) — pipeline mechanics, route config parsing, the
-  fan-out handler + command/panel registration, the route dispatcher (local/northbound/stream targets,
-  restamp, failure→evt), the metric/event surface. No broker required.
+- `cargo test` (107 tests as of this remediation) — pipeline mechanics, route config parsing,
+  route-build decisions (target/filter/publish/script-output-topic resolution, the restamp policy —
+  `src/route_build.rs`), the fan-out handler + command/panel registration, the route dispatcher
+  (local/northbound/stream targets, restamp, failure→evt), the metric/event surface. No broker
+  required.
 - `cargo llvm-cov --fail-under-lines 90` — the coverage gate; see D-TP-7 for exactly what is excluded
-  and why. Measured at ~92.5% lines on this remediation's changeset (native Windows; CI runs on
-  `ubuntu-latest`).
+  and why. Measured at 92.95% lines on this remediation's changeset, identical on native Windows and
+  WSL/Linux (CI runs on `ubuntu-latest`).
 - `cargo clippy --all-targets -- -D warnings` — clean.
 - Live-infra validation (HOST/dual-MQTT, GG-lab, Kubernetes) per the org validation matrix is not
   re-run by this remediation — it is a hygiene/CI-shaped change (lockfile, coverage gate, schema,

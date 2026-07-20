@@ -26,40 +26,39 @@
 //! re-consumed copy is discarded. Cross-device processor chaining still works (a different device
 //! does not match).
 //!
-//! ## Why this file is the coverage seam
-//! `ProcessorApp::start`/`build_route`/`run` are the composition root: they obtain a live
-//! `Config`/`Arc<dyn MessagingService>`/`EventsFacade`/`Arc<CommandInbox>`/`Arc<dyn StreamService>`
-//! from a real `&EdgeCommons`, none of which has a public (or test) constructor outside the
-//! `edgecommons` crate. That makes this file untestable without a live `EdgeCommons` — there is no
-//! broker or protocol involved, just library types this crate cannot fabricate. Every piece of
-//! *logic* that does not need `&EdgeCommons` directly (the fan-out handler, the command/panel
-//! registration, the pure helpers, script-output-topic validation) lives in [`crate::dispatch`]
-//! instead, where it is fully unit-tested. See `AGENTS.md` and the `coverage` job in
+//! ## Why this file is the coverage seam — and why it is now narrow
+//! The genuinely untestable surface is obtaining live library handles from a real `&EdgeCommons` —
+//! `Arc<dyn MessagingService>` (`gg.messaging()`), `EventsFacade` (`gg.events()`),
+//! `Arc<CommandInbox>` (`gg.commands()`), `Arc<dyn MetricService>` (`gg.metrics()`), `Arc<dyn
+//! StreamService>` (`gg.streams()`, stream targets only), and `gg.shutdown_signal()` — none of which
+//! has a public (or test) constructor outside the `edgecommons` crate. That is the only reason this
+//! file cannot be unit-tested; there is no broker or protocol involved, just library types this
+//! crate cannot fabricate. Every *decision* — cross-route defaulting, route target/filter/publish
+//! resolution, script-output-topic validation, the `local`-target restamp policy, the fan-out
+//! handler, the command/panel registration — needs only `Config` (publicly constructible via
+//! `Config::from_value`) or a fakeable trait object, and lives in [`crate::route_build`] /
+//! [`crate::dispatch`] instead, fully unit-tested. See `AGENTS.md` and the `coverage` job in
 //! `.github/workflows/ci.yml`, which excludes only this file and `main.rs`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use edgecommons::config::model::Config;
-use edgecommons::config::template::resolve;
-use edgecommons::messaging::message::MessageIdentity;
 use edgecommons::messaging::MessagingService;
 use edgecommons::prelude::*;
-use edgecommons::uns::reserved_class_of;
 use rhai::Engine;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::config::{
-    parse_target, GlobalDefaults, RouteConfig, ScriptEngineKind, ScriptStageSpec, StageConfig,
-};
-use crate::dispatch::{self_subscribe, register_commands, validate_script_output_topic, FilterRoutes, RouteHandle};
+use crate::config::{RouteConfig, ScriptEngineKind};
+use crate::dispatch::{self_subscribe, register_commands, FilterRoutes, RouteHandle};
 use crate::observe::{spawn_metric_emitter, EvtEmitter, RouteStats};
 use crate::proc::route::{run_worker, Dispatcher};
 use crate::proc::{Control, Pipeline, ProcMsg};
+use crate::route_build::{
+    compute_restamp, resolve_filters, resolve_global_wiring, resolve_publish_topic,
+    resolve_script_output_topics, resolve_target,
+};
 
-/// Default aggregation/partition key when neither the route nor the global defaults set one.
-const DEFAULT_KEY: &str = "body.signal.id";
 /// Default route channel capacity (also the broker-side subscribe queue depth).
 const DEFAULT_QUEUE: usize = 256;
 /// Depth of a route's out-of-band control channel (the `flush` command verb).
@@ -76,7 +75,8 @@ struct BuiltRoute {
 
 /// Per-route-invariant build context: the shared Rhai engine, the script-file loader, the
 /// cross-route defaults, and the component identity injected into scripts. Bundled so `build_route`
-/// takes the route plus one context, not a long argument list.
+/// takes the route plus one context, not a long argument list. Populated from
+/// [`crate::route_build::GlobalWiring`] (the actual defaulting logic lives there, tested).
 struct RouteBuildCtx<'a> {
     engine: &'a Arc<Engine>,
     loader: &'a crate::proc::script::ScriptLoader,
@@ -113,39 +113,22 @@ impl ProcessorApp {
         engine.set_max_operations(1_000_000);
         let engine = Arc::new(engine);
 
-        let defaults: GlobalDefaults = config
-            .global()
-            .get("defaults")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let default_key = defaults.key.clone().unwrap_or_else(|| DEFAULT_KEY.to_string());
-        // Script files (`{"file": "..."}`) resolve relative to this dir (template-substituted).
-        let scripts_dir = defaults
-            .scripts_dir
-            .as_deref()
-            .map(|d| resolve(&config, d))
-            .unwrap_or_else(|| ".".to_string());
-        let loader = crate::proc::script::ScriptLoader::new(scripts_dir);
-        // Component identity for the script runtime context. Read the raw values (the template
-        // resolver would sanitize them for topic/path safety, which we don't want in a script).
-        let component_full_name = config.component_name.clone();
-        let component_name =
-            component_full_name.rsplit('.').next().unwrap_or(&component_full_name).to_string();
-        let thing_name = config.thing_name.clone();
+        // Cross-route defaults + the processor's own identity strings — the actual defaulting
+        // decisions live in `route_build::resolve_global_wiring`, tested there against a plain
+        // `Config` (no live `EdgeCommons` needed).
+        let wiring = resolve_global_wiring(&config);
+        let loader = crate::proc::script::ScriptLoader::new(wiring.scripts_dir.clone());
         let ctx = RouteBuildCtx {
             engine: &engine,
             loader: &loader,
-            default_key: &default_key,
-            default_target: defaults.target.as_deref(),
-            thing_name: &thing_name,
-            component_name: &component_name,
-            component_full_name: &component_full_name,
-            default_script_engine: defaults.script_engine.unwrap_or_default(),
+            default_key: &wiring.default_key,
+            default_target: wiring.default_target.as_deref(),
+            thing_name: &wiring.thing_name,
+            component_name: &wiring.component_name,
+            component_full_name: &wiring.component_full_name,
+            default_script_engine: wiring.default_script_engine,
         };
 
-        // The processor's own UNS identity — the self-echo guard's match, and the restamp source.
-        let own_device = config.identity().device().to_string();
-        let own_component = config.identity().component().to_string();
         // The `evt` health-event publisher — a thin wrapper over the library's `events()` facade at
         // component scope (D-U28: no instance token, so events land on `.../telemetry-processor/evt/…`).
         let evt = EvtEmitter::new(gg.events());
@@ -196,8 +179,8 @@ impl ProcessorApp {
                 &app.messaging,
                 &filter,
                 routes,
-                own_device.clone(),
-                own_component.clone(),
+                wiring.own_device.clone(),
+                wiring.own_component.clone(),
                 evt.clone(),
             )
             .await?;
@@ -235,7 +218,11 @@ impl ProcessorApp {
         Ok(app)
     }
 
-    /// Build one route's worker + channels; return the wired route (no subscription yet).
+    /// Build one route's worker + channels; return the wired route (no subscription yet). The
+    /// route-level decisions (target/filter/publish/script-output-topic resolution, the restamp
+    /// policy) are delegated to `crate::route_build`, which needs only `config` — the sole thing
+    /// here that genuinely requires a live `&EdgeCommons` is `gg.streams()` for a `Channel::Stream`
+    /// target (behind the `streaming` feature).
     fn build_route(
         &mut self,
         gg: &EdgeCommons,
@@ -246,61 +233,11 @@ impl ProcessorApp {
     ) -> anyhow::Result<BuiltRoute> {
         let _ = gg; // used only under the `streaming` feature (stream targets)
         let route_key = route.key.clone().unwrap_or_else(|| ctx.default_key.to_string());
-        let target_str = route
-            .target
-            .clone()
-            .or_else(|| ctx.default_target.map(String::from))
-            .ok_or_else(|| anyhow::anyhow!("route '{}' has no target", route.id))?;
-        let target = parse_target(&target_str)?;
-
-        anyhow::ensure!(!route.subscribe.is_empty(), "route '{}' has no subscribe topics", route.id);
-        let filters: Vec<String> = route.subscribe.iter().map(|f| resolve(config, f)).collect();
-
-        let mut publish = route.publish.clone().unwrap_or_default();
-        if let Some(t) = &publish.topic {
-            let resolved = resolve(config, t);
-            // Defensive: a publish topic that resolves to a reserved UNS class (state|metric|cfg|log)
-            // is rejected at publish time by the reserved-class guard (silent drop). Warn at startup.
-            if let Some(cls) = reserved_class_of(&resolved, config.effective_include_root()) {
-                tracing::warn!(
-                    route = %route.id,
-                    topic = %resolved,
-                    class = cls.token(),
-                    "publish.topic targets a RESERVED UNS class; the reserved-class guard will drop \
-                     these publishes — target a data/evt/app class instead"
-                );
-            }
-            publish.topic = Some(resolved);
-        }
-
-        // Resolve + validate every script stage's explicit output topic: reserved classes and
-        // subscribe-overlap feedback loops are startup errors, and a route-level `publish.topic`
-        // may not silently override a stage output topic.
-        for sc in route.pipeline.iter_mut() {
-            let StageConfig::Script(ScriptStageSpec::Spec(sp)) = sc else { continue };
-            let Some(out) = sp.output.as_mut() else { continue };
-            let resolved = resolve(config, &out.topic);
-            validate_script_output_topic(
-                &route.id,
-                &resolved,
-                config.effective_include_root(),
-                &filters,
-                publish.topic.as_deref(),
-            )?;
-            out.topic = resolved;
-        }
-
-        // Restamp policy: `local` output carries the processor's own identity (instance = route id)
-        // — loop-safety for the self-echo guard + correct provenance for the processor's product.
-        let restamp: Option<MessageIdentity> = match &target {
-            Channel::Local => Some(
-                config
-                    .identity()
-                    .with_instance(&route.id)
-                    .map_err(|e| anyhow::anyhow!("route '{}' identity restamp: {e}", route.id))?,
-            ),
-            _ => None,
-        };
+        let target = resolve_target(&route, ctx.default_target)?;
+        let filters = resolve_filters(config, &route)?;
+        let publish = resolve_publish_topic(config, &route.id, route.publish.clone().unwrap_or_default());
+        resolve_script_output_topics(config, &mut route, &filters, publish.topic.as_deref())?;
+        let restamp = compute_restamp(config, &target, &route.id)?;
 
         #[cfg(feature = "streaming")]
         let stream = match &target {
