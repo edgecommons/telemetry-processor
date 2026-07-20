@@ -3,7 +3,7 @@ name = "telemetry-processor"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-license = "Apache-2.0"
+license = "BUSL-1.1"
 description = "Reference Rust processing component for edgecommons/edgecommons: subscribe → filter/sample/aggregate/project/script → forward (local / northbound / durable stream → Kinesis/Kafka/file)."
 publish = false
 
@@ -46,7 +46,8 @@ scripting-lua = ["dep:mlua"]
 # repo standalone needs read access to that repo. The fetch goes through the git CLI (see
 # .cargo/config.toml); locally it uses your gh/git credential helper, and in CI the reusable workflow
 # rewrites this https URL with the EDGECOMMONS_READ_TOKEN PAT. For local development against an
-# unpushed change, temporarily swap this for `path = "../core-monorepo/libs/rust"`.
+# unpushed change, add a gitignored `.cargo/config.toml` `[patch]` override pointing at
+# `../core/libs/rust` (the sibling checkout) instead of editing this pin — see CLAUDE.md.
 edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "36a70c48b65b35f77bfab70d3a73869debdfc407", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
