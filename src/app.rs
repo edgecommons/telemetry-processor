@@ -14,36 +14,49 @@
 //!   `metric` class (see [`crate::observe`]);
 //! - an [`EvtEmitter`] for the processor's own `evt` health events;
 //! - the custom command verbs `flush` / `get-stats` / `pause` / `resume` (registered on
-//!   `gg.commands()`), which the built-in `ping` / `reload-config` / `get-configuration` complement.
+//!   `gg.commands()`), which the built-in `ping` / `reload-config` / `get-configuration` complement;
+//! - two `scope: "component"` edge-console panel descriptors (`overview`, `routes`) bound to those
+//!   verbs — an optional enhancement (not a baseline requirement for processors).
 //!
 //! ## Self-echo guard (loop safety)
 //! Under a fleet `ecv1/+/+/+/data/#` input a `local` republish onto the processor's own `data`
 //! class would be re-consumed → an amplifying loop. The dispatcher restamps `local` output with the
-//! processor's identity (see [`crate::proc::route`]) and this fan-out handler drops any inbound
-//! message whose `identity` device+component equal the processor's own — so a re-consumed copy is
-//! discarded. Cross-device processor chaining still works (a different device does not match).
+//! processor's identity (see [`crate::proc::route`]) and the fan-out handler ([`crate::dispatch`])
+//! drops any inbound message whose `identity` device+component equal the processor's own — so a
+//! re-consumed copy is discarded. Cross-device processor chaining still works (a different device
+//! does not match).
+//!
+//! ## Why this file is the coverage seam
+//! `ProcessorApp::start`/`build_route`/`run` are the composition root: they obtain a live
+//! `Config`/`Arc<dyn MessagingService>`/`EventsFacade`/`Arc<CommandInbox>`/`Arc<dyn StreamService>`
+//! from a real `&EdgeCommons`, none of which has a public (or test) constructor outside the
+//! `edgecommons` crate. That makes this file untestable without a live `EdgeCommons` — there is no
+//! broker or protocol involved, just library types this crate cannot fabricate. Every piece of
+//! *logic* that does not need `&EdgeCommons` directly (the fan-out handler, the command/panel
+//! registration, the pure helpers, script-output-topic validation) lives in [`crate::dispatch`]
+//! instead, where it is fully unit-tested. See `AGENTS.md` and the `coverage` job in
+//! `.github/workflows/ci.yml`, which excludes only this file and `main.rs`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use edgecommons::config::model::Config;
 use edgecommons::config::template::resolve;
-use edgecommons::messaging::message::{Message, MessageIdentity};
-use edgecommons::messaging::{topic_matches, MessagingService};
+use edgecommons::messaging::message::MessageIdentity;
+use edgecommons::messaging::MessagingService;
 use edgecommons::prelude::*;
 use edgecommons::uns::reserved_class_of;
 use rhai::Engine;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::config::{
     parse_target, GlobalDefaults, RouteConfig, ScriptEngineKind, ScriptStageSpec, StageConfig,
 };
+use crate::dispatch::{self_subscribe, register_commands, validate_script_output_topic, FilterRoutes, RouteHandle};
 use crate::observe::{spawn_metric_emitter, EvtEmitter, RouteStats};
 use crate::proc::route::{run_worker, Dispatcher};
-use crate::proc::{now_ms, Control, Pipeline, ProcMsg};
+use crate::proc::{Control, Pipeline, ProcMsg};
 
 /// Default aggregation/partition key when neither the route nor the global defaults set one.
 const DEFAULT_KEY: &str = "body.signal.id";
@@ -52,24 +65,11 @@ const DEFAULT_QUEUE: usize = 256;
 /// Depth of a route's out-of-band control channel (the `flush` command verb).
 const CONTROL_QUEUE: usize = 4;
 
-/// The routes registered on one subscribe filter: each a `(worker data sender, route counters)`
-/// pair the fan-out handler forwards to.
-type FilterRoutes = Vec<(mpsc::Sender<ProcMsg>, Arc<RouteStats>)>;
-
 /// One fully wired route (produced by [`ProcessorApp::build_route`]).
 struct BuiltRoute {
     id: String,
     filters: Vec<String>,
     tx: mpsc::Sender<ProcMsg>,
-    control: mpsc::Sender<Control>,
-    stats: Arc<RouteStats>,
-}
-
-/// A command-facing route handle. Deliberately holds **no** data sender, so the app remains the
-/// sole owner of the data channels — dropping [`ProcessorApp::senders`] on shutdown then closes
-/// every worker (the control sender kept here does not gate worker shutdown).
-struct RouteHandle {
-    id: String,
     control: mpsc::Sender<Control>,
     stats: Arc<RouteStats>,
 }
@@ -208,19 +208,24 @@ impl ProcessorApp {
         let stats_vec: Vec<Arc<RouteStats>> = built.iter().map(|b| b.stats.clone()).collect();
         app.metric_task = Some(spawn_metric_emitter(gg.metrics(), config.clone(), stats_vec));
 
-        // 4. Register the custom command verbs (flush / get-stats / pause / resume). The built-in
-        //    ping / reload-config / get-configuration are already wired by the library.
-        let handles: Arc<Vec<RouteHandle>> = Arc::new(
-            built
-                .iter()
-                .map(|b| RouteHandle {
-                    id: b.id.clone(),
-                    control: b.control.clone(),
-                    stats: b.stats.clone(),
-                })
-                .collect(),
-        );
-        register_commands(gg, handles);
+        // 4. Register the custom command verbs (flush / get-stats / pause / resume) + the console
+        //    panel pair. The built-in ping / reload-config / get-configuration are already wired by
+        //    the library. A no-op when no messaging transport wired an inbox.
+        if let Some(cmds) = gg.commands() {
+            let handles: Arc<Vec<RouteHandle>> = Arc::new(
+                built
+                    .iter()
+                    .map(|b| RouteHandle {
+                        id: b.id.clone(),
+                        control: b.control.clone(),
+                        stats: b.stats.clone(),
+                    })
+                    .collect(),
+            );
+            register_commands(&cmds, handles);
+        } else {
+            tracing::debug!("no command inbox (no messaging transport); custom verbs not registered");
+        }
 
         tracing::info!(
             routes = app.workers.len(),
@@ -370,256 +375,5 @@ impl ProcessorApp {
             let _ = w.await;
         }
         Ok(())
-    }
-}
-
-/// Subscribe one filter with a fan-out handler: apply the UNS self-echo guard, then forward each
-/// message to every route channel that registered for it (tallying `messages_in`/`messages_dropped`
-/// and the queue-depth gauge, honoring the per-route `paused` flag, and emitting a rate-limited
-/// `evt/warning/queue-overflow` on backpressure drops). Concurrency is 1 so ordered consumers get
-/// messages in order.
-async fn self_subscribe(
-    messaging: &Arc<dyn MessagingService>,
-    filter: &str,
-    routes: FilterRoutes,
-    own_device: String,
-    own_component: String,
-    evt: Arc<EvtEmitter>,
-) -> anyhow::Result<()> {
-    let filter_owned = filter.to_string();
-    messaging
-        .subscribe(
-            filter,
-            message_handler(move |topic, msg| {
-                let routes = routes.clone();
-                let filter_owned = filter_owned.clone();
-                let own_device = own_device.clone();
-                let own_component = own_component.clone();
-                let evt = evt.clone();
-                async move {
-                    // Self-echo guard: drop our own re-consumed output (identity device+component
-                    // match ours) so a `local` republish onto the consumed `data` class can't loop.
-                    if let Some(id) = &msg.identity {
-                        if id.device() == own_device && id.component() == own_component {
-                            tracing::trace!(topic = %topic, "self-echo dropped (own identity)");
-                            return;
-                        }
-                    }
-                    let pm = ProcMsg { topic, msg, recv_ms: now_ms() };
-                    for (tx, stats) in &routes {
-                        if stats.is_paused() {
-                            continue;
-                        }
-                        match tx.try_send(pm.clone()) {
-                            Ok(()) => {
-                                stats.messages_in.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => {
-                                stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    filter = %filter_owned,
-                                    route = %stats.id,
-                                    "route queue full; dropping message"
-                                );
-                                evt.queue_overflow(&stats.id).await;
-                            }
-                        }
-                        // Update the queue-depth gauge (max_capacity - remaining permits).
-                        let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
-                        stats.queue_depth.store(depth, Ordering::Relaxed);
-                    }
-                }
-            }),
-            DEFAULT_QUEUE,
-            1,
-        )
-        .await?;
-    Ok(())
-}
-
-/// Register the processor's custom command verbs on the library command inbox (a no-op when no
-/// messaging transport wired an inbox). The built-in `ping`/`reload-config`/`get-configuration`
-/// verbs are registered by the library and complement these.
-fn register_commands(gg: &EdgeCommons, handles: Arc<Vec<RouteHandle>>) {
-    let Some(cmds) = gg.commands() else {
-        tracing::debug!("no command inbox (no messaging transport); custom verbs not registered");
-        return;
-    };
-
-    // get-stats — per-route counters snapshot.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "get-stats", command_handler(move |_req| {
-            let handles = handles.clone();
-            async move { Ok(Some(stats_json(&handles))) }
-        }));
-    }
-
-    // flush — force-close every route's open time windows now; report the total emitted.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "flush", command_handler(move |_req| {
-            let handles = handles.clone();
-            async move {
-                let mut flushed = 0u64;
-                for route in handles.iter() {
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    if route.control.send(Control::Flush(reply_tx)).await.is_ok() {
-                        if let Ok(n) = reply_rx.await {
-                            flushed += n;
-                        }
-                    }
-                }
-                Ok(Some(json!({ "flushed": flushed })))
-            }
-        }));
-    }
-
-    // pause — stop enqueuing to a route (body `{route}`), or all routes when omitted.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "pause", command_handler(move |req| {
-            let handles = handles.clone();
-            async move { Ok(Some(set_paused(&handles, &req, true))) }
-        }));
-    }
-
-    // resume — the inverse of pause.
-    {
-        let handles = handles.clone();
-        try_register(&cmds, "resume", command_handler(move |req| {
-            let handles = handles.clone();
-            async move { Ok(Some(set_paused(&handles, &req, false))) }
-        }));
-    }
-}
-
-/// Register a verb, logging (not failing) if the inbox rejects it.
-fn try_register(cmds: &Arc<CommandInbox>, verb: &str, handler: Arc<dyn CommandHandler>) {
-    if let Err(e) = cmds.register(verb, handler) {
-        tracing::warn!(verb, error = %e, "failed to register command verb");
-    }
-}
-
-/// The `get-stats` reply body: `{routes: [{id, in, out, dropped, streamAppends, publishFailures,
-/// queueDepth, paused}]}`.
-fn stats_json(handles: &[RouteHandle]) -> Value {
-    let routes: Vec<Value> = handles
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.id,
-                "in": r.stats.messages_in.load(Ordering::Relaxed),
-                "out": r.stats.messages_out.load(Ordering::Relaxed),
-                "dropped": r.stats.messages_dropped.load(Ordering::Relaxed),
-                "streamAppends": r.stats.stream_appends.load(Ordering::Relaxed),
-                "publishFailures": r.stats.publish_failures.load(Ordering::Relaxed),
-                "queueDepth": r.stats.queue_depth.load(Ordering::Relaxed),
-                "paused": r.stats.paused.load(Ordering::Relaxed),
-            })
-        })
-        .collect();
-    json!({ "routes": routes })
-}
-
-/// Apply `paused` to the route named in `request.body.route` (or all routes when absent). Returns
-/// `{paused|resumed: [ids...]}`.
-fn set_paused(handles: &[RouteHandle], request: &Message, paused: bool) -> Value {
-    let route = request.body.get("route").and_then(Value::as_str);
-    let mut affected = Vec::new();
-    for r in handles {
-        if route.is_none() || route == Some(r.id.as_str()) {
-            r.stats.paused.store(paused, Ordering::Relaxed);
-            affected.push(r.id.clone());
-        }
-    }
-    let key = if paused { "paused" } else { "resumed" };
-    json!({ key: affected })
-}
-
-/// Validate a script stage's resolved `output.topic` for one route: reject reserved UNS classes,
-/// reject an output that any of the route's own subscribe filters would re-consume (a direct
-/// feedback loop — cross-route re-consumption is stopped at runtime by the self-echo guard), and
-/// reject a route-level `publish.topic` alongside it (the dispatcher's per-route topic would
-/// silently override the per-stage output topic).
-fn validate_script_output_topic(
-    route_id: &str,
-    topic: &str,
-    include_root: bool,
-    filters: &[String],
-    route_publish_topic: Option<&str>,
-) -> anyhow::Result<()> {
-    if let Some(cls) = reserved_class_of(topic, include_root) {
-        anyhow::bail!(
-            "route '{route_id}': script output.topic '{topic}' targets the RESERVED UNS class \
-             '{}' — target a data/evt/app class instead",
-            cls.token()
-        );
-    }
-    for f in filters {
-        anyhow::ensure!(
-            !topic_matches(f, topic),
-            "route '{route_id}': script output.topic '{topic}' overlaps this route's subscribe \
-             filter '{f}' — a feedback loop; publish the derived signal outside the route's input \
-             filters"
-        );
-    }
-    anyhow::ensure!(
-        route_publish_topic.is_none(),
-        "route '{route_id}': `publish.topic` and a script stage `output.topic` are mutually \
-         exclusive — the route-level topic would override the stage output; drop one of the two"
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn script_output_topic_validation() {
-        let filters = vec!["ecv1/+/+/+/data/#".to_string()];
-        // A data-class topic under the subscribed fleet filter is a feedback loop.
-        let err = validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/data/derived",
-            true,
-            &filters,
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("feedback loop"), "{err}");
-
-        // A reserved class (`metric`) is rejected outright.
-        let err = validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/metric/derived",
-            true,
-            &[],
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("RESERVED"), "{err}");
-
-        // A route publish.topic alongside a stage output topic is ambiguous.
-        let err = validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/data/derived",
-            true,
-            &[],
-            Some("ecv1/gw-1/telemetry-processor/r1/data/other"),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("mutually"), "{err}");
-
-        // A non-overlapping data topic with no publish.topic passes.
-        validate_script_output_topic(
-            "r1",
-            "ecv1/gw-1/telemetry-processor/r1/data/derived",
-            true,
-            &["ecv1/+/opcua-adapter/+/data/#".to_string()],
-            None,
-        )
-        .unwrap();
     }
 }

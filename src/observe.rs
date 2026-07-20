@@ -94,15 +94,49 @@ impl RouteStats {
 /// per-channel **cooldown** gate. Publishing is best-effort: `evt` is a non-reserved class, so the
 /// reserved-class guard passes; a failed publish is logged at DEBUG and swallowed (the facade
 /// itself never propagates a transport error here — see [`EventsFacade::emit`]).
+/// One recorded `(event_type, message, context)` tuple, captured by [`EvtEmitter::recording`].
+#[cfg(test)]
+pub(crate) type RecordedEvts = Arc<Mutex<Vec<(String, Option<String>, Value)>>>;
+
 pub struct EvtEmitter {
-    events: EventsFacade,
+    /// `None` only in the test-only [`EvtEmitter::recording`] constructor — [`EventsFacade`] has no
+    /// public constructor outside the `edgecommons` crate (by design), so a unit test that needs to
+    /// exercise the cooldown gate + call sites (the fan-out handler, the route dispatcher) without a
+    /// live `EdgeCommons` cannot build a real one. Production code always goes through
+    /// [`EvtEmitter::new`], which always populates this.
+    events: Option<EventsFacade>,
     cooldowns: Mutex<HashMap<String, Instant>>,
+    /// Test-only recorder (see [`EvtEmitter::recording`]): when set, [`Self::emit`] records the
+    /// `(event_type, message, context)` tuple for in-process assertions instead of publishing
+    /// through a facade.
+    #[cfg(test)]
+    recorder: Option<RecordedEvts>,
 }
 
 impl EvtEmitter {
     /// Build an emitter over the component's `events()` facade (`gg.events()`).
     pub fn new(events: EventsFacade) -> Arc<EvtEmitter> {
-        Arc::new(EvtEmitter { events, cooldowns: Mutex::new(HashMap::new()) })
+        Arc::new(EvtEmitter {
+            events: Some(events),
+            cooldowns: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            recorder: None,
+        })
+    }
+
+    /// A test-only emitter with no bound facade: [`Self::emit`] records into the returned recorder
+    /// instead of publishing, so component code that depends on an `EvtEmitter` (the fan-out
+    /// handler, the route [`crate::proc::route::Dispatcher`]) is unit-testable without a live
+    /// `EdgeCommons`/`EventsFacade`.
+    #[cfg(test)]
+    pub(crate) fn recording() -> (RecordedEvts, Arc<EvtEmitter>) {
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(EvtEmitter {
+            events: None,
+            cooldowns: Mutex::new(HashMap::new()),
+            recorder: Some(recorder.clone()),
+        });
+        (recorder, emitter)
     }
 
     /// Returns `true` if `event_type` is outside its cooldown (and records the emit time).
@@ -125,8 +159,13 @@ impl EvtEmitter {
         if !self.allow(event_type) {
             return;
         }
-        if let Err(e) = self.events.emit(Severity::Warning, event_type, message, Some(context)).await
-        {
+        #[cfg(test)]
+        if let Some(rec) = &self.recorder {
+            rec.lock().unwrap().push((event_type.to_string(), message, context));
+            return;
+        }
+        let Some(events) = &self.events else { return };
+        if let Err(e) = events.emit(Severity::Warning, event_type, message, Some(context)).await {
             tracing::debug!(error = %e, event_type, "evt publish failed");
         }
     }
@@ -286,5 +325,33 @@ mod tests {
             cds.insert(channel.to_string(), now);
             true
         }
+    }
+
+    #[tokio::test]
+    async fn recording_emitter_records_each_health_event_with_its_context() {
+        let (rec, emitter) = EvtEmitter::recording();
+        emitter.queue_overflow("r1").await;
+        emitter.route_error("r1", "ecv1/x/telemetry-processor/data/y", "publish failed").await;
+        emitter.stream_unavailable("r2", "archive", "sink down").await;
+
+        let recorded = rec.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].0, "queue-overflow");
+        assert_eq!(recorded[0].1, None);
+        assert_eq!(recorded[0].2, json!({ "route": "r1" }));
+        assert_eq!(recorded[1].0, "route-error");
+        assert_eq!(recorded[1].1.as_deref(), Some("publish failed"));
+        assert_eq!(recorded[1].2, json!({ "route": "r1", "topic": "ecv1/x/telemetry-processor/data/y" }));
+        assert_eq!(recorded[2].0, "stream-unavailable");
+        assert_eq!(recorded[2].1.as_deref(), Some("sink down"));
+        assert_eq!(recorded[2].2, json!({ "route": "r2", "stream": "archive" }));
+    }
+
+    #[tokio::test]
+    async fn recording_emitter_is_also_cooldown_gated() {
+        let (rec, emitter) = EvtEmitter::recording();
+        emitter.queue_overflow("r1").await;
+        emitter.queue_overflow("r1").await; // within the cooldown window — suppressed
+        assert_eq!(rec.lock().unwrap().len(), 1);
     }
 }

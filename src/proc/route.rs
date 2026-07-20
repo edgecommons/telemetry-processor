@@ -249,7 +249,10 @@ pub async fn run_worker(
 
 #[cfg(test)]
 mod tests {
-    use edgecommons::messaging::message::{Message, MessageBuilder};
+    use super::*;
+    use crate::observe::EvtEmitter;
+    use crate::test_support::FakeMessaging;
+    use edgecommons::messaging::message::MessageBuilder;
     use serde_json::json;
 
     #[test]
@@ -274,5 +277,173 @@ mod tests {
         assert_eq!(decoded.body["samples"][0]["value"], json!(21.5));
         assert_eq!(decoded.body["samples"][0]["sourceTsMs"], json!(1783360799900u64));
         assert_eq!(decoded.body["samples"][0]["serverTsMs"], json!(1783360800000u64));
+    }
+
+    fn southbound(topic: &str) -> ProcMsg {
+        let msg = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .southbound_signal_update(json!({
+                "signal": { "id": "temp", "name": "Temperature" },
+                "samples": [{ "value": 21.5, "quality": "GOOD" }]
+            }))
+            .build();
+        ProcMsg { topic: topic.to_string(), msg, recv_ms: 1_000 }
+    }
+
+    fn publish_cfg(topic: Option<&str>, qos: Option<&str>, partition_key: Option<&str>) -> PublishConfig {
+        PublishConfig {
+            topic: topic.map(String::from),
+            partition_key: partition_key.map(String::from),
+            qos: qos.map(String::from),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatcher(
+        messaging: Arc<dyn MessagingService>,
+        target: Channel,
+        publish: &PublishConfig,
+        stats: Arc<RouteStats>,
+        evt: Arc<EvtEmitter>,
+        restamp: Option<MessageIdentity>,
+    ) -> Dispatcher {
+        Dispatcher::new(
+            messaging,
+            target,
+            publish,
+            "body.signal.id",
+            "r1".to_string(),
+            stats,
+            evt,
+            restamp,
+            #[cfg(feature = "streaming")]
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn local_dispatch_uses_the_source_topic_by_default_and_tallies_out() {
+        let fake = FakeMessaging::new();
+        let messaging: Arc<dyn MessagingService> = fake.clone();
+        let stats = RouteStats::new("r1");
+        let (_rec, evt) = EvtEmitter::recording();
+        let d = dispatcher(messaging, Channel::Local, &publish_cfg(None, None, None), stats.clone(), evt, None);
+
+        d.dispatch(southbound("ecv1/gw/opcua-adapter/kep1/data/temp")).await;
+
+        let published = fake.published.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, "ecv1/gw/opcua-adapter/kep1/data/temp", "default topic = source topic");
+        assert_eq!(stats.messages_out.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn local_dispatch_restamps_identity_when_configured() {
+        let fake = FakeMessaging::new();
+        let messaging: Arc<dyn MessagingService> = fake.clone();
+        let stats = RouteStats::new("r1");
+        let (_rec, evt) = EvtEmitter::recording();
+        let restamp = MessageIdentity::new(
+            vec![edgecommons::messaging::message::HierEntry {
+                level: "device".into(),
+                value: "gw".into(),
+            }],
+            "telemetry-processor",
+            Some("r1".into()),
+        )
+        .unwrap();
+        let d = dispatcher(
+            messaging,
+            Channel::Local,
+            &publish_cfg(Some("ecv1/{ThingName}/telemetry-processor/data/downsampled"), None, None),
+            stats,
+            evt,
+            Some(restamp.clone()),
+        );
+
+        d.dispatch(southbound("ecv1/gw/opcua-adapter/kep1/data/temp")).await;
+
+        let published = fake.published.lock().unwrap();
+        assert_eq!(published[0].0, "ecv1/{ThingName}/telemetry-processor/data/downsampled");
+        assert_eq!(published[0].1.identity.as_ref().unwrap(), &restamp, "output carries the processor's identity");
+    }
+
+    #[tokio::test]
+    async fn a_failed_local_publish_is_tallied_and_emits_route_error() {
+        let fake = FakeMessaging::new();
+        fake.set_fail_publish("broker unavailable");
+        let messaging: Arc<dyn MessagingService> = fake.clone();
+        let stats = RouteStats::new("r1");
+        let (rec, evt) = EvtEmitter::recording();
+        let d = dispatcher(messaging, Channel::Local, &publish_cfg(None, None, None), stats.clone(), evt, None);
+
+        d.dispatch(southbound("ecv1/gw/opcua-adapter/kep1/data/temp")).await;
+
+        assert_eq!(stats.publish_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.messages_out.load(Ordering::Relaxed), 0);
+        let recorded = rec.lock().unwrap();
+        assert_eq!(recorded[0].0, "route-error");
+    }
+
+    #[tokio::test]
+    async fn northbound_dispatch_uses_the_configured_qos() {
+        let fake = FakeMessaging::new();
+        let messaging: Arc<dyn MessagingService> = fake.clone();
+        let stats = RouteStats::new("r1");
+        let (_rec, evt) = EvtEmitter::recording();
+        let d = dispatcher(
+            messaging,
+            Channel::Northbound,
+            &publish_cfg(Some("ecv1/{ThingName}/telemetry-processor/evt/alarms"), Some("atMostOnce"), None),
+            stats.clone(),
+            evt,
+            None,
+        );
+
+        d.dispatch(southbound("ecv1/gw/opcua-adapter/kep1/data/temp")).await;
+
+        let nb = fake.northbound.lock().unwrap();
+        assert_eq!(nb.len(), 1);
+        assert_eq!(nb[0].0, "ecv1/{ThingName}/telemetry-processor/evt/alarms");
+        assert_eq!(nb[0].2, Qos::AtMostOnce);
+        assert_eq!(stats.messages_out.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_northbound_publish_is_tallied_and_emits_route_error() {
+        let fake = FakeMessaging::new();
+        fake.set_fail_publish("northbound link down");
+        let messaging: Arc<dyn MessagingService> = fake.clone();
+        let stats = RouteStats::new("r1");
+        let (rec, evt) = EvtEmitter::recording();
+        let d =
+            dispatcher(messaging, Channel::Northbound, &publish_cfg(None, None, None), stats.clone(), evt, None);
+
+        d.dispatch(southbound("ecv1/gw/opcua-adapter/kep1/data/temp")).await;
+
+        assert_eq!(stats.publish_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(rec.lock().unwrap()[0].0, "route-error");
+    }
+
+    #[tokio::test]
+    async fn a_stream_target_with_no_configured_handle_is_dropped_and_emits_stream_unavailable() {
+        let fake = FakeMessaging::new();
+        let messaging: Arc<dyn MessagingService> = fake.clone();
+        let stats = RouteStats::new("r1");
+        let (rec, evt) = EvtEmitter::recording();
+        let d = dispatcher(
+            messaging,
+            Channel::Stream("archive".to_string()),
+            &publish_cfg(None, None, Some("body.signal.id")),
+            stats.clone(),
+            evt,
+            None,
+        );
+
+        d.dispatch(southbound("ecv1/gw/opcua-adapter/kep1/data/temp")).await;
+
+        assert_eq!(stats.publish_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.stream_appends.load(Ordering::Relaxed), 0);
+        assert_eq!(rec.lock().unwrap()[0].0, "stream-unavailable");
+        assert!(fake.published.lock().unwrap().is_empty(), "a stream target never touches messaging");
     }
 }
