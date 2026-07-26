@@ -316,6 +316,61 @@ mod tests {
     }
 
     #[test]
+    fn explicit_null_samples_fold_per_documented_null_semantics() {
+        // SOUTHBOUND §2: explicit null values (quality GOOD) must not crash aggregation. This
+        // repo's documented null semantics (docs/reference/data-types.md "Aggregate `agg` value
+        // types"): `count` counts ALL folded values (null included), `first`/`last` carry the raw
+        // value (null included), and numeric reducers are null when the window had no numeric
+        // sample. Additive sample fields (valueType/...) beside the value must not disturb any of it.
+        let spec = AggregateSpec {
+            window: "2".into(),
+            by: None,
+            fns: vec!["avg".into(), "sum".into(), "min".into(), "max".into(), "count".into(), "first".into(), "last".into()],
+            value: None,
+        };
+        let mk = |value: Value, recv: u64| {
+            let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+                .payload(json!({
+                    "signal": { "id": "a" },
+                    "samples": [ { "value": value, "quality": "GOOD", "qualityRaw": "relinquished",
+                                   "valueType": "REAL", "valueEncoding": "scalar" } ]
+                }))
+                .build();
+            ProcMsg { topic: "t".into(), msg: m, recv_ms: recv }
+        };
+
+        // Window 1: all-null. Numeric reducers are null; count still counts both samples.
+        let mut s = AggregateStage::build(&spec, "body.signal.id").unwrap();
+        assert!(s.process(mk(Value::Null, 1)).is_empty());
+        let out = s.process(mk(Value::Null, 2));
+        assert_eq!(out.len(), 1);
+        let agg = &out[0].msg.body["agg"];
+        assert_eq!(agg["avg"], Value::Null);
+        assert_eq!(agg["sum"], Value::Null);
+        assert_eq!(agg["min"], Value::Null);
+        assert_eq!(agg["max"], Value::Null);
+        assert_eq!(agg["count"], json!(2));
+        assert_eq!(agg["first"], Value::Null);
+        assert_eq!(agg["last"], Value::Null);
+        // The primary (first fn = avg) lands as samples[0].value = null without error.
+        assert_eq!(out[0].msg.body["samples"][0]["value"], Value::Null);
+
+        // Window 2: mixed null + numeric. Numeric reducers fold the numeric values only; count
+        // includes the null.
+        assert!(s.process(mk(json!(10.0), 3)).is_empty());
+        let out = s.process(mk(Value::Null, 4));
+        assert_eq!(out.len(), 1);
+        let agg = &out[0].msg.body["agg"];
+        assert_eq!(agg["avg"], json!(10.0));
+        assert_eq!(agg["sum"], json!(10.0));
+        assert_eq!(agg["min"], json!(10.0));
+        assert_eq!(agg["max"], json!(10.0));
+        assert_eq!(agg["count"], json!(2));
+        assert_eq!(agg["first"], json!(10.0));
+        assert_eq!(agg["last"], Value::Null);
+    }
+
+    #[test]
     fn aggregate_custom_value_path_non_southbound() {
         // A non-SouthboundSignalUpdate payload: aggregate `body.temp`, keyed by `body.id`.
         let spec = AggregateSpec {

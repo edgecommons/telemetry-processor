@@ -430,6 +430,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_additive_sample_fields_and_explicit_null_value_untouched() {
+        // SOUTHBOUND §2 ("Explicit null values" + "Additive sample fields"): a SouthboundSignalUpdate
+        // whose samples carry unknown additive fields (valueType/valueEncoding) and an explicit
+        // null value with quality GOOD must flow through ingestion without error, without the
+        // sample being dropped, and without the additive fields being stripped.
+        let body = json!({
+            "signal": { "id": "bacnet-av-3", "name": "AV3" },
+            "samples": [{
+                "value": null, "quality": "GOOD", "qualityRaw": "relinquished",
+                "sourceTs": "2026-07-26T00:00:00Z",
+                "valueType": "REAL", "valueEncoding": "scalar"
+            }]
+        });
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .southbound_signal_update(body.clone())
+            .build();
+
+        let fake = FakeMessaging::new();
+        let messaging: Arc<dyn MessagingService> = fake.clone();
+        let (_rec, evt) = EvtEmitter::recording();
+        let (tx, mut rx) = mpsc::channel(4);
+        let stats = RouteStats::new("r1");
+
+        self_subscribe(
+            &messaging,
+            "ecv1/+/+/+/data/#",
+            vec![(tx, stats.clone())],
+            "my-device".into(),
+            "telemetry-processor".into(),
+            evt,
+        )
+        .await
+        .unwrap();
+
+        fake.deliver("ecv1/+/+/+/data/#", "ecv1/other/bacnet-adapter/i1/data/av3", m).await;
+
+        let pm = rx.try_recv().expect("the explicit-null sample must be forwarded, not dropped");
+        assert_eq!(pm.msg.body, body, "additive sample fields and the null value must survive ingestion verbatim");
+        assert_eq!(stats.messages_in.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.messages_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn drops_a_re_consumed_message_carrying_its_own_identity() {
         let fake = FakeMessaging::new();
         let messaging: Arc<dyn MessagingService> = fake.clone();

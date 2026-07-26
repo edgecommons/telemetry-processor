@@ -81,6 +81,31 @@ mod tests {
     }
 
     #[test]
+    fn keep_preserves_additive_sample_fields_and_explicit_null_value() {
+        // SOUTHBOUND §2: samples MAY carry additive fields beside the canonical five, and a
+        // deliberate null value rides with quality GOOD. `keep` whitelists top-level body keys and
+        // copies them verbatim — the samples entries (extras and null included) must survive intact.
+        let sample = json!({
+            "value": null, "quality": "GOOD", "qualityRaw": "relinquished",
+            "sourceTs": "2026-07-26T00:00:00Z",
+            "valueType": "REAL", "valueEncoding": "scalar"
+        });
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .payload(json!({ "signal": { "id": "t1" }, "samples": [sample.clone()], "noise": 1 }))
+            .build();
+        let pm = ProcMsg { topic: "t".into(), msg: m, recv_ms: now_ms() };
+
+        let mut s = ProjectStage::build(&ProjectSpec {
+            keep: Some(vec!["signal".into(), "samples".into()]),
+            set: None,
+        });
+        let out = s.process(pm);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].msg.body["samples"][0], sample, "sample must pass through byte-identical");
+        assert!(out[0].msg.body.get("noise").is_none());
+    }
+
+    #[test]
     fn set_overlays_literals() {
         let mut set = Map::new();
         set.insert("origin".into(), json!("processor"));
