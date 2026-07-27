@@ -188,6 +188,50 @@ mod tests {
     }
 
     #[test]
+    fn southbound_s2_null_and_additive_sample_fields_flow_through_a_pass_through_pipeline() {
+        // SOUTHBOUND §2 pin: a representative pass-through pipeline (quality filter → sample →
+        // project keep) must carry an explicit-null GOOD sample with additive fields
+        // (valueType/valueEncoding) end to end — no error, no dropped sample, no stripped fields.
+        use crate::config::{ProjectSpec, StageConfig};
+
+        let sample = json!({
+            "value": null, "quality": "GOOD", "qualityRaw": "relinquished",
+            "sourceTs": "2026-07-26T00:00:00Z",
+            "valueType": "REAL", "valueEncoding": "scalar"
+        });
+        let stages = vec![
+            StageConfig::Filter(FilterSpec { quality: Some("GOOD".into()), ..Default::default() }),
+            StageConfig::Sample(SampleSpec { every_n: Some(1), ..Default::default() }),
+            StageConfig::Project(ProjectSpec {
+                keep: Some(vec!["signal".into(), "samples".into()]),
+                set: None,
+            }),
+        ];
+        let mut p = Pipeline::build(
+            &stages,
+            "body.signal.id",
+            ScriptEngineKind::Rhai,
+            &engine(),
+            &script::ScriptLoader::default(),
+            &Arc::new(script::ScriptContext::default()),
+        )
+        .unwrap();
+
+        let m = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+            .payload(json!({ "signal": { "id": "bacnet-av-3" }, "samples": [sample.clone()] }))
+            .build();
+        let mut input: Out = SmallVec::new();
+        input.push(ProcMsg { topic: "t".into(), msg: m, recv_ms: 1 });
+
+        let out = p.run(input, None);
+        assert_eq!(out.len(), 1, "the explicit-null GOOD sample must survive the pipeline");
+        assert_eq!(
+            out[0].msg.body["samples"][0], sample,
+            "additive fields and the null value must pass through verbatim"
+        );
+    }
+
+    #[test]
     fn flush_via_max_tick_closes_open_time_window() {
         // The `flush` command verb force-closes open TIME windows by running a `u64::MAX` tick
         // (every window's `window_end <= u64::MAX`), even before the window's own deadline.

@@ -234,6 +234,25 @@ mod tests {
     }
 
     #[test]
+    fn quality_filter_keeps_explicit_null_value_with_good_quality_and_additive_fields() {
+        // SOUTHBOUND §2: an explicit null value with quality GOOD is a legitimate sample (e.g. a
+        // BACnet relinquished slot), and samples MAY carry additive fields (valueType/valueEncoding)
+        // consumers MUST ignore. A quality filter keys on `quality` only — it must keep the sample.
+        let spec = FilterSpec { quality: Some("GOOD".into()), ..Default::default() };
+        let mut s = FilterStage::build(&spec, ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).unwrap();
+        let m = msg(json!([{
+            "value": null, "quality": "GOOD", "qualityRaw": "relinquished",
+            "valueType": "REAL", "valueEncoding": "scalar"
+        }]));
+        assert_eq!(s.process(m).len(), 1, "explicit-null GOOD sample must not be dropped");
+
+        // A failed read (null + BAD) is still droppable by the same filter — the two null cases
+        // stay distinguishable by quality alone.
+        let bad = msg(json!([{ "value": null, "quality": "BAD", "qualityRaw": "timeout" }]));
+        assert_eq!(s.process(bad).len(), 0);
+    }
+
+    #[test]
     fn build_and_op_parse_errors() {
         // No predicate form configured.
         assert!(FilterStage::build(&FilterSpec::default(), ScriptEngineKind::Rhai, &engine(), &ScriptLoader::default(), &ctx()).is_err());
