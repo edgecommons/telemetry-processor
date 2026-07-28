@@ -72,6 +72,9 @@ ComponentConfiguration:
         shop: "test_shop"
         line: "test_line"
       component:
+        # UNS component token. The Greengrass ComponentName is reverse-DNS PascalCase; the token the
+        # wire carries is lower-kebab, so it is set explicitly rather than derived from the name.
+        token: telemetry-processor
         # Cross-route defaults, overlaid by each route (global ⊕ instance).
         global:
           defaults:
