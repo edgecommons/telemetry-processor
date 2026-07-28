@@ -94,6 +94,12 @@ reference.
   restamps `local` output with the processor's own identity and the subscribe fan-out drops any
   inbound message whose identity matches that — without both halves, a `local` route would loop.
 - A full route queue drops and counts; it never blocks the transport's dispatch task.
+- Command verbs declare their addressing scope at registration (core 0.5.0,
+  `DESIGN-scoped-commands.md` D-SC-2). All four processor verbs — `get-stats`, `flush`, `pause`,
+  `resume` — declare `CommandScope::Both` (DESIGN.md D-TP-9): a route **is** a
+  `component.instances[]` entry, so a route-addressed delivery acts on that route alone while a
+  component-addressed one keeps its established "every route" meaning. The topic's instance token
+  wins over the legacy `route` body selector.
 - Four-way parity: if this repo's Java/Python/TypeScript siblings exist, observable behavior should
   match — same config shape, same metric names, same command verbs.
 - Builders/facades are the construction path (`messaging()`, `streams()`, `events()`, `commands()`,

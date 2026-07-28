@@ -12,7 +12,10 @@
 //!   per-route delivery honoring `paused` and tallying `messages_in`/`messages_dropped`/`queue_depth`,
 //!   with a rate-limited `evt/warning/queue-overflow` on backpressure.
 //! - [`register_commands`] wires the custom command verbs (`get-stats`/`flush`/`pause`/`resume`) and
-//!   the two edge-console panel descriptors onto the library's command inbox.
+//!   the two edge-console panel descriptors onto the library's command inbox. All four verbs are
+//!   registered at [`CommandScope::Both`] (D-SC-2/D-SC-3): a route **is** a
+//!   `component.instances[]` entry, so an instance-addressed delivery names exactly one route,
+//!   while a component-addressed one means "every route" — the dual-semantics use.
 //! - [`validate_script_output_topic`] rejects a script stage's `output.topic` that targets a reserved
 //!   UNS class, feeds back into the route's own subscribe filters, or collides with a route-level
 //!   `publish.topic`.
@@ -110,24 +113,34 @@ pub(crate) async fn self_subscribe(
 /// Register the processor's custom command verbs on the library command inbox (a no-op when no
 /// messaging transport wired an inbox). The built-in `ping`/`reload-config`/`get-configuration`
 /// verbs are registered by the library and complement these.
+///
+/// Every verb declares [`CommandScope::Both`]: a route is a `component.instances[]` entry, so an
+/// instance-addressed delivery (`ecv1/{d}/{c}/{route}/cmd/{verb}`) names exactly one route, and a
+/// component-addressed one keeps the established "every route" meaning (D-SC-3's dual-semantics
+/// use). The topic's token is authoritative over the legacy `route` body field — see
+/// [`selected_route`].
 pub(crate) fn register_commands(cmds: &Arc<CommandInbox>, handles: Arc<Vec<RouteHandle>>) {
-    // get-stats — per-route counters snapshot.
+    // get-stats — counters for the addressed route, or every route.
     {
         let handles = handles.clone();
-        try_register(cmds, "get-stats", command_handler(move |_req| {
+        try_register(cmds, "get-stats", CommandScope::Both, command_handler(move |req, addressed| {
             let handles = handles.clone();
-            async move { Ok(Some(stats_json(&handles))) }
+            async move {
+                Ok(Some(stats_json(&handles, selected_route(&req, addressed.as_deref()))))
+            }
         }));
     }
 
-    // flush — force-close every route's open time windows now; report the total emitted.
+    // flush — force-close the addressed route's (or every route's) open time windows now; report
+    // the total emitted.
     {
         let handles = handles.clone();
-        try_register(cmds, "flush", command_handler(move |_req| {
+        try_register(cmds, "flush", CommandScope::Both, command_handler(move |req, addressed| {
             let handles = handles.clone();
             async move {
+                let selected = selected_route(&req, addressed.as_deref());
                 let mut flushed = 0u64;
-                for route in handles.iter() {
+                for route in handles.iter().filter(|r| is_selected(r, selected)) {
                     let (reply_tx, reply_rx) = oneshot::channel();
                     if route.control.send(Control::Flush(reply_tx)).await.is_ok() {
                         if let Ok(n) = reply_rx.await {
@@ -140,28 +153,30 @@ pub(crate) fn register_commands(cmds: &Arc<CommandInbox>, handles: Arc<Vec<Route
         }));
     }
 
-    // pause — stop enqueuing to a route (body `{route}`), or all routes when omitted.
+    // pause — stop enqueuing to the addressed route (or the legacy body `{route}`), or all routes
+    // when neither names one.
     {
         let handles = handles.clone();
-        try_register(cmds, "pause", command_handler(move |req| {
+        try_register(cmds, "pause", CommandScope::Both, command_handler(move |req, addressed| {
             let handles = handles.clone();
-            async move { Ok(Some(set_paused(&handles, &req, true))) }
+            async move { Ok(Some(set_paused(&handles, &req, addressed.as_deref(), true))) }
         }));
     }
 
     // resume — the inverse of pause.
     {
         let handles = handles.clone();
-        try_register(cmds, "resume", command_handler(move |req| {
+        try_register(cmds, "resume", CommandScope::Both, command_handler(move |req, addressed| {
             let handles = handles.clone();
-            async move { Ok(Some(set_paused(&handles, &req, false))) }
+            async move { Ok(Some(set_paused(&handles, &req, addressed.as_deref(), false))) }
         }));
     }
 
     // The edge-console panel pair (optional enhancement, not a baseline requirement for
-    // processors — see DESIGN.md). Component-scoped: the processor has no console-facing UNS
-    // instance dimension (routes are internal wiring, addressed by an optional body field, not a
-    // topic segment), unlike a southbound adapter's per-device instances.
+    // processors — see DESIGN.md). Both panels are component-scoped because both render
+    // fleet-wide aggregates over every route (the overview totals, the routes table); a route is
+    // still individually addressable through the verbs' `Both` scope, which the console surfaces
+    // from `describe` rather than from a panel descriptor.
     for panel in panels() {
         if let Err(e) = cmds.register_panel(panel) {
             tracing::warn!(error = %e, "failed to register edge-console panel");
@@ -188,18 +203,39 @@ pub(crate) fn panels() -> Vec<Value> {
     ]
 }
 
-/// Register a verb, logging (not failing) if the inbox rejects it.
-fn try_register(cmds: &Arc<CommandInbox>, verb: &str, handler: Arc<dyn CommandHandler>) {
-    if let Err(e) = cmds.register(verb, handler) {
+/// Register a verb at its declared [`CommandScope`], logging (not failing) if the inbox rejects it.
+fn try_register(
+    cmds: &Arc<CommandInbox>,
+    verb: &str,
+    scope: CommandScope,
+    handler: Arc<dyn CommandHandler>,
+) {
+    if let Err(e) = cmds.register(verb, scope, handler) {
         tracing::warn!(verb, error = %e, "failed to register command verb");
     }
 }
 
+/// The route one command delivery selects: the **topic-addressed instance wins** over the legacy
+/// `route` body field (D-SC-4 — the topic is authoritative), and `None` means "every route".
+///
+/// The library has already rejected a delivery whose topic token and `body.instance` disagree; this
+/// component's own selector has always been named `route`, so the precedence between the two is
+/// resolved here rather than by the library.
+pub(crate) fn selected_route<'a>(request: &'a Message, addressed_instance: Option<&'a str>) -> Option<&'a str> {
+    addressed_instance.or_else(|| request.body.get("route").and_then(Value::as_str))
+}
+
+/// Whether `route` is selected by `selected` (`None` selects every route).
+fn is_selected(route: &RouteHandle, selected: Option<&str>) -> bool {
+    selected.is_none() || selected == Some(route.id.as_str())
+}
+
 /// The `get-stats` reply body: `{routes: [{id, in, out, dropped, streamAppends, publishFailures,
-/// queueDepth, paused}]}`.
-pub(crate) fn stats_json(handles: &[RouteHandle]) -> Value {
+/// queueDepth, paused}]}` — the selected route only, or every route when `selected` is `None`.
+pub(crate) fn stats_json(handles: &[RouteHandle], selected: Option<&str>) -> Value {
     let routes: Vec<Value> = handles
         .iter()
+        .filter(|r| is_selected(r, selected))
         .map(|r| {
             json!({
                 "id": r.id,
@@ -216,13 +252,18 @@ pub(crate) fn stats_json(handles: &[RouteHandle]) -> Value {
     json!({ "routes": routes })
 }
 
-/// Apply `paused` to the route named in `request.body.route` (or all routes when absent). Returns
-/// `{paused|resumed: [ids...]}`.
-pub(crate) fn set_paused(handles: &[RouteHandle], request: &Message, paused: bool) -> Value {
-    let route = request.body.get("route").and_then(Value::as_str);
+/// Apply `paused` to the route this delivery selects ([`selected_route`]: the topic-addressed
+/// instance, else `request.body.route`, else every route). Returns `{paused|resumed: [ids...]}`.
+pub(crate) fn set_paused(
+    handles: &[RouteHandle],
+    request: &Message,
+    addressed_instance: Option<&str>,
+    paused: bool,
+) -> Value {
+    let route = selected_route(request, addressed_instance);
     let mut affected = Vec::new();
     for r in handles {
-        if route.is_none() || route == Some(r.id.as_str()) {
+        if is_selected(r, route) {
             r.stats.paused.store(paused, Ordering::Relaxed);
             affected.push(r.id.clone());
         }
@@ -280,7 +321,7 @@ mod tests {
         let orders: Vec<u64> = ps.iter().map(|p| p["order"].as_u64().unwrap()).collect();
         assert_eq!(orders, vec![10, 20]);
         for p in &ps {
-            assert_eq!(p["scope"], json!("component"), "the processor has no console instance dimension");
+            assert_eq!(p["scope"], json!("component"), "both panels render fleet-wide route aggregates");
             assert!(!p["title"].as_str().unwrap().is_empty());
         }
         assert_eq!(ps[0]["verbs"], json!(["get-stats", "flush", "pause", "resume"]));
@@ -352,7 +393,7 @@ mod tests {
         h.stats.queue_depth.store(5, Ordering::Relaxed);
         h.stats.paused.store(true, Ordering::Relaxed);
 
-        let out = stats_json(&[h]);
+        let out = stats_json(&[h], None);
         let routes = out["routes"].as_array().unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0]["id"], json!("r1"));
@@ -370,22 +411,56 @@ mod tests {
     }
 
     #[test]
+    fn stats_json_reports_only_the_addressed_route() {
+        let handles = vec![a_handle("r1"), a_handle("r2")];
+
+        let out = stats_json(&handles, Some("r2"));
+        let routes = out["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 1, "an instance-addressed get-stats answers for that route only");
+        assert_eq!(routes[0]["id"], json!("r2"));
+
+        assert_eq!(stats_json(&handles, None)["routes"].as_array().unwrap().len(), 2);
+        assert!(
+            stats_json(&handles, Some("nope"))["routes"].as_array().unwrap().is_empty(),
+            "an unconfigured route selects nothing"
+        );
+    }
+
+    #[test]
     fn set_paused_targets_one_route_when_named_and_all_when_omitted() {
         let handles = vec![a_handle("r1"), a_handle("r2")];
 
-        let out = set_paused(&handles, &a_request(json!({ "route": "r1" })), true);
+        let out = set_paused(&handles, &a_request(json!({ "route": "r1" })), None, true);
         assert_eq!(out["paused"], json!(["r1"]));
         assert!(handles[0].stats.is_paused());
         assert!(!handles[1].stats.is_paused());
 
-        let out = set_paused(&handles, &a_request(json!({})), true);
+        let out = set_paused(&handles, &a_request(json!({})), None, true);
         assert_eq!(out["paused"].as_array().unwrap().len(), 2, "no route -> every route");
         assert!(handles[1].stats.is_paused());
 
-        let out = set_paused(&handles, &a_request(json!({})), false);
+        let out = set_paused(&handles, &a_request(json!({})), None, false);
         assert_eq!(out["resumed"].as_array().unwrap().len(), 2);
         assert!(!handles[0].stats.is_paused());
         assert!(!handles[1].stats.is_paused());
+    }
+
+    #[test]
+    fn the_topic_addressed_route_wins_over_the_body_selector() {
+        // D-SC-4: the delivery topic is authoritative; `route` in the body is the legacy selector.
+        let handles = vec![a_handle("r1"), a_handle("r2")];
+
+        let out = set_paused(&handles, &a_request(json!({ "route": "r1" })), Some("r2"), true);
+        assert_eq!(out["paused"], json!(["r2"]));
+        assert!(!handles[0].stats.is_paused());
+        assert!(handles[1].stats.is_paused());
+
+        // Component-addressed with no body selector = every route (D-SC-3's "the whole component").
+        let req = a_request(json!({}));
+        assert_eq!(selected_route(&req, None), None);
+        assert_eq!(selected_route(&req, Some("r2")), Some("r2"));
+        let req = a_request(json!({ "route": "r1" }));
+        assert_eq!(selected_route(&req, None), Some("r1"));
     }
 
     // ---- self_subscribe (the fan-out handler) -----------------------------------------------------

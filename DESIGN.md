@@ -91,10 +91,24 @@ Numbered `D-TP-<n>` so later sessions can cite them.
   panels (`overview`: fleet totals + flush/pause/resume; `routes`: per-route counters via
   `get-stats`) were straightforward to add via the library's existing `commands.register_panel` (used
   identically by the protocol-adapter templates) and ride the command surface that already shipped —
-  so they were implemented rather than deferred. `scope: "component"`, not `"instance"`: the
-  processor has no console-facing UNS instance dimension (a route is internal wiring, addressed by an
-  optional `body.route` field on the command verbs, not a topic segment), unlike a southbound
-  adapter's per-device instances.
+  so they were implemented rather than deferred. `scope: "component"`, not `"instance"`: both panels
+  render fleet-wide aggregates over every route (the overview totals, the routes table). Individual
+  routes stay reachable through the verbs' own `Both` scope (D-TP-9), which the console derives from
+  `describe` rather than from a panel descriptor.
+- **D-TP-9 (core 0.5.0 adoption). Every command verb declares `CommandScope::Both`.** Core 0.5.0's
+  scoped registration (`register(verb, scope, handler)`, core `DESIGN-scoped-commands.md` D-SC-2)
+  requires each verb to declare its addressing. A route **is** a `component.instances[]` entry, so
+  the library subscribes a per-route command inbox and an instance-addressed delivery names exactly
+  one route — while the established meaning of a component-addressed delivery is "every route". That
+  is precisely D-SC-3's dual-semantics use of `Both`, so all four verbs (`get-stats`, `flush`,
+  `pause`, `resume`) declare it: `None` = every route, a token = that route. `Component` would refuse
+  a legitimate per-route request, and `Instance` would make the fleet-wide form an error.
+  Resolution is `addressed_instance ?? body.route` — the topic token is authoritative (D-SC-4) and
+  the legacy `route` body selector is retained, unchanged, for component-addressed callers.
+  `get-stats` and `flush`, which never had a body selector, now honor the topic token rather than
+  ignoring it: silently fanning a mutating `flush` out to every route when one was addressed is
+  exactly the mis-targeting class D-SC-1 closes. Unknown/unconfigured route ids stay non-fatal
+  (they simply select nothing), matching the pre-existing `pause`/`resume` behavior.
 
 ## Config
 
@@ -109,15 +123,15 @@ field-by-field prose it was derived from; treat that page, not this one, as the 
 
 Beyond the library's automatic `ping` / `reload-config` / `get-configuration`:
 
-| Verb | Body | Result |
-|------|------|--------|
-| `get-stats` | — | Per-route counters (`in`/`out`/`dropped`/`streamAppends`/`publishFailures`/`queueDepth`/`paused`). |
-| `flush` | — | Force-closes every route's open **time** windows now; `{flushed: n}`. Count windows are unaffected. |
-| `pause` | `{route?}` | Stops enqueuing to a route (or all routes when omitted); `{paused: [ids]}`. |
-| `resume` | `{route?}` | The inverse of `pause`; `{resumed: [ids]}`. |
+| Verb | Scope | Body | Result |
+|------|-------|------|--------|
+| `get-stats` | `Both` | — | Counters for the addressed route, or every route (`in`/`out`/`dropped`/`streamAppends`/`publishFailures`/`queueDepth`/`paused`). |
+| `flush` | `Both` | — | Force-closes the addressed route's (or every route's) open **time** windows now; `{flushed: n}`. Count windows are unaffected. |
+| `pause` | `Both` | `{route?}` | Stops enqueuing to the addressed route (or all routes when neither the topic nor the body names one); `{paused: [ids]}`. |
+| `resume` | `Both` | `{route?}` | The inverse of `pause`; `{resumed: [ids]}`. |
 
-Two edge-console panels (`overview`, `routes`; see D-TP-8) bind to these verbs. Full wire contract in
-`docs/reference/messaging-interface.md`.
+Every verb declares `CommandScope::Both` (D-TP-9). Two edge-console panels (`overview`, `routes`;
+see D-TP-8) bind to these verbs. Full wire contract in `docs/reference/messaging-interface.md`.
 
 ## Metrics
 
@@ -127,7 +141,7 @@ summed across routes and emitted as interval deltas every 30s via `gg.metrics()`
 
 ## Validation
 
-- `cargo test` (107 tests as of this remediation) — pipeline mechanics, route config parsing,
+- `cargo test` (114 tests with the coverage job's feature set) — pipeline mechanics, route config parsing,
   route-build decisions (target/filter/publish/script-output-topic resolution, the restamp policy —
   `src/route_build.rs`), the fan-out handler + command/panel registration, the route dispatcher
   (local/northbound/stream targets, restamp, failure→evt), the metric/event surface. No broker
