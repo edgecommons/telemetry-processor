@@ -226,27 +226,43 @@ the triggering message, which continues on the source topic.
 
 ## Command verbs
 
-The processor subscribes its own command inbox `ecv1/{device}/telemetry-processor/cmd/#` (wired
+The processor subscribes its own command inbox `ecv1/{device}/telemetry-processor/cmd/#` and, for each
+configured route, the per-route inbox `ecv1/{device}/telemetry-processor/{route}/cmd/#` (both wired
 automatically by the library). A `cmd` request whose `header.reply_to` is set gets a structured reply
 `{"ok": true, "result": …}` or `{"ok": false, "error": {"code", "message"}}`; a request without
 `reply_to` is fire-and-forget.
 
 **Built-in verbs** (library-provided, cannot be shadowed):
 
-| Verb | Result |
-|------|--------|
-| `ping` | `{ "status": "RUNNING", "uptimeSecs": n }` — liveness/echo |
-| `reload-config` | re-fetch + re-apply the config from the active source → `{ "reloaded": true }` |
-| `get-configuration` | the current **redacted effective config** → `{ "config": … }` |
+| Verb | Scope | Result |
+|------|-------|--------|
+| `ping` | both | `{ "status": "RUNNING", "uptimeSecs": n }` — liveness/echo |
+| `reload-config` | both | re-fetch + re-apply the config from the active source → `{ "reloaded": true }` |
+| `get-configuration` | both | the current **redacted effective config** → `{ "config": … }` |
 
 **Custom verbs** (registered by the processor):
 
-| Verb | Body | Result |
-|------|------|--------|
-| `get-stats` | — | `{ "routes": [ { id, in, out, dropped, streamAppends, publishFailures, queueDepth, paused } ] }` — per-route counters |
-| `flush` | — | force-close every route's open **time** windows now → `{ "flushed": n }` (messages emitted). Count windows keep their count semantics. |
-| `pause` | `{ "route"? }` | stop enqueuing to a route (or all routes when omitted) → `{ "paused": [ids] }` |
-| `resume` | `{ "route"? }` | the inverse of `pause` → `{ "resumed": [ids] }` |
+| Verb | Scope | Body | Result |
+|------|-------|------|--------|
+| `get-stats` | both | — | `{ "routes": [ { id, in, out, dropped, streamAppends, publishFailures, queueDepth, paused } ] }` — counters for the addressed route, or every route |
+| `flush` | both | — | force-close the addressed route's (or every route's) open **time** windows now → `{ "flushed": n }` (messages emitted). Count windows keep their count semantics. |
+| `pause` | both | `{ "route"? }` | stop enqueuing to a route → `{ "paused": [ids] }` |
+| `resume` | both | `{ "route"? }` | the inverse of `pause` → `{ "resumed": [ids] }` |
+
+### Verb scope and addressing
+
+A route is a `component.instances[]` entry, so every verb above is addressable two ways and each one
+declares the scope `both`:
+
+- **Component-addressed** (`ecv1/{device}/telemetry-processor/cmd/{verb}`, no route token) means
+  **every route** — the fleet-wide form.
+- **Route-addressed** (`ecv1/{device}/telemetry-processor/{route}/cmd/{verb}`) acts on that route
+  alone.
+
+The topic's route token is authoritative: when a request is route-addressed, `pause`/`resume` ignore
+a `route` field in the body. The `route` body field remains the way to target a single route over the
+component-addressed topic. A request that names one route in the topic and a different instance in
+`body.instance` is rejected by the library with `BAD_ARGS` before the verb runs.
 
 > **Known limitation.** The built-in `reload-config` hot-swaps the config snapshot but the routes are
 > wired once at startup, so a route topology change needs a component restart; there is no dynamic

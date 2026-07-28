@@ -42,13 +42,12 @@ streaming-file-avro = ["streaming", "edgecommons/streaming-file-avro"]
 scripting-lua = ["dep:mlua"]
 
 [dependencies]
-# The edgecommons Rust library, pinned to a commit on edgecommons/edgecommons (private). Building this
-# repo standalone needs read access to that repo. The fetch goes through the git CLI (see
-# .cargo/config.toml); locally it uses your gh/git credential helper, and in CI the reusable workflow
-# rewrites this https URL with the EDGECOMMONS_READ_TOKEN PAT. For local development against an
-# unpushed change, add a gitignored `.cargo/config.toml` `[patch]` override pointing at
-# `../core/libs/rust` (the sibling checkout) instead of editing this pin — see CLAUDE.md.
-edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "36a70c48b65b35f77bfab70d3a73869debdfc407", default-features = false }
+# The edgecommons Rust library, pinned to the `rust-lib/v0.5.0` release tag on
+# edgecommons/edgecommons (a public repo — the fetch needs no credentials, in CI or locally). For
+# local development against an unpushed change, add a gitignored `.cargo/config.toml` `[patch]`
+# override pointing at `../core/libs/rust` (the sibling checkout) instead of editing this pin — see
+# CLAUDE.md.
+edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

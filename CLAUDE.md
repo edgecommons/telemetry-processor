@@ -8,10 +8,10 @@ inherits — lives in `AGENTS.md` and is shared with every agent tool. It is imp
 
 ## Local-dev notes
 
-- **Default (committed pin):** `Cargo.toml`'s `edgecommons` dependency is a git `rev` pin, and
-  `Cargo.lock` is committed against that pin — a plain `cargo build`/`clone` needs only read access
-  to `edgecommons/edgecommons` (private; the fetch goes through the git CLI, and CI rewrites the URL
-  with the `EDGECOMMONS_READ_TOKEN` PAT).
+- **Default (committed pin):** `Cargo.toml`'s `edgecommons` dependency is a git `rev` pin — currently
+  the `rust-lib/v0.5.0` release tag — and `Cargo.lock` is committed against that pin.
+  `edgecommons/edgecommons` is public, so a plain `cargo build`/`clone` fetches it anonymously, in CI
+  and locally.
 - **Building against an unpushed sibling change:** add a gitignored `.cargo/config.toml` next to this
   file with a `[patch]` block pointing the git URL at your local `../core/libs/rust` checkout (see the
   comment above the `edgecommons` dependency in `Cargo.toml` for the exact form). This is local-dev

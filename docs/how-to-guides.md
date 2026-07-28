@@ -477,17 +477,22 @@ filter to specific adapters instead when you don't need the whole fleet, e.g.
 
 **Goal:** inspect and control a running processor from the console / any MQTT client.
 
-The processor answers its command inbox at `ecv1/{device}/telemetry-processor/cmd/<verb>`. Send a
-`cmd` envelope (`header.name` = the verb) with `header.reply_to` set to get a structured reply.
+The processor answers its command inbox at `ecv1/{device}/telemetry-processor/cmd/<verb>` and, per
+route, at `ecv1/{device}/telemetry-processor/{route}/cmd/<verb>`. Send a `cmd` envelope
+(`header.name` = the verb) with `header.reply_to` set to get a structured reply.
+
+Every verb below declares the scope `both`: address the component to act on **every route**, or
+address one route to act on that route alone. The topic's route token wins over a `route` field in
+the body.
 
 | Verb | What it does |
 |------|--------------|
 | `ping` | liveness — `{status:"RUNNING", uptimeSecs}` (library built-in) |
 | `reload-config` | re-fetch + re-apply the config (library built-in) |
 | `get-configuration` | the redacted effective config (library built-in) |
-| `get-stats` | per-route counters `{routes:[{id,in,out,dropped,streamAppends,publishFailures,queueDepth,paused}]}` |
-| `flush` | force-close every route's open **time** windows now → `{flushed:n}` |
-| `pause` / `resume` | stop / restart enqueuing to a route (`{route}`) or all routes (body omitted) |
+| `get-stats` | counters for the addressed route, or every route: `{routes:[{id,in,out,dropped,streamAppends,publishFailures,queueDepth,paused}]}` |
+| `flush` | force-close the addressed route's (or every route's) open **time** windows now → `{flushed:n}` |
+| `pause` / `resume` | stop / restart enqueuing to the addressed route (or the body's `{route}`), or all routes when neither names one |
 
 The processor also publishes, without any request: its `state` keepalive
 (`ecv1/{device}/telemetry-processor/state`), a `metric/pipeline` throughput metric (when
