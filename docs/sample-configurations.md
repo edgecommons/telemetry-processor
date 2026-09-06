@@ -812,9 +812,12 @@ caller-declared Parquet schema.
 
 Incoming bus message (no `body.signal`, no `body.samples`):
 
+Human-readable JSON projection of an EdgeCommons protobuf message. Normal MQTT and Greengrass IPC messaging carries protobuf bytes, not this JSON text.
+
 ```jsonc
 // topic: sensors/plant-3/pump-7/vibration
-{ "header": { "name": "SensorReading", "version": "1.0" },
+{ "header": { "name": "SensorReading", "version": "1.0", "timestamp": "2026-06-30T12:00:00Z", "uuid": "b114bb67-cdf9-4604-92bc-3c999548f661" },
+  "identity": { "hier": [{"level":"device","value":"pump-7"}], "path":"pump-7", "component":"sensor-client" },
   "tags":   { "site": "plant-3" },
   "body":   { "deviceId": "pump-7", "metric": "vibration", "raw": 3214, "ts": "2026-06-30T12:00:00Z" } }
 ```

@@ -237,7 +237,9 @@ and script rewrite the body) — except a multi-signal `script` with an `output`
 `ProcessedTelemetry`: it reuses the first message of the window as the base (so the envelope `tags` and
 the source `signal` carry through) and rewrites the body to
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 { "signal": { ... },
   "samples": [ { "value": <primary>, "quality": "GOOD" } ],
   "agg": { "avg": ..., "max": ..., "count": ... },
