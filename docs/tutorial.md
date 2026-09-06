@@ -18,10 +18,11 @@ By the end you will have seen a downsampled message land on the Unified-Namespac
 
 - A **Rust toolchain** (stable) to build and run the component.
 - **Docker**, to start the local EMQX broker.
-- **Python 3.9+** with `pip install paho-mqtt` — a tiny publisher and subscriber.
+- **Python 3.9+** with `pip install paho-mqtt -e ../core/libs/python` in the organization workspace — the MQTT clients and matching EdgeCommons protobuf codec.
 - Optional: `pip install pyarrow pandas` if you want to read the Parquet output.
 
-Run everything from the repository root.
+Run everything from the repository root. Python here-documents use a Bash-compatible shell; in
+PowerShell, save their Python contents as `.py` files and run `python <file>.py`.
 
 ## 1. Start a local MQTT broker
 
@@ -50,7 +51,8 @@ The flags are the standard edgecommons CLI contract: `--platform HOST` (laptop, 
 and `-t my-thing` (the Thing name, which fills the `{ThingName}` template).
 
 `test-configs/config.json` defines two **routes** (each a `component.instances[]` entry), both
-subscribed to the fleet's UNS `data` class `ecv1/+/+/+/data/#`:
+subscribed to instance-scope UNS data with `ecv1/+/+/+/data/#`. This sample filter matches the
+simulator below; fleet-wide data coverage also needs the component-scope `ecv1/+/+/data/#` filter:
 
 - **`downsample-local`** — drops any update that isn't all-`GOOD` quality, then keeps **at most one
   message per signal per second** (`sample everyMs:1000`), and republishes the survivors on
@@ -66,81 +68,81 @@ Wait for the `telemetry-processor started` log line, then leave it running.
 
 ## 3. Watch the downsampled output
 
-In a second terminal, subscribe to everything the processor republishes:
+In a second terminal, decode the configured output's protobuf messages to a human-readable JSON
+projection. This sample route uses a component-scope output **topic**; its local output identity
+carries the route instance `downsample-local`.
 
 ```bash
 python - <<'PY'
-import paho.mqtt.client as mqtt, json
+import json
+import paho.mqtt.client as mqtt
+from edgecommons.messaging.message import Message
+
 c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-# Only the processor's own data output (component = telemetry-processor), so we don't also
-# print the raw input we publish in Step 4.
-c.on_connect = lambda c,u,f,rc,p=None: c.subscribe("ecv1/+/telemetry-processor/+/data/#")
-def on_msg(c,u,m):
-    b = json.loads(m.payload)["body"]; s = b["samples"][0]
-    print(f'{m.topic}  {b["signal"]["id"]:12} = {s["value"]:>8}  [{s["quality"]}]')
-c.on_message = on_msg
-c.connect("localhost", 1883); c.loop_forever()
+c.on_connect = lambda c, u, f, rc, p: c.subscribe("ecv1/my-thing/telemetry-processor/data/downsampled", qos=1)
+def on_message(c, u, m):
+    message = Message.from_bytes(m.payload)
+    print(m.topic, json.dumps(message.to_diagnostic_json(), indent=2))
+c.on_message = on_message
+c.connect("localhost", 1883)
+try:
+    c.loop_forever()
+except KeyboardInterrupt:
+    pass
+finally:
+    c.unsubscribe("ecv1/my-thing/telemetry-processor/data/downsampled")
+    c.disconnect()
 PY
 ```
 
-(MQTTX subscribed to `ecv1/+/telemetry-processor/+/data/#` works just as well.) Leave it running —
-MQTT messages aren't retained, so the subscriber must be up before you publish.
+Leave the subscriber running before publishing: these messages are not retained. A generic MQTT
+viewer shows the protobuf bytes unless configured with the EdgeCommons schema/decoder.
 
 ## 4. Feed it synthetic telemetry
 
-In a third terminal, publish a burst of `SouthboundSignalUpdate` envelopes for two signals — about four
-per second for eight seconds — and slip in **one BAD-quality sample** so you can watch the filter
-drop it:
+Publish two signals at about four updates per second each for eight seconds, with one BAD sample.
+The builder encodes the native Python body into protobuf and stamps the simulated publisher identity.
 
 ```bash
 python - <<'PY'
-import paho.mqtt.client as mqtt, json, time
+import time
+import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
-c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-c.connect("localhost", 1883); c.loop_start()
+from edgecommons.messaging.identity import HierEntry, MessageIdentity
+from edgecommons.messaging.message_builder import MessageBuilder
 
+c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+c.connect("localhost", 1883)
+c.loop_start()
+identity = MessageIdentity([HierEntry("device", "gw-01")], "sim-adapter", "inst1")
 def update(signal_id, signal_name, value, quality="GOOD"):
     now = datetime.now(timezone.utc).isoformat()
-    env = {
-        "header": {"name": "SouthboundSignalUpdate", "version": "1.0"},
-        # The UNS identity element: the SOURCE publisher (a simulated adapter on device gw-01).
-        # The device lives in this identity element.
-        "identity": {"hier": [{"level": "device", "value": "gw-01"}],
-                     "path": "gw-01", "component": "sim-adapter", "instance": "inst1"},
-        "tags":   {"site": "factory-1"},
-        "body": {
-            "device":  {"adapter": "sim", "instance": "inst1"},
-            "signal":     {"id": signal_id, "name": signal_name},
-            "samples": [{"value": value, "quality": quality,
-                         "sourceTs": now, "serverTs": now}],
-        },
+    body = {
+        "device": {"adapter": "sim", "instance": "inst1"},
+        "signal": {"id": signal_id, "name": signal_name},
+        "samples": [{"value": value, "quality": quality, "sourceTs": now, "serverTs": now}],
     }
-    # An adapter's UNS data topic: ecv1/{device}/{component}/{instance}/data/{signalPath}
-    c.publish(f"ecv1/gw-01/sim-adapter/inst1/data/{signal_name}", json.dumps(env))
-
-for i in range(32):
-    update("ns=3;i=1001", "Temp",     round(20 + i * 0.1, 2))
-    update("ns=3;i=1002", "Pressure", round(1.0 + i * 0.01, 3))
-    if i == 12:
-        update("ns=3;i=1001", "Temp", -999.0, quality="BAD")  # dropped by the GOOD filter
-    time.sleep(0.25)
-
-time.sleep(1); c.loop_stop()
-print("published ~64 GOOD updates + 1 BAD")
+    message = (MessageBuilder.create("SouthboundSignalUpdate", "1.0")
+        .with_identity(identity).with_tags({"site": "factory-1"})
+        .with_southbound_signal_update(body).build())
+    c.publish(f"ecv1/gw-01/sim-adapter/inst1/data/{signal_name}",
+              message.to_bytes(), qos=1).wait_for_publish(timeout=5)
+try:
+    for i in range(32):
+        update("ns=3;i=1001", "Temp", round(20 + i * 0.1, 2))
+        update("ns=3;i=1002", "Pressure", round(1.0 + i * 0.01, 3))
+        if i == 12:
+            update("ns=3;i=1001", "Temp", -999.0, quality="BAD")
+        time.sleep(0.25)
+finally:
+    c.disconnect()
+    c.loop_stop()
+print("published 64 GOOD updates + 1 BAD")
 PY
 ```
 
-You published ~4 updates/sec per signal, but the subscriber from Step 3 prints only about **one per signal
-per second** — that's the `sample` stage downsampling. And the `-999.0 [BAD]` reading **never
-appears**: the `filter { quality: GOOD }` stage dropped it before sampling. You'll see something like
-(exact values and cadence depend on arrival timing):
-
-```
-ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1001  =    20.0  [GOOD]
-ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1002  =     1.0  [GOOD]
-ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1001  =    20.8  [GOOD]
-ecv1/my-thing/telemetry-processor/data/downsampled  ns=3;i=1002  =    1.08  [GOOD]
-```
+The subscriber should show roughly one update per signal per second. The `-999.0` BAD sample should
+be absent: filtering runs before sampling. Exact values and timing depend on arrival cadence.
 
 ## 5. Find the Parquet archive
 
@@ -190,8 +192,10 @@ The two routes never touched each other; they just subscribed to the same topic 
 results to different channels. That is the whole idea of the processor.
 
 While it ran, the processor was also a full **Unified-Namespace citizen**: subscribe
-`ecv1/+/+/+/state` to see its automatic keepalive, `ecv1/+/+/+/metric/#` for its `pipeline` throughput
-metric, and `ecv1/+/+/+/evt/#` for health events — and you can address its command inbox at
+`ecv1/my-thing/telemetry-processor/state` to see its automatic keepalive,
+`ecv1/my-thing/telemetry-processor/metric/#` for component metrics, and both
+`ecv1/my-thing/telemetry-processor/evt/#` and `ecv1/my-thing/telemetry-processor/+/evt/#` for
+component and route events — and you can address its command inbox at
 `ecv1/my-thing/telemetry-processor/cmd/get-stats` (or `flush` / `pause` / `resume`, plus the
 library built-ins `ping` / `reload-config` / `get-configuration`) to read the per-route counters. See
 the [messaging-interface reference](reference/messaging-interface.md#command-verbs).

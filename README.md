@@ -1,6 +1,6 @@
 # telemetry-processor
 
-The **reference Rust processing component** for the edgecommons / edgecommons ecosystem. It is the
+The **reference Rust processing component** for the EdgeCommons ecosystem. It is the
 high-throughput northbound seam between southbound protocol adapters (which publish high-rate
 `SouthboundSignalUpdate` telemetry on the local bus) and the cloud.
 
@@ -19,14 +19,14 @@ edgecommons monorepo for the full design.
 
 ## Unified Namespace (UNS)
 
-The processor speaks the edgecommons **Unified Namespace** — topics are
-`ecv1/{device}/{component}/[{instance}/]{class}[/channel]` (the instance segment is optional), and
-because it is a single instance the processor appears on the bus at **component scope**:
-`ecv1/{device}/telemetry-processor/{class}[/channel]` — the component token (the short name after the
-last `.`) is followed directly by the class, with no instance segment. What this means for the processor:
+The processor uses rootless `ecv1/{device}/{component}[/{instance}]/{class}[/channel]` topics.
+Its keepalive, configuration, metrics and component command inbox use component scope. Each route
+is an instance: local output identity is restamped with that route id, while its output topic is the
+configured `publish.topic`. Northbound and stream outputs preserve source identity.
 
-- **Ingest** the fleet's southbound telemetry (the `data` class) with a single wildcard:
-  `ecv1/+/+/+/data/#` (or scope it, e.g. `ecv1/+/opcua-adapter/+/data/#`).
+- **Ingest** instance data with `ecv1/+/+/+/data/#`. To include component-scope data, also configure
+  `ecv1/+/+/data/#`; a single scope filter is not fleet-complete.
+
 - **Output** processed telemetry on the `data` class and events on `evt`; `state`/`metric`/`cfg`/`log`
   are **reserved** (library-owned) — a direct publish to them is rejected, so route outputs must
   target `data` / `evt` / `app`.
@@ -60,7 +60,7 @@ file sinks + CloudWatch are all on by default, so the command above needs no `--
 Publish synthetic `SouthboundSignalUpdate` messages (envelopes with a top-level `identity`) to an
 adapter's UNS data topic, e.g. `ecv1/gw-01/opcua-adapter/kep1/data/<signal>`, and watch: downsampled
 messages on `ecv1/my-thing/telemetry-processor/data/downsampled` (MQTTX), and rolling Parquet
-files under `./out/archive/dt=…/`. Subscribe `ecv1/+/+/+/state` to see the processor's automatic
+files under `./out/archive/dt=…/`. Subscribe `ecv1/+/+/state` to see the processor's automatic
 keepalive, and address `ecv1/my-thing/telemetry-processor/cmd/get-stats` to read its counters.
 
 ## Build the device artifact (Greengrass, Linux)

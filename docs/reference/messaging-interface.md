@@ -12,11 +12,12 @@ verbs](#command-verbs)), publishes `evt` health events, and emits a `metric` thr
 
 ## Unified Namespace (UNS) topic grammar
 
-Every UNS topic is `ecv1/{device}/{component}/{instance}/{class}[/channel]` (rootless; a `site`
+Every UNS topic is `ecv1/{device}/{component}[/{instance}]/{class}[/channel]` (rootless; a `site`
 position appears between `ecv1` and `{device}` only under a multi-level `hierarchy` with
 `topic.includeRoot`). The processor's own token is `telemetry-processor` (the sanitized short name
 after the last `.` of `com.mbreissi.edgecommons.TelemetryProcessor`), so it lives at
-`ecv1/{device}/telemetry-processor/{instance}/{class}[/channel]`.
+`ecv1/{device}/telemetry-processor[/{instance}]/{class}[/channel]`. Component scope omits the
+topic instance segment and `identity.instance`; literal `main` is an ordinary configured id.
 
 The **eight classes**, and how the processor uses each:
 
@@ -44,26 +45,31 @@ Normal messages arrive on the wire as EdgeCommons protobuf envelopes. The proces
 diagnostic/projection shape to filters, scripts, key paths, and file rows — `{ header, identity, tags,
 body }` — that the adapters publish:
 
-```jsonc
+Human-readable JSON projection of an EdgeCommons protobuf message. Normal MQTT and Greengrass IPC messaging carries protobuf bytes, not this JSON text.
+
+```json
 {
-  "header":   { "name": "SouthboundSignalUpdate", "version": "1.0", "timestamp": "<ISO-8601>",
-                "uuid": "…", "correlation_id": null },
-  "identity": { "hier": [ { "level": "device", "value": "<device>" } ],
-                "path": "<device>", "component": "opcua-adapter", "instance": "kep1" },
-  "tags":     { "appId": "…", "site": "…", "shop": "…", "line": "…" },
+  "header": {
+    "name": "SouthboundSignalUpdate", "version": "1.0",
+    "timestamp": "2026-07-03T12:00:00Z", "timestamp_ms": 1783080000000,
+    "uuid": "5db5b842-6f46-48ea-a8ce-d5ff580c956c"
+  },
+  "identity": {
+    "hier": [{"level": "device", "value": "gw-01"}],
+    "path": "gw-01", "component": "opcua-adapter", "instance": "kep1"
+  },
+  "tags": {"site": "dallas"},
   "body": {
-    "device":  { "adapter": "opcua", "instance": "<instanceId>", "endpoint": "opc.tcp://host:4840" },
-    "signal":  { "id": "<canonical stable id>", "name": "<human label>", "address": { /* protocol-native */ } },
-    "samples": [
-      { "value": <any>, "quality": "GOOD|BAD|UNCERTAIN", "qualityRaw": "<native code>",
-        "sourceTs": "<ISO-8601 UTC>", "serverTs": "<ISO-8601 UTC>" }
-    ]
+    "device": {"adapter": "opcua", "instance": "kep1", "endpoint": "opc.tcp://host:4840"},
+    "signal": {"id": "ns=2;s=Temperature", "name": "Temperature", "address": {"ns": 2, "signalId": "Temperature"}},
+    "samples": [{"value": 23.5, "quality": "GOOD", "qualityRaw": "0x00000000", "sourceTs": "2026-07-03T12:00:00Z", "serverTs": "2026-07-03T12:00:00Z"}]
   }
 }
 ```
 
-The processor does not require a specific `header.name`: any JSON message that matches a route's
-`subscribe` filter flows through (filters and scripts can act on any body).
+The processor does not require a specific `header.name`: any decoded EdgeCommons message matching
+a route's `subscribe` filter can enter the pipeline; stage behavior depends on its body shape.
+Raw JSON text published directly to MQTT is not an EdgeCommons message.
 
 <a id="envelope-tags-vs-the-signal"></a>
 ### Identity vs. envelope `tags` vs. the *signal* — three different things
